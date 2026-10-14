@@ -487,6 +487,15 @@ def api_events(h, m, body):
     if cid:
         sql += " AND company_id=?"
         params.append(cid)
+    agent = _int(qs.get("agent_id", [0])[0])
+    if agent:
+        sql += " AND agent_id=?"
+        params.append(agent)
+    for key, op in (("kinds", "IN"), ("exclude", "NOT IN")):
+        names = [k for k in (qs.get(key, [""])[0] or "").split(",") if re.fullmatch(r"[a-z_]{1,24}", k)]
+        if names:
+            sql += f" AND kind {op} ({','.join('?' * len(names))})"
+            params.extend(names)
     if before:
         sql += " AND id<?"
         params.append(before)

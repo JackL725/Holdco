@@ -222,7 +222,22 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any(c["path"] == "/v1/chat/completions" for c in self.model.calls))
         self.api.put("/api/settings", {"llm_backend": "ollama", "default_model": "gpt-oss:20b"})
 
-    def test_14_feed_and_delete(self):
+    def test_14_thinking_view(self):
+        think = self.api.get(f"/api/events?company_id={self.cid}&kinds=think&limit=300")["events"]
+        self.assertTrue(think, "agents' reasoning should be recorded")
+        self.assertTrue(any(e["data"].get("thinking") == "planning..." and e["data"].get("calls") for e in think))
+        results = self.api.get(f"/api/events?company_id={self.cid}&kinds=result&limit=300")["events"]
+        self.assertTrue(any(e["data"].get("name") == "web_search" for e in results))
+        one = think[0]["agent_id"]
+        only = self.api.get(f"/api/events?company_id={self.cid}&kinds=think&agent_id={one}")["events"]
+        self.assertTrue(only and all(e["agent_id"] == one for e in only))
+        # the main feed stays readable
+        feed = self.api.get(f"/api/events?company_id={self.cid}&exclude=think,result&limit=300")["events"]
+        self.assertFalse({e["kind"] for e in feed} & {"think", "result"})
+        # junk filter values are ignored, not injected
+        self.api.get(f"/api/events?company_id={self.cid}&kinds=think%27%3B--")
+
+    def test_15_feed_and_delete(self):
         events = self.api.get(f"/api/events?company_id={self.cid}&limit=300")["events"]
         kinds = {e["kind"] for e in events}
         self.assertTrue({"founding", "run", "tool", "file", "task", "approval", "decision", "done"} <= kinds, kinds)

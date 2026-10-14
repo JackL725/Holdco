@@ -179,11 +179,24 @@ def _to_json_mode(messages: list[dict], tools: list[dict]) -> list[dict]:
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
+def split_thinking(text: str) -> tuple[str, str]:
+    """Separate a model's <think> block from its answer. Returns (answer, thoughts)."""
+    text = text or ""
+    thoughts = [m.strip() for m in re.findall(r"<think>(.*?)</think>", text, re.S | re.I)]
+    text = _THINK_RE.sub("", text)
+    if "<think>" in text:  # unterminated: everything after the tag is still thinking
+        head, _, tail = text.partition("<think>")
+        thoughts.append(tail.strip())
+        text = head
+    elif "</think>" in text:  # the chat template already opened the tag
+        head, _, tail = text.rpartition("</think>")
+        thoughts.append(head.strip())
+        text = tail
+    return text.strip(), "\n\n".join(t for t in thoughts if t)
+
+
 def strip_thinking(text: str) -> str:
-    text = _THINK_RE.sub("", text or "")
-    if "<think>" in text:  # unterminated
-        text = text.split("<think>")[0]
-    return text.strip()
+    return split_thinking(text)[0]
 
 
 def extract_json(text: str):
@@ -339,6 +352,7 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         content = msg.get("content") or ""
+        thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
         calls = []
         for i, tc in enumerate(msg.get("tool_calls") or []):
             f = tc.get("function") or {}
@@ -348,7 +362,9 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
         usage = data.get("usage") or {}
         tokens = int(usage.get("total_tokens") or 0)
 
-    content = strip_thinking(content)
+    content, inline_thoughts = split_thinking(content)
+    if inline_thoughts:
+        thinking = (thinking + "\n\n" + inline_thoughts).strip() if thinking else inline_thoughts
     if tools and not calls:
         tc = _text_tool_call(content, names)
         if tc:
@@ -357,7 +373,7 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     # Unknown tool names are kept so the agent gets a helpful error instead of silence.
     calls = calls if tools else []
     return Reply(content=content, tool_calls=calls, tokens=tokens, mode="json" if json_mode else "native",
-                 thinking=thinking[:6000])
+                 thinking=thinking[:8000])
 
 
 def complete_json(prompt: str, system: str = "", model: str | None = None, temperature: float = 0.7):

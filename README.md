@@ -26,6 +26,8 @@ No cloud AI, no API bills, no pip installs.
   a note and the agent gets a task to revise it. Spending money always needs you; Holdco never pays for anything.
 - **Chat with your team.** Message the CEO or any agent; they act on it (create tasks, change plans) and reply.
 - **Live feed** of everything every agent does, plus full transcripts of every work session.
+- **Thinking tab.** Watch each agent's reasoning, the tool it picks and what the tool returns, live, per agent.
+  Shows the model's own reasoning when it shares it (gpt-oss, Qwen3 and other thinking models).
 - **Integrations:** web search (DuckDuckGo, SearXNG or Brave), company email (SMTP/IMAP; inbound mail becomes
   support tasks), website publishing (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
 

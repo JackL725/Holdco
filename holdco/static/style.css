@@ -416,3 +416,22 @@ details[open] > summary h2::after { content: " −"; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- thinking tab ---------- */
+.mind { max-height: 68vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.mind ul { list-style: none; margin: 0; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.mind .m-think { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; }
+.mind .mh { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.mind .mh .av { width: 22px; height: 22px; }
+.mind details.think summary, .turn details.think summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink-3); }
+.mind pre, .turn details.think pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-height: 260px; overflow: auto; margin: 6px 0 0; }
+.mind .said { margin: 8px 0 0; padding-left: 10px; border-left: 3px solid var(--accent); }
+.mind .call { margin-top: 6px; font-size: 12.5px; overflow-wrap: anywhere; }
+.mind .m-tool { padding: 2px 6px 2px 18px; font-size: 12.5px; color: var(--ink-2); }
+.mind .m-tool.bad summary { color: var(--bad); }
+.mind .m-tool summary { cursor: pointer; overflow-wrap: anywhere; }
+.mind .m-sep { text-align: center; font-size: 12px; color: var(--ink-3); padding: 4px 0; }
+.mind .m-sep.k-error { color: var(--bad); }
+.mind .m-more { text-align: center; }
+.mind details.think summary::before, .turn details.think summary::before { content: "▸ "; }
+.mind details.think[open] summary::before, .turn details.think[open] summary::before { content: "▾ "; }

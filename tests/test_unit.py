@@ -116,6 +116,12 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(llm.strip_thinking("<think>hmm</think>Answer"), "Answer")
         self.assertEqual(llm.strip_thinking("Answer<think>unterminated"), "Answer")
 
+    def test_split_thinking(self):
+        self.assertEqual(llm.split_thinking("<think>plan it</think>Answer"), ("Answer", "plan it"))
+        self.assertEqual(llm.split_thinking("step one\n</think>Answer"), ("Answer", "step one"))   # template opened the tag
+        self.assertEqual(llm.split_thinking("Answer<think>half a thought"), ("Answer", "half a thought"))
+        self.assertEqual(llm.split_thinking("plain"), ("plain", ""))
+
     def test_text_tool_call(self):
         call = llm._text_tool_call('```json\n{"tool": "web_search", "args": {"query": "x"}}\n```', {"web_search"})
         self.assertEqual((call.name, call.arguments), ("web_search", {"query": "x"}))

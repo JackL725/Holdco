@@ -254,6 +254,23 @@ def _describe_call(tc: llm.ToolCall) -> str:
     return f"{tc.name}({json.dumps(short, ensure_ascii=False)[:400]})"
 
 
+def _show_thinking(company_id: int, agent_id: int, run_id: int, task_id: int | None, step: int,
+                   reply: "llm.Reply", calls: list) -> None:
+    """Publish what the agent just thought and decided so the owner can watch the 'Thinking' tab."""
+    thinking = (reply.thinking or "").strip()
+    said = (reply.content or "").strip()
+    if not (thinking or said or calls):
+        return
+    gist = (thinking or said or "Deciding what to do next").replace("\n", " ")
+    bus.emit(company_id, "think", gist[:240], agent_id,
+             {"run_id": run_id, "step": step + 1, "thinking": thinking[:8000], "said": said[:2000],
+              "calls": [{"name": c.name, "args": _args_preview(c.arguments)} for c in calls], "task_id": task_id})
+
+
+def _args_preview(args: dict) -> dict:
+    return {k: (v[:600] + "…" if isinstance(v, str) and len(v) > 600 else v) for k, v in (args or {}).items()}
+
+
 def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", context: str = "") -> None:
     """Run one work session. kind: task | cycle | founding | chat."""
     with _running_lock:
@@ -331,6 +348,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                 reply = llm.chat(messages, tool_specs, model, settings, think=think, creativity=creativity)
                 tokens += reply.tokens
                 steps += 1
+                _show_thinking(company["id"], agent_id, run_id, task_id, step, reply, reply.tool_calls[:4])
                 if reply.tool_calls:
                     calls = reply.tool_calls[:4]
                     messages.append({"role": "assistant", "content": reply.content, "thinking": reply.thinking,
@@ -352,6 +370,9 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                             result = tools.execute(ctx, c.name, c.arguments)
                         messages.append({"role": "tool", "name": c.name, "tool_call_id": c.id or f"call_{step}_{i}",
                                          "content": result})
+                        bus.emit(company["id"], "result", f"{c.name}: {result[:200]}".replace("\n", " "), agent_id,
+                                 {"run_id": run_id, "step": step + 1, "name": c.name, "result": result[:1500],
+                                  "failed": result.startswith("ERROR"), "task_id": task_id})
                         if ctx.finished:
                             break
                     if ctx.finished:
@@ -366,7 +387,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                     ctx.finished, ctx.finish_status = True, "partial"
                     ctx.finish_summary = f"Status: partial\nSummary: {content[:2000]}"
                     break
-                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "assistant", "content": content, "thinking": reply.thinking})
                 messages.append({"role": "user", "content": "Use your tools to do the work. When you're completely "
                                  "done, call the finish tool with a summary."})
             else:
@@ -423,6 +444,10 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
         if kind == "cycle":
             db.update("companies", cid, last_cycle_at=ts)
         db.run("UPDATE companies SET tokens_used = tokens_used + ? WHERE id=?", (tokens, cid))
+        # Reasoning events are bulky: keep the latest 1500 per company (full transcripts stay in the session log).
+        db.run("DELETE FROM events WHERE company_id=? AND kind IN ('think','result') AND id < "
+               "COALESCE((SELECT MIN(id) FROM (SELECT id FROM events WHERE company_id=? AND kind IN ('think','result') "
+               "ORDER BY id DESC LIMIT 1500)), 0)", (cid, cid))
         db.update("runs", run_id, status=status if not ctx.finished else ctx.finish_status, summary=summary[:4000],
                   transcript=json.dumps(messages[1:], ensure_ascii=False)[:2_000_000], tokens=tokens, steps=steps,
                   finished_at=ts)

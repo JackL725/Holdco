@@ -231,7 +231,7 @@ function mountFeed(el, companyId = 0) {
   const feed = { el, companyId, oldest: 0 };
   el.innerHTML = '<ul class="feed"><li class="feed-empty">Loading activity…</li></ul>';
   const load = async (before = 0) => {
-    const r = await GET(`/api/events?limit=60${companyId ? `&company_id=${companyId}` : ''}${before ? `&before=${before}` : ''}`);
+    const r = await GET(`/api/events?limit=60&exclude=think,result${companyId ? `&company_id=${companyId}` : ''}${before ? `&before=${before}` : ''}`);
     const ul = $('ul', el);
     if (!before) ul.innerHTML = '';
     if (!r.events.length && !before) ul.innerHTML = '<li class="feed-empty">Nothing yet. Activity shows up here as agents work.</li>';
@@ -245,6 +245,7 @@ function mountFeed(el, companyId = 0) {
   };
   feed.add = (ev) => {
     if (companyId && ev.company_id !== companyId) return;
+    if (ev.kind === 'think' || ev.kind === 'result') return;
     const ul = $('ul', el);
     if (!ul) return;
     $('.feed-empty', ul)?.remove();
@@ -709,7 +710,7 @@ function Settings() {
 }
 
 // ---------------------------------------------------------------- company
-const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['files', 'Files'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
+const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
 
 function CompanyView(cid, tab, arg) {
   let el, d, tabView;
@@ -743,7 +744,7 @@ function CompanyView(cid, tab, arg) {
       el = holder;
       await reload();
       el.innerHTML = `<div id="co-head">${head()}</div><div id="tab"></div>`;
-      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, files: TabFiles, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
+      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
       tabView = factory(cid, () => d, arg, async () => { await redrawHead(); tabView?.onCompany?.(); });
       await tabView.mount($('#tab', el));
     },
@@ -963,6 +964,7 @@ function TabTeam(cid, data, _arg, reloadCompany) {
           <select data-act-change="model" aria-label="Model for ${esc(a.name)}" style="width:auto;max-width:210px"><option value="">Default model</option>${models.map((m) => `<option ${m === a.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}${a.model && !models.includes(a.model) ? `<option selected>${esc(a.model)}</option>` : ''}</select>
           <label class="check small" style="align-items:center"><input type="checkbox" data-act-change="enabled" ${a.enabled ? 'checked' : ''} style="margin:0"> On</label>
           <button class="btn sm" data-act="run">${a.role === 'ceo' ? 'Plan now' : 'Run next task'}</button>
+          <button class="btn sm" data-act="watch">Watch thinking</button>
           <button class="btn sm" data-act="sessions">Sessions</button>
           ${presetByKey(a.preset || a.role) ? `<button class="btn sm ghost" data-act="preset-info" data-key="${esc(a.preset || a.role)}">Playbook</button>` : ''}
           <button class="btn sm ghost" data-act="edit-agent">Edit</button>
@@ -1043,6 +1045,7 @@ function TabTeam(cid, data, _arg, reloadCompany) {
         });
       }
       if (name === 'transcript') showTranscript(+t.dataset.id);
+      if (name === 'watch') location.hash = `#/c/${cid}/mind/${a.id}`;
     },
     async submit(name, form) {
       const f = Object.fromEntries(new FormData(form));
@@ -1061,13 +1064,88 @@ async function showTranscript(runId) {
   const { run } = await GET(`/api/runs/${runId}`);
   const turn = (m) => {
     if (m.role === 'assistant') {
-      return `<div class="turn assistant"><div class="r">${esc(run.agent_name)}</div>${m.content ? `<div>${md(m.content)}</div>` : ''}
+      return `<div class="turn assistant"><div class="r">${esc(run.agent_name)}</div>${m.thinking ? `<details class="think"><summary>Thinking</summary><pre class="small">${esc(m.thinking)}</pre></details>` : ''}${m.content ? `<div>${md(m.content)}</div>` : ''}
         ${(m.tool_calls || []).map((c) => `<pre class="small">→ ${esc(c.name)}(${esc(JSON.stringify(c.arguments, null, 1)).slice(0, 4000)})</pre>`).join('')}</div>`;
     }
     if (m.role === 'tool') return `<div class="turn tool"><div class="r">Result of ${esc(m.name)}</div><pre class="small">${esc(m.content)}</pre></div>`;
     return `<div class="turn"><div class="r">${m.role === 'user' ? 'Instructions' : esc(m.role)}</div><pre class="small">${esc(m.content)}</pre></div>`;
   };
   modal({ title: `Session #${run.id}: ${run.kind}, ${run.status}`, wide: true, body: `<div class="transcript">${run.transcript.map(turn).join('')}</div>` });
+}
+
+// ---- thinking: a live view of what each agent is reasoning and doing
+function TabMind(cid, data, arg) {
+  let el, agentId = +arg || 0, showTools = true, items = [], oldest = 0, more = false;
+  const KINDS = 'think,result,run,done,error';
+  const stepHtml = (ev) => {
+    const a = S.agents[ev.agent_id];
+    const d = ev.data || {};
+    const who = a ? esc(a.name) : 'Holdco';
+    const head = (label) => `<div class="mh">${a ? avatar(a, '', false) : ''}<b>${who}</b> <span class="faint small">${label} · ${when(ev.created_at)}</span></div>`;
+    if (ev.kind === 'think') {
+      const calls = (d.calls || []).map((c) => `<div class="call">→ <b>${esc(c.name)}</b> <span class="faint">${esc(JSON.stringify(c.args)).slice(0, 500)}</span></div>`).join('');
+      return `<li class="m-think">${head(`step ${d.step || ''}${d.task_id ? `, task #${d.task_id}` : ''}`)}
+        ${d.thinking ? `<details class="think" open><summary>Thinking</summary><pre>${esc(d.thinking)}</pre></details>` : ''}
+        ${d.said ? `<div class="said">${md(d.said)}</div>` : ''}${calls}
+        ${!d.thinking && !d.said && !calls ? '<div class="faint small">(no visible reasoning)</div>' : ''}</li>`;
+    }
+    if (ev.kind === 'result') {
+      if (!showTools) return '';
+      return `<li class="m-tool ${d.failed ? 'bad' : ''}"><details><summary>${d.failed ? '⚠ ' : '↳ '}${esc(d.name)} result <span class="faint small">${esc((d.result || '').replace(/\s+/g, ' ').slice(0, 110))}</span></summary><pre>${esc(d.result || '')}</pre></details></li>`;
+    }
+    return `<li class="m-sep k-${esc(ev.kind)}">${who}: ${esc(ev.message)} <span class="faint small">${when(ev.created_at)}</span></li>`;
+  };
+  const paint = (keepBottom) => {
+    const box = $('#mind-box', el);
+    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    const html = items.map(stepHtml).join('');
+    $('#mind-list', el).innerHTML = (more ? '<li class="m-more"><button class="btn sm ghost" data-act="older">Show older</button></li>' : '') +
+      (html || '<li class="faint" style="padding:20px">Nothing yet. When an agent starts working you will see its reasoning, the tools it picks and what they return, live.</li>');
+    if (keepBottom || near) box.scrollTop = box.scrollHeight;
+  };
+  const working = () => {
+    const w = data().agents.filter((a) => a.status === 'working' && (!agentId || a.id === agentId));
+    $('#mind-now', el).innerHTML = w.length ? w.map((a) => `<span class="badge accent"><span class="spinner"></span> ${esc(a.name)}: ${esc(a.status_note || 'working')}</span>`).join(' ')
+      : '<span class="faint small">Nobody is working right now. Press "Run next task" on the Team tab, or wait for autopilot.</span>';
+  };
+  const chips = () => {
+    const d = data();
+    $('#mind-chips', el).innerHTML = `<button class="btn sm ${agentId ? '' : 'primary'}" data-act="pick" data-id="0">Everyone</button>` +
+      d.agents.map((a) => `<button class="btn sm ${agentId === a.id ? 'primary' : ''}" data-act="pick" data-id="${a.id}">${esc(a.name)}</button>`).join('');
+  };
+  const load = async (before = 0) => {
+    const r = await GET(`/api/events?limit=60&company_id=${cid}&kinds=${KINDS}${agentId ? `&agent_id=${agentId}` : ''}${before ? `&before=${before}` : ''}`);
+    const batch = r.events.slice().reverse();
+    items = before ? batch.concat(items) : batch;
+    if (r.events.length) oldest = r.events[r.events.length - 1].id;
+    more = r.events.length === 60;
+    paint(!before);
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel"><div class="panel-head"><h2>What your agents are thinking</h2>
+          <label class="check small" style="align-items:center"><input type="checkbox" id="mind-tools" checked style="margin:0"> Show tool results</label></div>
+        <div class="panel-body"><div id="mind-chips" class="chips" style="margin-bottom:10px"></div><div id="mind-now" style="margin-bottom:12px"></div>
+        <p class="faint small" style="margin:0 0 10px">Reasoning is the model's own scratch work. Some models don't share it, in which case you will still see what they say and which tools they use.</p>
+        <div id="mind-box" class="mind"><ul id="mind-list"></ul></div></div></section>`;
+      $('#mind-tools', el).onchange = (e) => { showTools = e.target.checked; paint(false); };
+      chips(); working();
+      await load();
+    },
+    onCompany() { chips(); working(); },
+    live(ev) {
+      if (ev.type !== 'event' || ev.company_id !== cid || !KINDS.split(',').includes(ev.kind)) return;
+      if (agentId && ev.agent_id !== agentId) return;
+      items.push(ev);
+      if (items.length > 400) items.splice(0, items.length - 400);
+      paint(false);
+    },
+    async act(name, t) {
+      if (name === 'pick') { agentId = +t.dataset.id; history.replaceState(null, '', `#/c/${cid}/mind${agentId ? '/' + agentId : ''}`); chips(); working(); await load(); }
+      if (name === 'older') await load(oldest);
+    },
+  };
 }
 
 // ---- files
