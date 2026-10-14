@@ -1,0 +1,1374 @@
+'use strict';
+/* Holdco dashboard: plain JavaScript, no build step. */
+
+// ---------------------------------------------------------------- utilities
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + 's')}`;
+
+async function api(method, path, body) {
+  const opt = { method, headers: {} };
+  if (method !== 'GET') opt.headers['X-Holdco'] = '1';
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  let data = {};
+  try { data = await r.json(); } catch (_) { /* empty */ }
+  if (!r.ok) throw new Error(data.error || `${r.status} ${r.statusText}`);
+  return data;
+}
+const GET = (p) => api('GET', p);
+
+function rel(iso) {
+  if (!iso) return '';
+  const t = new Date(iso);
+  const s = (Date.now() - t.getTime()) / 1000;
+  if (s < 45) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  if (s < 86400 * 6) return t.toLocaleDateString(undefined, { weekday: 'short' }) + ' ' + t.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return t.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+const when = (iso) => `<time data-t="${esc(iso)}" title="${esc(iso ? new Date(iso).toLocaleString() : '')}">${rel(iso)}</time>`;
+setInterval(() => $$('time[data-t]').forEach((t) => { t.textContent = rel(t.dataset.t); }), 30000);
+
+function toast(msg, bad = false) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (bad ? ' bad' : '');
+  t.textContent = msg;
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), bad ? 6000 : 3200);
+}
+const fail = (e) => toast(e.message || String(e), true);
+
+function debounce(fn, ms) {
+  let id;
+  return (...a) => { clearTimeout(id); id = setTimeout(() => fn(...a), ms); };
+}
+
+// Minimal, safe Markdown (escapes everything first).
+function inline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,!?:;]|$)/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+}
+function md(src) {
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      out.push(`<pre><code>${esc(buf.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    if (h) { const n = Math.min(h[1].length, 3); out.push(`<h${n}>${inline(h[2])}</h${n}>`); i++; continue; }
+    if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) { out.push('<hr>'); i++; continue; }
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
+      const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+      const body = rows.filter((r) => !/^\s*\|[\s:|-]+\|\s*$/.test(r));
+      const head = cells(body.shift() || '');
+      out.push('<table><thead><tr>' + head.map((c) => `<th>${inline(c)}</th>`).join('') + '</tr></thead><tbody>' +
+        body.map((r) => '<tr>' + cells(r).map((c) => `<td>${inline(c)}</td>`).join('') + '</tr>').join('') + '</tbody></table>');
+      continue;
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+      const ordered = /^\s*\d/.test(line);
+      const items = [];
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, '').replace(/^\[( |x)\]\s*/i, (m, x) => (x.trim() ? '☑ ' : '☐ ')));
+        i++;
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(`<${tag}>` + items.map((t) => `<li>${inline(t)}</li>`).join('') + `</${tag}>`);
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ''));
+      out.push(`<blockquote>${inline(buf.join(' '))}</blockquote>`);
+      continue;
+    }
+    if (!line.trim()) { i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|```|>|\s*([-*+]|\d+[.)])\s+|\s*\|)/.test(lines[i])) buf.push(lines[i++]);
+    if (!buf.length) buf.push(lines[i++]);
+    out.push(`<p>${buf.map(inline).join('<br>')}</p>`);
+  }
+  return `<div class="md">${out.join('')}</div>`;
+}
+
+// ---------------------------------------------------------------- avatars
+const ROLE_COLORS = {
+  ceo: '#2d45e0', product: '#4058c9', research: '#0d7f80', discovery: '#127a62', engineering: '#6246d8', qa: '#52606d',
+  design: '#a8458f', marketing: '#c2357a', seo: '#8f5a1d', social: '#c8366a', lifecycle: '#b8551a', ads: '#b02a37',
+  partnerships: '#94661a', sales: '#cc5a17', support: '#1b7f4e', success: '#2b8a3e', ops: '#8a6a12', legal: '#4b5563',
+  analyst: '#1f6fbf',
+};
+const EXTRA_COLORS = ['#3a6fd0', '#b5446e', '#2a8a7f', '#8f652a', '#5653e0', '#b83b2e'];
+function roleColor(role) {
+  if (ROLE_COLORS[role]) return ROLE_COLORS[role];
+  let h = 0;
+  for (const c of role || '') h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return EXTRA_COLORS[h % EXTRA_COLORS.length];
+}
+function avatar(agent, size = '', ring = true) {
+  if (!agent) return `<span class="sys" aria-hidden="true">•</span>`;
+  const working = ring && agent.status === 'working' ? ' working' : '';
+  return `<span class="av ${size}${working}" style="--c:${roleColor(agent.preset || agent.role)}" title="${esc(agent.name)}, ${esc(agent.title || agent.role)}">${esc((agent.name || '?')[0].toUpperCase())}</span>`;
+}
+
+// ---------------------------------------------------------------- modal
+function modal({ title, body, foot = '', wide = false, onClose }) {
+  const root = $('#modal-root');
+  root.innerHTML = `<div class="overlay" data-act="overlay"><div class="modal ${wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><h2>${esc(title)}</h2><button class="btn ghost sm" data-act="close-modal">Close</button></div>
+    <div class="modal-body">${body}</div>${foot ? `<div class="modal-foot">${foot}</div>` : ''}</div></div>`;
+  S.onModalClose = onClose || null;
+  const first = $('input, textarea, select', root) || $('.modal', root);
+  setTimeout(() => first && first.focus(), 30);
+  return $('.modal', root);
+}
+function closeModal() {
+  $('#modal-root').innerHTML = '';
+  if (S.onModalClose) { const f = S.onModalClose; S.onModalClose = null; f(); }
+}
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('#modal-root').innerHTML) closeModal(); });
+
+// ---------------------------------------------------------------- app state
+const S = {
+  st: null,            // /api/state
+  agents: {},          // id -> agent
+  view: null,
+  feeds: new Set(),
+  models: null,
+  offline: false,
+};
+
+const refreshState = async () => {
+  try {
+    S.st = await GET('/api/state');
+    S.agents = Object.fromEntries(S.st.agents.map((a) => [a.id, a]));
+    renderSide();
+    if (S.view && S.view.onState) S.view.onState();
+  } catch (e) { /* server restarting */ }
+};
+const stateSoon = debounce(refreshState, 900);
+
+async function loadModels(force = false) {
+  if (S.models && !force) return S.models;
+  try { const r = await GET('/api/llm/models'); S.models = r.ok ? r.models : []; } catch (_) { S.models = []; }
+  return S.models;
+}
+
+// ---------------------------------------------------------------- sidebar
+const LOGO = `<svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--accent)"/><path d="M9.5 8v16M22.5 8v16M9.5 16h13" stroke="var(--accent-ink)" stroke-width="3.2" stroke-linecap="round"/></svg>`;
+
+function renderSide() {
+  const st = S.st;
+  const side = $('#side');
+  if (!st) { side.innerHTML = `<div class="brand">${LOGO} Holdco</div>`; return; }
+  const p = route();
+  const at = (cond) => (cond ? ' on' : '');
+  const working = st.agents.filter((a) => a.status === 'working').length;
+  const cos = st.companies.filter((c) => c.status !== 'archived');
+  const archived = st.companies.filter((c) => c.status === 'archived');
+  const coLink = (c) => {
+    const busy = st.agents.filter((a) => a.company_id === c.id && a.status === 'working').length;
+    return `<a class="co-link${at(p[0] === 'c' && +p[1] === c.id)}" href="#/c/${c.id}">
+      <span class="dot ${esc(c.status)}"></span><span class="name">${esc(c.name)}</span>
+      ${c.stats.approvals ? `<span class="count">${c.stats.approvals}</span>` : busy ? `<span class="busy">${busy} working</span>` : ''}</a>`;
+  };
+  side.innerHTML = `
+    <div class="brand">${LOGO} Holdco</div>
+    <nav class="nav" aria-label="Main">
+      <a href="#/" class="${at(!p.length)}">Portfolio</a>
+      <a href="#/inbox" class="${at(p[0] === 'inbox')}">Inbox ${st.approvals ? `<span class="count">${st.approvals}</span>` : ''}</a>
+      <a href="#/library" class="${at(p[0] === 'library')}">Agent library</a>
+    </nav>
+    <div class="side-label">Companies</div>
+    <nav class="nav" aria-label="Companies">
+      ${cos.map(coLink).join('')}
+      <a href="#/new" class="${at(p[0] === 'new')}">+ Start a company</a>
+    </nav>
+    ${archived.length ? `<div class="side-label">Archived</div><nav class="nav">${archived.map(coLink).join('')}</nav>` : ''}
+    <div class="side-foot">
+      <nav class="nav"><a href="#/settings" class="${at(p[0] === 'settings')}">Settings</a></nav>
+      <button class="engine ${st.scheduler_enabled && !S.offline ? 'on' : ''}" data-act="toggle-autopilot" style="border:0;text-align:left;cursor:pointer;font:inherit" title="Start or stop all agents">
+        <span class="pulse"></span>
+        <span>${S.offline ? 'Reconnecting to Holdco…' : st.scheduler_enabled ? `Autopilot on<br><span class="faint">${working ? plural(working, 'agent') + ' working' : 'Agents idle'}</span>` : 'Autopilot off<br><span class="faint">Agents only work when you run them</span>'}</span>
+      </button>
+    </div>`;
+}
+
+// ---------------------------------------------------------------- live feed
+function feedItem(ev, showCompany) {
+  const a = S.agents[ev.agent_id];
+  const co = showCompany ? (S.st?.companies.find((c) => c.id === ev.company_id)) : null;
+  let msg = esc(ev.message);
+  if (ev.kind === 'file' && ev.data?.path && ev.company_id) {
+    msg = msg.replace(esc(ev.data.path), `<a href="#/c/${ev.company_id}/files/${encodeURIComponent(ev.data.path)}">${esc(ev.data.path)}</a>`);
+  }
+  if (ev.kind === 'approval') msg += ` <a href="#/inbox">Review</a>`;
+  const icon = a ? avatar(a, '', false) : ev.data?.by === 'owner' ? '<span class="av owner" aria-hidden="true">Y</span>' : '<span class="sys" aria-hidden="true">•</span>';
+  return `<li class="k-${esc(ev.kind)}" data-id="${ev.id}">${icon}
+    <div class="line"><span class="who">${esc(a ? a.name : (ev.data?.by === 'owner' ? 'You' : 'Holdco'))}</span>
+    ${co ? `<span class="co"> at <a href="#/c/${co.id}">${esc(co.name)}</a></span>` : ''}
+    <span class="when">${when(ev.created_at)}</span><div class="msg">${msg}</div></div></li>`;
+}
+
+function mountFeed(el, companyId = 0) {
+  const feed = { el, companyId, oldest: 0 };
+  el.innerHTML = '<ul class="feed"><li class="feed-empty">Loading activity…</li></ul>';
+  const load = async (before = 0) => {
+    const r = await GET(`/api/events?limit=60${companyId ? `&company_id=${companyId}` : ''}${before ? `&before=${before}` : ''}`);
+    const ul = $('ul', el);
+    if (!before) ul.innerHTML = '';
+    if (!r.events.length && !before) ul.innerHTML = '<li class="feed-empty">Nothing yet. Activity shows up here as agents work.</li>';
+    ul.insertAdjacentHTML('beforeend', r.events.map((e) => feedItem(e, !companyId)).join(''));
+    feed.oldest = r.events.length ? r.events[r.events.length - 1].id : feed.oldest;
+    $('.more', el)?.remove();
+    if (r.events.length === 60) {
+      ul.insertAdjacentHTML('afterend', '<div class="more" style="padding:6px 18px 14px"><button class="btn sm ghost">Show older</button></div>');
+      $('.more button', el).onclick = () => load(feed.oldest).catch(fail);
+    }
+  };
+  feed.add = (ev) => {
+    if (companyId && ev.company_id !== companyId) return;
+    const ul = $('ul', el);
+    if (!ul) return;
+    $('.feed-empty', ul)?.remove();
+    ul.insertAdjacentHTML('afterbegin', feedItem(ev, !companyId));
+    ul.firstElementChild.classList.add('new');
+    while (ul.children.length > 300) ul.lastElementChild.remove();
+  };
+  S.feeds.add(feed);
+  load().catch(fail);
+  return feed;
+}
+
+// ---------------------------------------------------------------- presets
+async function loadPresets() {
+  if (!S.presets) S.presets = await GET('/api/presets');
+  return S.presets;
+}
+const presetByKey = (key) => (S.presets?.presets || []).find((p) => p.key === key);
+const cadence = (h) => (h <= 6 ? `every ${h}h` : h < 48 ? 'daily' : h < 100 ? `every ${Math.round(h / 24)} days` : h <= 170 ? 'weekly' : h <= 340 ? 'every 2 weeks' : 'monthly');
+
+function presetCard(p, opts = {}) {
+  const hired = opts.hired && opts.hired.has(p.key);
+  return `<article class="preset">
+    <div class="preset-head">${avatar({ name: p.name, role: p.key, title: p.title }, '', false)}<div><b>${esc(p.title)}</b><div class="small faint">${esc(p.name)}</div></div></div>
+    <p class="small muted">${esc(p.summary)}</p>
+    <div class="preset-meta">${p.routines.length ? `<span class="badge">${plural(p.routines.length, 'recurring duty', 'recurring duties')}</span>` : ''}<span class="badge">${esc(p.reasoning)} reasoning</span></div>
+    <div class="actions"><button class="btn sm" data-act="preset-info" data-key="${p.key}">Playbook</button>
+      ${opts.hire ? (hired ? '<span class="small faint">On the team</span>' : `<button class="btn sm primary" data-act="hire-preset" data-key="${p.key}">Hire ${esc(p.name)}</button>`) : ''}</div>
+  </article>`;
+}
+
+function presetGallery(data, opts = {}) {
+  return data.categories.map((cat) => {
+    const items = data.presets.filter((p) => p.category === cat);
+    return items.length ? `<section class="gallery-group"><h3>${esc(cat)}</h3><div class="presets">${items.map((p) => presetCard(p, opts)).join('')}</div></section>` : '';
+  }).join('');
+}
+
+function showPreset(key, opts = {}) {
+  const p = presetByKey(key);
+  if (!p) return;
+  const list = (items, tag = 'ul') => `<${tag}>${items.map((i) => `<li>${inline(i)}</li>`).join('')}</${tag}>`;
+  modal({
+    title: `${p.title} (${p.name})`,
+    wide: true,
+    body: `<div class="md playbook"><p class="muted">${esc(p.mission)}</p>
+      <h3>What done looks like</h3>${list(p.done)}
+      <h3>How they work</h3>${list(p.workflow, 'ol')}
+      <h3>Rules</h3>${list(p.rules)}
+      <h3>Measured on</h3><p>${esc(p.kpis.join('; '))}</p>
+      ${p.routines.length ? `<h3>Recurring duties</h3><ul>${p.routines.map((r) => `<li><b>${esc(r.title)}</b>, ${cadence(r.every_hours)}${r.requires ? ` (once ${r.requires === 'imap' ? 'receiving' : 'sending'} email is connected)` : ''}</li>`).join('')}</ul>` : ''}
+      <h3>Tools</h3><p>${p.tools.map((t) => `<code>${esc(t)}</code>`).join(' ')}</p>
+      <h3>Model settings</h3><p>Reasoning effort: ${esc(p.reasoning)} (used by gpt-oss models). Style: ${esc(p.creativity)}.</p>
+      <h3>Based on</h3><ul class="small">${p.sources.map((u) => `<li><a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u.replace(/^https?:\/\/(www\.)?/, '').slice(0, 90))}</a></li>`).join('')}</ul></div>`,
+    foot: opts.hire ? `<button class="btn" data-act="close-modal">Close</button><button class="btn primary" data-act="hire-preset" data-key="${p.key}">Hire ${esc(p.name)}</button>` : '',
+  });
+}
+
+function templatePicker(data, selected) {
+  return `<fieldset class="templates"><legend>Starting team</legend><div class="tpl-grid">${Object.entries(data.templates).map(([k, t]) => `
+    <label class="tpl"><input type="radio" name="template" value="${k}" ${k === selected ? 'checked' : ''}>
+      <span class="tpl-body"><span class="tpl-title"><b>${esc(t.label)}</b>${t.recommended ? ' <span class="badge accent">Recommended</span>' : ''}</span>
+      <span class="small muted">${esc(t.description)}</span>
+      <span class="chips">${t.team.map((m) => avatar({ name: m.name, role: m.key, title: m.title }, 'sm', false)).join('')}</span></span></label>`).join('')}</div></fieldset>`;
+}
+
+// ---------------------------------------------------------------- router
+function route() {
+  return (location.hash || '#/').slice(1).split('/').filter(Boolean).map(decodeURIComponent);
+}
+
+async function render() {
+  const p = route();
+  S.feeds.clear();
+  $('#side').classList.remove('open');
+  closeModal();
+  const main = $('#main');
+  let view;
+  if (!p.length) view = Portfolio();
+  else if (p[0] === 'new') view = NewCompany();
+  else if (p[0] === 'inbox') view = Inbox();
+  else if (p[0] === 'settings') view = Settings();
+  else if (p[0] === 'library') view = Library();
+  else if (p[0] === 'c' && p[1]) view = CompanyView(+p[1], p[2] || 'overview', p[3]);
+  else { location.hash = '#/'; return; }
+  S.view = view;
+  main.innerHTML = '';
+  if (window.innerWidth <= 760) main.insertAdjacentHTML('beforeend', `<div class="mobile-bar" style="margin:-18px -16px 16px"><button class="btn sm" data-act="menu">Menu</button><b>Holdco</b></div>`);
+  const holder = document.createElement('div');
+  main.appendChild(holder);
+  try { await view.mount(holder); } catch (e) { holder.innerHTML = `<div class="panel empty"><h2>Something went wrong</h2><p>${esc(e.message)}</p></div>`; }
+  renderSide();
+}
+window.addEventListener('hashchange', render);
+
+// ---------------------------------------------------------------- portfolio
+function Portfolio() {
+  let el;
+  const draw = () => {
+    const st = S.st;
+    if (!st || !el) return;
+    const cos = st.companies.filter((c) => c.status !== 'archived');
+    const working = st.agents.filter((a) => a.status === 'working').length;
+    $('#pf-sub', el).textContent = cos.length
+      ? `${plural(cos.length, 'company', 'companies')}, ${plural(working, 'agent')} working right now.`
+      : 'Companies run by your local AI team.';
+    const list = $('#pf-list', el);
+    if (!cos.length) return;
+    list.innerHTML = cos.map((c) => {
+      const s = c.stats;
+      const status = { active: ['good', 'Running'], founding: ['accent', 'Founding'], paused: ['warn', 'Paused'] }[c.status] || ['', c.status];
+      return `<a class="co-row" href="#/c/${c.id}">
+        <div><div class="title"><h3>${esc(c.name)}</h3><span class="badge ${status[0]}">${status[1]}</span><span class="badge">${esc(c.stage)}</span></div>
+          <p class="muted" style="margin:4px 0 8px">${esc(c.mission || c.idea.split('\n')[0])}</p>
+          <div class="facts"><span><b class="num">${s.agents_working}</b> of ${s.agents_total} agents working</span><span><b class="num">${s.tasks_open}</b> open tasks</span><span><b class="num">${s.done_today}</b> done today</span></div></div>
+        <div class="right">${s.approvals ? `<span class="badge warn">${plural(s.approvals, 'request')} for you</span>` : ''}<span class="faint small">${s.last_event ? 'Active ' + rel(s.last_event) : ''}</span></div></a>`;
+    }).join('');
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      const hasCos = S.st && S.st.companies.some((c) => c.status !== 'archived');
+      el.innerHTML = `<div class="page-head"><div><h1>Portfolio</h1><p class="sub" id="pf-sub"></p></div>
+        <div class="actions"><a class="btn primary" href="#/new">Start a company</a></div></div>
+        ${hasCos ? `<div class="cols"><section class="panel" id="pf-list"></section>
+          <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="pf-feed"></div></section></div>`
+        : `<section class="panel empty"><h2>Start your first company</h2>
+          <p>Describe an idea, or let your agents suggest a few. A CEO agent researches the market, writes a charter and hands work to six specialists: research, engineering, marketing, sales, support and operations. They keep working around the clock on your GPU, and anything that leaves your computer (emails, posts, deploys, purchases) waits in your inbox for a yes.</p>
+          <div id="model-check" class="banner" style="margin:18px 0"><span class="spinner"></span> Checking your model server…</div>
+          <a class="btn primary" href="#/new">Start a company</a></section>`}`;
+      if (hasCos) mountFeed($('#pf-feed', el), 0);
+      else checkModel($('#model-check', el));
+      draw();
+    },
+    onState: draw,
+  };
+}
+
+async function checkModel(box) {
+  const [m, st] = await Promise.all([GET('/api/llm/models').catch(() => ({ ok: false, error: 'No response' })), GET('/api/settings')]);
+  const model = st.settings.default_model;
+  if (!m.ok) {
+    box.className = 'banner bad';
+    box.innerHTML = `<div class="grow"><b>Your model server isn't reachable.</b><br><span class="small">${esc(m.error)}</span>
+      <ol class="steps small"><li>Install Ollama from <a href="https://ollama.com/download" target="_blank" rel="noopener">ollama.com/download</a> and start it.</li>
+      <li>In a terminal run <code>ollama pull ${esc(model)}</code></li><li>Come back here; this check reruns when you reload.</li></ol></div>
+      <a class="btn" href="#/settings">Model settings</a>`;
+  } else if (!m.models.includes(model)) {
+    box.className = 'banner warn';
+    box.innerHTML = `<div class="grow"><b>Connected, but ${esc(model)} isn't installed.</b><br><span class="small">Run <code>ollama pull ${esc(model)}</code>, or pick one of your ${m.models.length} installed models in Settings.</span></div><a class="btn" href="#/settings">Model settings</a>`;
+  } else {
+    box.className = 'banner';
+    box.innerHTML = `<div class="grow"><b>Ready.</b> Connected to your model server; ${esc(model)} will run your agents.</div>`;
+  }
+}
+
+// ---------------------------------------------------------------- new company
+function NewCompany() {
+  let el, mode = 'idea', about = '', presetsData = null;
+  const chosenTemplate = () => (el && $('input[name=template]:checked', el)?.value) || presetsData?.default_template || 'launch';
+  const ideaForm = () => `
+    <form class="form-stack panel-body" data-form="found" style="padding:20px 22px">
+      <label class="field">The idea<span class="hint">What you'd sell, to whom. A sentence or a page, both work.</span>
+        <textarea name="idea" rows="5" required minlength="8" placeholder="A subscription that sends small cafés a weekly, AI-written social media plan with ready-to-post images."></textarea></label>
+      <div class="form-grid">
+        <label class="field">Company name<span class="hint">Optional. The CEO will pick one if you leave it blank.</span><input type="text" name="name" maxlength="80"></label>
+      </div>
+      <label class="field">About you<span class="hint">Skills, budget, hours per week, anything off-limits. Agents plan around this.</span>
+        <textarea name="context" rows="3" placeholder="I'm a designer, I can spend $200 to start and about 5 hours a week. No cold calling.">${esc(about)}</textarea></label>
+      ${presetsData ? templatePicker(presetsData, presetsData.default_template) : ''}
+      <div><button class="btn primary" type="submit">Found this company</button></div>
+    </form>`;
+  const findForm = () => `
+    <form class="form-stack panel-body" data-form="ideas" style="padding:20px 22px">
+      <div class="form-grid">
+        <label class="field">What are you into?<textarea name="interests" rows="2" placeholder="Dogs, coffee, indie games"></textarea></label>
+        <label class="field">Skills and background<textarea name="skills" rows="2" placeholder="Marketing, some Python"></textarea></label>
+      </div>
+      <div class="form-grid">
+        <label class="field">Starting budget<input type="text" name="budget" placeholder="$300"></label>
+        <label class="field">Hours a week you can give<input type="text" name="hours" placeholder="5"></label>
+      </div>
+      ${presetsData ? templatePicker(presetsData, presetsData.default_template) : ''}
+      <div class="actions"><button class="btn primary" type="submit">Suggest three ideas</button><span class="faint small" id="ideas-wait"></span></div>
+      <div id="ideas"></div>
+    </form>`;
+  const draw = () => {
+    el.innerHTML = `<div class="page-head"><div><h1>Start a company</h1><p class="sub">Your CEO agent takes it from here: market research, a charter, a team and a first week of work.</p></div></div>
+      <section class="panel"><div class="choice" role="tablist">
+        <button role="tab" aria-selected="${mode === 'idea'}" class="${mode === 'idea' ? 'on' : ''}" data-act="mode" data-mode="idea"><b>I have an idea</b>Describe it and the team starts building.</button>
+        <button role="tab" aria-selected="${mode === 'find'}" class="${mode === 'find' ? 'on' : ''}" data-act="mode" data-mode="find"><b>Suggest ideas for me</b>Tell the AI about you and pick from three.</button>
+      </div>${mode === 'idea' ? ideaForm() : findForm()}</section>`;
+  };
+  return {
+    async mount(holder) { el = holder; presetsData = await loadPresets().catch(() => null); draw(); },
+    act(name, t) { if (name === 'mode') { mode = t.dataset.mode; draw(); } },
+    async submit(name, form) {
+      const f = Object.fromEntries(new FormData(form));
+      const btn = $('button[type=submit]', form);
+      if (name === 'found' || name === 'found-idea') {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Founding…';
+        try {
+          const r = await api('POST', '/api/companies', { idea: f.idea, name: f.name || '', context: f.context || '', template: chosenTemplate() });
+          await refreshState();
+          location.hash = `#/c/${r.company.id}`;
+        } catch (e) { fail(e); btn.disabled = false; btn.textContent = 'Found this company'; }
+      }
+      if (name === 'ideas') {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Thinking…';
+        $('#ideas-wait', el).textContent = 'Local models can take a minute.';
+        about = [f.skills && `Skills: ${f.skills}`, f.budget && `Budget: ${f.budget}`, f.hours && `Hours per week: ${f.hours}`, f.interests && `Interests: ${f.interests}`].filter(Boolean).join('. ');
+        try {
+          const r = await api('POST', '/api/ideas', f);
+          $('#ideas', el).innerHTML = `<div class="ideas">${r.ideas.map((i, n) => `
+            <article class="idea"><h3>${esc(i.name)}</h3><p>${esc(i.one_liner)}</p>
+              <dl><dt>Customer</dt><dd>${esc(i.customer)}</dd><dt>Offer</dt><dd>${esc(i.offer)}</dd>
+              <dt>Why it fits you</dt><dd>${esc(i.why_it_fits)}</dd><dt>First week</dt><dd>${esc(i.first_week)}</dd></dl>
+              <button class="btn primary" type="button" data-act="pick" data-n="${n}">Found ${esc(i.name)}</button></article>`).join('')}</div>`;
+          this.ideas = r.ideas;
+        } catch (e) { fail(e); }
+        btn.disabled = false;
+        btn.textContent = 'Suggest three more';
+        $('#ideas-wait', el).textContent = '';
+      }
+    },
+    async actPick(t) {
+      const i = this.ideas[+t.dataset.n];
+      t.disabled = true;
+      t.innerHTML = '<span class="spinner"></span> Founding…';
+      try {
+        const idea = `${i.name}: ${i.one_liner}\nCustomer: ${i.customer}\nOffer: ${i.offer}\nFirst week: ${i.first_week}`;
+        const r = await api('POST', '/api/companies', { idea, name: i.name, context: about, template: chosenTemplate() });
+        await refreshState();
+        location.hash = `#/c/${r.company.id}`;
+      } catch (e) { fail(e); t.disabled = false; }
+    },
+  };
+}
+
+// ---------------------------------------------------------------- inbox
+const ACTION_VERB = {
+  send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
+  http_post: 'wants to send data to an outside service', run_code: 'wants to run code on this PC',
+  spend_money: 'wants you to buy something', question: 'has a question',
+};
+
+const platformName = (p) => ({ x: 'X', twitter: 'X', linkedin: 'LinkedIn', reddit: 'Reddit', instagram: 'Instagram', facebook: 'Facebook', threads: 'Threads', bluesky: 'Bluesky', tiktok: 'TikTok', youtube: 'YouTube' }[(p || '').toLowerCase()] || p || 'social media');
+
+function requestFields(a) {
+  const p = a.payload || {};
+  const ro = (label, v) => `<label class="field">${label}<div class="box">${esc(v)}</div></label>`;
+  switch (a.action) {
+    case 'send_email':
+      return `<div class="form-grid"><label class="field">To<input type="email" data-k="to" value="${esc(p.to)}"></label>
+        <label class="field">Subject<input type="text" data-k="subject" value="${esc(p.subject)}"></label></div>
+        <label class="field">Message<textarea data-k="body" rows="8">${esc(p.body)}</textarea></label>`;
+    case 'social_post':
+      return `<label class="field">Post for ${esc(platformName(p.platform))}<textarea data-k="content" rows="4">${esc(p.content)}</textarea></label>
+        ${p.link ? ro('Link', p.link) : ''}`;
+    case 'deploy_site':
+      return `<p class="muted">Publishes everything in the company's <code>site/</code> folder to Netlify. <a href="/preview/${esc(a.company_slug || '')}/" target="_blank" rel="noopener" data-preview="${a.company_id}">Preview the site first</a>.</p>`;
+    case 'http_post':
+      return `${ro('Request', `${p.method || 'POST'} ${p.url}`)}<label class="field">Body<pre class="box">${esc(JSON.stringify(p.body, null, 2))}</pre></label>`;
+    case 'run_code':
+      return `<label class="field">${esc(p.language === 'python' ? 'Python script' : 'Shell command')} (runs in the company folder, ${esc(p.timeout || 60)}s limit)<textarea class="code" data-k="code" rows="${Math.min(16, Math.max(3, (p.code || '').split('\n').length + 1))}">${esc(p.code)}</textarea></label>`;
+    case 'spend_money':
+      return `<div class="form-grid">${ro('Item', p.item)}${ro('Cost', `$${p.amount_usd}`)}${p.vendor ? ro('Vendor', p.vendor) : ''}</div>
+        ${p.url ? `<p><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.url)}</a></p>` : ''}${ro('Why', p.reason)}
+        <p class="faint small">Holdco never spends money. Approving tells the agent you'll make the purchase yourself.</p>`;
+    case 'question':
+      return `<div class="box md">${md(p.question)}</div><label class="field">Your answer<textarea data-k="answer" rows="3"></textarea></label>`;
+    default:
+      return `<pre class="box">${esc(JSON.stringify(p, null, 2))}</pre>`;
+  }
+}
+
+function requestCard(a) {
+  const agent = S.agents[a.agent_id] || { name: a.agent_name || 'An agent', role: a.agent_role || '' };
+  const q = a.action === 'question';
+  const approveLabel = { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run' }[a.action] || 'Approve';
+  return `<article class="req" data-req="${a.id}">
+    <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${ACTION_VERB[a.action] || esc(a.action)}</span>
+      <div class="faint small">Request #${a.id}, ${when(a.created_at)}</div></div></div>
+    <div class="fields">${requestFields(a)}</div>
+    <div class="foot">${q ? `<button class="btn primary" data-act="decide" data-d="answer">Send answer</button>`
+      : `<input type="text" data-k="feedback" placeholder="Note for the agent (optional)">
+         <button class="btn" data-act="decide" data-d="reject">Reject</button>
+         <button class="btn good" data-act="decide" data-d="approve">${approveLabel}</button>`}</div>
+  </article>`;
+}
+
+async function decideRequest(card, decision) {
+  const id = +card.dataset.req;
+  const payload = {};
+  $$('[data-k]', card).forEach((f) => { payload[f.dataset.k] = f.value; });
+  const { feedback = '', answer = '' } = payload;
+  delete payload.feedback; delete payload.answer;
+  if (decision === 'answer' && !answer.trim()) { toast('Write an answer first.', true); return; }
+  $$('button', card).forEach((b) => { b.disabled = true; });
+  try {
+    const r = await api('POST', `/api/approvals/${id}`, { decision, payload, feedback, answer });
+    const a = r.approval;
+    const msg = { done: 'Done.', rejected: feedback ? 'Rejected. The agent will revise it.' : 'Rejected.', answered: 'Answer sent.', failed: `Couldn't complete it: ${a.result} You can retry it from Recent decisions.` }[a.status] || a.status;
+    toast(msg.slice(0, 220), a.status === 'failed');
+    card.remove();
+    refreshState();
+    if (S.view && S.view.reloadDecided) S.view.reloadDecided();
+  } catch (e) { fail(e); $$('button', card).forEach((b) => { b.disabled = false; }); }
+}
+
+function Inbox() {
+  let el;
+  const slugOf = (cid) => (S.st?.companies.find((c) => c.id === cid) || {}).slug || '';
+  const loadPending = async () => {
+    const r = await GET('/api/approvals');
+    const list = $('#req-list', el);
+    const have = new Set($$('[data-req]', list).map((n) => +n.dataset.req));
+    const want = new Set(r.approvals.map((a) => a.id));
+    $$('[data-req]', list).forEach((n) => { if (!want.has(+n.dataset.req)) n.remove(); });
+    r.approvals.filter((a) => !have.has(a.id)).reverse().forEach((a) => {
+      a.company_slug = slugOf(a.company_id);
+      list.insertAdjacentHTML('afterbegin', requestCard(a));
+    });
+    $('#req-empty', el).classList.toggle('hidden', r.approvals.length > 0);
+  };
+  const loadDecided = async () => {
+    const r = await GET('/api/approvals?status=decided');
+    const badge = { done: 'good', answered: 'good', rejected: '', failed: 'bad', running: 'accent' };
+    $('#decided', el).innerHTML = r.approvals.length ? r.approvals.slice(0, 30).map((a) => `
+      <li>${avatar(S.agents[a.agent_id] || { name: a.agent_name || '?', role: a.agent_role })}<div class="grow">
+        <div><span class="badge ${badge[a.status] || ''}">${esc(a.status)}</span> ${esc(a.summary)}</div>
+        <div class="faint small">${esc(a.company_name)}, ${when(a.decided_at)}${a.feedback ? `. Your note: ${esc(a.feedback)}` : ''}</div>
+        ${a.result ? `<div class="small muted" style="margin-top:4px">${inline(a.result.slice(0, 400))}</div>` : ''}</div>
+        ${a.status === 'failed' ? `<button class="btn sm" data-act="retry" data-id="${a.id}">Retry</button>` : ''}</li>`).join('')
+      : '<li class="faint">Nothing decided yet.</li>';
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<div class="page-head"><div><h1>Inbox</h1><p class="sub">Everything your companies want to send, publish, run or buy waits here. Edit anything before you approve it.</p></div></div>
+        <div class="stack"><section class="panel"><div id="req-list"></div>
+          <div id="req-empty" class="empty hidden"><h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code or spend money, it shows up here first.</p></div></section>
+          <section class="panel"><div class="panel-head"><h2>Recent decisions</h2></div><ul class="decided" id="decided" style="padding-top:8px"></ul></section></div>`;
+      await Promise.all([loadPending(), loadDecided()]);
+    },
+    live(ev) { if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); } },
+    reloadDecided: () => loadDecided().catch(() => {}),
+    async act(name, t) {
+      if (name === 'retry') {
+        try { await api('POST', `/api/approvals/${t.dataset.id}/retry`); toast('Back in your inbox.'); await Promise.all([loadPending(), loadDecided()]); refreshState(); } catch (e) { fail(e); }
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------- library
+function Library() {
+  return {
+    async mount(el) {
+      const data = await loadPresets();
+      el.innerHTML = `<div class="page-head"><div><h1>Agent library</h1><p class="sub">${data.presets.length} researched roles, each with a playbook, rules, recurring duties and model settings. Pick a team template when you start a company, or hire individual roles from a company's Team tab.</p></div></div>
+        <section class="panel" style="margin-bottom:22px"><div class="panel-head"><h2>Team templates</h2></div><div class="panel-body">
+          <div class="tpl-grid">${Object.values(data.templates).map((t) => `<div class="tpl static"><span class="tpl-body"><span class="tpl-title"><b>${esc(t.label)}</b>${t.recommended ? ' <span class="badge accent">Default</span>' : ''}</span><span class="small muted">${esc(t.description)}</span>
+            <span class="chips">${t.team.map((m) => avatar({ name: m.name, role: m.key, title: m.title }, 'sm', false)).join('')}</span></span></div>`).join('')}</div></div></section>
+        ${presetGallery(data)}`;
+    },
+    act(name, t) { if (name === 'preset-info') showPreset(t.dataset.key); },
+  };
+}
+
+// ---------------------------------------------------------------- settings
+function Settings() {
+  let el, data;
+  const sel = (name, value, opts) => `<select name="${name}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+  const modelSel = (name, value, models, blank) => {
+    const opts = [...(blank ? [['', blank]] : []), ...models.map((m) => [m, m])];
+    if (value && !models.includes(value)) opts.push([value, `${value} (not installed)`]);
+    return sel(name, value, opts);
+  };
+  const draw = (models) => {
+    const s = data.settings;
+    const pol = s.policies;
+    el.innerHTML = `<div class="page-head"><div><h1>Settings</h1><p class="sub">Applies to every company. Each company can override approvals in its own settings.</p></div></div>
+    <form class="panel" data-form="settings">
+      <div class="section"><h2>Model</h2><p class="muted">Holdco talks to a model server on this PC. Ollama is the easiest; LM Studio, vLLM and llama.cpp work through the OpenAI-compatible option.</p>
+        <div class="form-grid">
+          <label class="field">Server type${sel('llm_backend', s.llm_backend, [['ollama', 'Ollama'], ['openai', 'OpenAI-compatible']])}</label>
+          <label class="field">Server address<input type="text" name="llm_base_url" value="${esc(s.llm_base_url)}"></label>
+          <label class="field">API key<span class="hint">Only if your server needs one.</span><input type="password" name="llm_api_key" value="${esc(s.llm_api_key)}" autocomplete="off"></label>
+        </div>
+        <div class="form-grid" style="margin-top:14px">
+          <label class="field">Agent model<span class="hint">Used by every agent unless you set one per agent.</span>${models.length ? modelSel('default_model', s.default_model, models) : `<input type="text" name="default_model" value="${esc(s.default_model)}">`}</label>
+          <label class="field">CEO model<span class="hint">Optional stronger model for planning.</span>${models.length ? modelSel('ceo_model', s.ceo_model, models, 'Same as agent model') : `<input type="text" name="ceo_model" value="${esc(s.ceo_model)}">`}</label>
+          <label class="field">Context window (tokens)<span class="hint">Ollama only. 32768 suits a 5090.</span><input type="number" name="num_ctx" min="4096" step="1024" value="${esc(s.num_ctx)}"></label>
+        </div>
+        <div class="form-grid" style="margin-top:14px">
+          <label class="field">Agents working at once<span class="hint">Match OLLAMA_NUM_PARALLEL.</span><input type="number" name="max_concurrent_runs" min="1" max="8" value="${esc(s.max_concurrent_runs)}"></label>
+          <label class="field">Tool calls per session<input type="number" name="max_steps_per_run" min="4" max="60" value="${esc(s.max_steps_per_run)}"></label>
+          <label class="field">Sampling<span class="hint">Automatic uses each model maker's recommended settings.</span>${sel('sampling', s.sampling || 'auto', [['auto', 'Automatic'], ['manual', 'Manual temperature']])}</label>
+          <label class="field">Manual temperature<input type="number" name="temperature" min="0" max="1.5" step="0.1" value="${esc(s.temperature)}"></label>
+          <label class="field">Tool calling${sel('tool_mode', s.tool_mode, [['auto', 'Automatic'], ['native', 'Native only'], ['json', 'Prompt-based (for models without tools)']])}</label>
+        </div>
+        <div class="actions" style="margin-top:14px"><button class="btn" type="button" data-act="test-llm">Test connection</button><span id="llm-result" class="small"></span></div>
+      </div>
+      <div class="section"><h2>Autopilot</h2>
+        <label class="check"><input type="checkbox" name="scheduler_enabled" ${s.scheduler_enabled ? 'checked' : ''}><span>Keep agents working around the clock<br><span class="faint small">When off, agents only work when you press Run or chat with them.</span></span></label>
+        <div class="form-grid" style="margin-top:14px"><label class="field">What agents call you<input type="text" name="owner_name" value="${esc(s.owner_name)}"></label></div>
+      </div>
+      <div class="section"><h2>Approvals</h2><p class="muted">What happens when an agent tries something that leaves your computer.</p>
+        <div class="form-grid">${Object.entries(data.policy_actions).map(([k, label]) => `
+          <label class="field">${esc(label)}${data.locked.includes(k) ? `<div class="box small">Always asks you</div>`
+            : sel(`policy_${k}`, pol[k], [['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']])}</label>`).join('')}</div>
+      </div>
+      <div class="section"><h2>Web search</h2>
+        <div class="form-grid">
+          <label class="field">Search with${sel('search_provider', s.search_provider, [['duckduckgo', 'DuckDuckGo (no key)'], ['searxng', 'SearXNG (self-hosted)'], ['brave', 'Brave Search API']])}</label>
+          <label class="field">SearXNG address<input type="text" name="searxng_url" value="${esc(s.searxng_url)}" placeholder="http://127.0.0.1:8888"></label>
+          <label class="field">Brave API key<input type="password" name="brave_api_key" value="${esc(s.brave_api_key)}" autocomplete="off"></label>
+        </div>
+      </div>
+      <div class="section actions" style="justify-content:space-between"><span class="faint small">Data folder: <code>${esc(data.data_dir)}</code></span><button class="btn primary" type="submit">Save settings</button></div>
+    </form>`;
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      data = await GET('/api/settings');
+      draw(await loadModels(true));
+    },
+    async submit(name, form) {
+      const f = new FormData(form);
+      const body = {};
+      for (const [k, v] of f.entries()) if (!k.startsWith('policy_')) body[k] = v;
+      ['num_ctx', 'max_concurrent_runs', 'max_steps_per_run'].forEach((k) => { body[k] = parseInt(body[k], 10); });
+      body.temperature = parseFloat(body.temperature);
+      body.scheduler_enabled = !!form.scheduler_enabled.checked;
+      body.policies = {};
+      Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
+      try {
+        data = { ...data, ...(await api('PUT', '/api/settings', body)) };
+        S.models = null;
+        toast('Settings saved.');
+        refreshState();
+      } catch (e) { fail(e); }
+    },
+    async act(name) {
+      if (name === 'test-llm') {
+        const form = $('form', el);
+        await this.submit('settings', form);
+        const out = $('#llm-result', el);
+        out.innerHTML = '<span class="spinner"></span> Asking the model…';
+        try {
+          const r = await api('POST', '/api/llm/test', {});
+          out.innerHTML = `<span class="badge ${r.ok ? 'good' : 'bad'}">${r.ok ? 'OK' : 'Failed'}</span> ${esc(r.message)}`;
+          if (r.ok) { const models = await loadModels(true); data = await GET('/api/settings'); draw(models); $('#llm-result', el).innerHTML = `<span class="badge good">OK</span> ${esc(r.message)}`; }
+        } catch (e) { out.textContent = e.message; }
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------- company
+const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['files', 'Files'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
+
+function CompanyView(cid, tab, arg) {
+  let el, d, tabView;
+  const head = () => {
+    const c = d.company;
+    const status = { active: ['good', 'Running'], founding: ['accent', 'Founding'], paused: ['warn', 'Paused'], archived: ['', 'Archived'] }[c.status] || ['', c.status];
+    const url = c.settings.site_url;
+    return `<div class="co-head"><div><h1>${esc(c.name)}</h1><p class="one">${esc(c.mission || c.idea.split('\n')[0])}</p>
+        <div class="meta"><span class="badge ${status[0]}">${status[1]}</span><span class="badge">Stage: ${esc(c.stage)}</span>
+        ${url ? `<a class="small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url.replace(/^https?:\/\//, ''))}</a>` : ''}</div></div>
+      <div class="actions">
+        ${d.has_site ? `<a class="btn" href="/preview/${esc(c.slug)}/" target="_blank" rel="noopener">Preview website</a>` : ''}
+        ${c.status === 'active' ? `<button class="btn" data-act="plan">Plan now</button><button class="btn" data-act="status" data-s="paused">Pause</button>` : ''}
+        ${c.status === 'paused' || c.status === 'archived' ? `<button class="btn primary" data-act="status" data-s="active">Resume</button>` : ''}
+      </div></div>
+      <nav class="tabs" aria-label="Company">${TABS.map(([k, l]) => `<a href="#/c/${cid}/${k}" class="${k === tab ? 'on' : ''}">${l}${k === 'overview' && d.stats.approvals ? ` <span class="count">${d.stats.approvals}</span>` : ''}</a>`).join('')}</nav>`;
+  };
+  const reload = async () => {
+    d = await GET(`/api/companies/${cid}`);
+    d.agentsById = Object.fromEntries(d.agents.map((a) => [a.id, a]));
+  };
+  const redrawHead = async () => {
+    await reload();
+    const h = $('#co-head', el);
+    if (h) h.innerHTML = head();
+  };
+  const refreshHeadSoon = debounce(() => redrawHead().then(() => tabView?.onCompany?.()).catch(() => {}), 700);
+
+  return {
+    async mount(holder) {
+      el = holder;
+      await reload();
+      el.innerHTML = `<div id="co-head">${head()}</div><div id="tab"></div>`;
+      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, files: TabFiles, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
+      tabView = factory(cid, () => d, arg, async () => { await redrawHead(); tabView?.onCompany?.(); });
+      await tabView.mount($('#tab', el));
+    },
+    live(ev) {
+      if (ev.company_id && ev.company_id !== cid) return;
+      if (['event', 'agents', 'company', 'approvals', 'tasks'].includes(ev.type)) refreshHeadSoon();
+      tabView?.live?.(ev);
+    },
+    async act(name, t, e) {
+      if (name === 'status') {
+        try { await api('PATCH', `/api/companies/${cid}`, { status: t.dataset.s }); await redrawHead(); refreshState(); tabView?.onCompany?.(); } catch (err) { fail(err); }
+        return;
+      }
+      if (name === 'plan') {
+        try { const r = await api('POST', `/api/companies/${cid}/cycle`); toast(r.message); } catch (err) { fail(err); }
+        return;
+      }
+      if (tabView?.act) return tabView.act(name, t, e);
+    },
+    submit(name, form, e) { return tabView?.submit?.(name, form, e); },
+  };
+}
+
+// ---- overview
+function TabOverview(cid, data) {
+  let el;
+  const side = () => {
+    const d = data();
+    const c = d.company;
+    const ceo = d.agents.find((a) => a.role === 'ceo');
+    let banner = '';
+    if (c.status === 'founding') {
+      banner = ceo && ceo.status === 'working'
+        ? `<div class="banner"><span class="spinner"></span><div class="grow"><b>${esc(ceo.name)} is founding the company.</b> Researching the market, writing a charter and setting up the first tasks. Follow along in the feed.</div></div>`
+        : `<div class="banner bad"><div class="grow"><b>Founding stopped before it finished.</b> Usually the model server wasn't reachable. Check Settings, then try again.</div><button class="btn" data-act="refound">Retry founding</button></div>`;
+    } else if (c.status === 'paused') {
+      banner = `<div class="banner warn"><div class="grow"><b>Paused.</b> Agents finish their current step and then wait. Chat still works.</div><button class="btn primary" data-act="status" data-s="active">Resume</button></div>`;
+    }
+    if (d.stats.approvals) banner += `<div class="banner warn"><div class="grow"><b>${plural(d.stats.approvals, 'request')} from ${esc(c.name)} ${d.stats.approvals === 1 ? 'is' : 'are'} waiting for you.</b></div><a class="btn" href="#/inbox">Review</a></div>`;
+    $('#ov-banner', el).innerHTML = banner;
+    $('#ov-team', el).innerHTML = d.agents.map((a) => `<li>${avatar(a)}<div class="info"><div><b>${esc(a.name)}</b> <span class="role">${esc(a.title)}</span></div>
+      <div class="doing">${!a.enabled ? 'Off' : a.status === 'working' ? esc(a.status_note || 'Working') : a.status === 'error' ? `<span style="color:var(--bad)">${esc(a.status_note || 'Error')}</span>` : 'Idle'}</div></div></li>`).join('');
+    $('#ov-stats', el).innerHTML = `
+      <div class="kpi"><div class="v">${d.stats.tasks_open}</div><div class="k">Open tasks</div></div>
+      <div class="kpi"><div class="v">${d.stats.tasks_done}</div><div class="k">Tasks done</div></div>
+      <div class="kpi"><div class="v">${d.stats.done_today}</div><div class="k">Done today</div></div>
+      <div class="kpi"><div class="v">${(c.tokens_used / 1e6).toFixed(c.tokens_used > 1e7 ? 0 : 2)}M</div><div class="k">Tokens used</div></div>
+      ${d.metrics.map((m) => `<div class="kpi" title="${esc(m.note)}"><div class="v">${esc(Number(m.value).toLocaleString())}</div><div class="k">${esc(m.name.replace(/_/g, ' '))}</div></div>`).join('')}`;
+    $('#ov-folder', el).innerHTML = `<p class="small muted" style="margin:0 0 6px">Everything the team makes is a normal file on your PC:</p><code class="small" style="overflow-wrap:anywhere">${esc(d.folder)}</code>`;
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<div id="ov-banner"></div><div class="cols">
+        <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="ov-feed"></div></section>
+        <div class="stack"><section class="panel"><div class="panel-head"><h2>Team</h2><a class="small" href="#/c/${cid}/team">Manage</a></div><ul class="team-list" id="ov-team" style="padding-top:6px"></ul></section>
+          <section class="panel"><div class="panel-head"><h2>Numbers</h2></div><div class="kpis" id="ov-stats" style="padding-top:14px"></div></section>
+          <section class="panel"><div class="panel-body" id="ov-folder"></div></section></div></div>`;
+      mountFeed($('#ov-feed', el), cid);
+      side();
+    },
+    onCompany: () => side(),
+    async act(name) {
+      if (name === 'refound') {
+        try { await api('POST', `/api/companies/${cid}/refound`); toast('Founding restarted.'); } catch (e) { fail(e); }
+      }
+    },
+  };
+}
+
+// ---- chat
+function TabChat(cid, data) {
+  let el, busy = [];
+  const draw = (msgs) => {
+    const d = data();
+    const th = $('.thread', el);
+    const atBottom = th.scrollHeight - th.scrollTop - th.clientHeight < 80;
+    th.innerHTML = msgs.length ? msgs.map((m) => {
+      const me = m.sender === 'owner';
+      const a = d.agentsById[m.agent_id] || { name: m.agent_name || 'Team', role: m.agent_role };
+      return `<div class="bubble-row ${me ? 'me' : ''}">${me ? '<span class="av owner">Y</span>' : avatar(a)}
+        <div class="bubble"><div class="who">${me ? `You to ${esc(a.name)}` : esc(a.name)}, ${when(m.created_at)}</div>${md(m.content)}</div></div>`;
+    }).join('') : `<div class="faint" style="padding:10px">Talk to your CEO like you would a cofounder: ask for status, change priorities, hand over context. Agents act on it.</div>`;
+    const target = +$('select[name=agent_id]', el).value;
+    const who = d.agentsById[target];
+    $('.typing', el).textContent = busy.includes(target) && who ? `${who.name} is working…` : '';
+    if (atBottom || !loaded) th.scrollTop = th.scrollHeight;
+    loaded = true;
+  };
+  let loaded = false;
+  const load = async () => { const r = await GET(`/api/companies/${cid}/messages`); busy = r.busy; draw(r.messages); };
+  const loadSoon = debounce(() => load().catch(() => {}), 300);
+  return {
+    async mount(holder) {
+      el = holder;
+      const d = data();
+      const ceo = d.agents.find((a) => a.role === 'ceo');
+      el.innerHTML = `<section class="panel chat"><div class="thread"></div><div class="typing"></div>
+        <form class="composer" data-form="chat">
+          <select name="agent_id" aria-label="Send to">${d.agents.map((a) => `<option value="${a.id}" ${a.id === ceo?.id ? 'selected' : ''}>${esc(a.name)} (${esc(a.role)})</option>`).join('')}</select>
+          <textarea name="content" rows="1" placeholder="Message your team…" aria-label="Message"></textarea>
+          <button class="btn primary" type="submit">Send</button></form></section>`;
+      const ta = $('textarea', el);
+      ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('form', el).requestSubmit(); } });
+      ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'; });
+      $('select', el).addEventListener('change', () => loadSoon());
+      await load();
+      ta.focus();
+    },
+    live(ev) { if (['messages', 'agents'].includes(ev.type)) loadSoon(); },
+    async submit(name, form) {
+      const content = form.content.value.trim();
+      if (!content) return;
+      form.content.value = '';
+      form.content.style.height = 'auto';
+      try {
+        const r = await api('POST', `/api/companies/${cid}/messages`, { content, agent_id: +form.agent_id.value });
+        if (r.queued) toast(`${r.agent} is in the middle of a task and will reply right after.`);
+        await load();
+      } catch (e) { fail(e); form.content.value = content; }
+    },
+  };
+}
+
+// ---- tasks
+const LANES = [['todo', 'To do', ['todo']], ['in_progress', 'In progress', ['in_progress']], ['waiting', 'Waiting or blocked', ['waiting', 'blocked']], ['done', 'Done', ['done', 'cancelled']]];
+
+function TabTasks(cid, data) {
+  let el, tasks = [];
+  const draw = () => {
+    $('.board', el).innerHTML = LANES.map(([k, label, sts]) => {
+      const items = tasks.filter((t) => sts.includes(t.status));
+      return `<div class="lane"><h3><span>${label}</span><span class="num">${items.length}</span></h3>
+        ${items.map((t) => `<button class="card st-${esc(t.status)}" data-act="task" data-id="${t.id}">
+          <div class="t">${esc(t.title)}</div><div class="m">${avatar(data().agentsById[t.agent_id] || { name: t.agent_name || '?', role: t.role }, 'sm')}
+          <span>#${t.id}</span>${t.priority === 1 && !['done', 'cancelled'].includes(t.status) ? '<span class="p1">Urgent</span>' : ''}
+          ${t.status === 'blocked' ? '<span style="color:var(--bad)">Blocked</span>' : ''}${t.status === 'waiting' ? '<span style="color:var(--warn)">Waiting on you</span>' : ''}
+          <span style="margin-left:auto">${when(t.updated_at)}</span></div></button>`).join('') || '<div class="faint small" style="padding:4px">Nothing here.</div>'}</div>`;
+    }).join('');
+  };
+  const load = async () => { tasks = (await GET(`/api/companies/${cid}/tasks`)).tasks; draw(); };
+  const loadSoon = debounce(() => load().catch(() => {}), 500);
+  const agentOptions = (sel) => data().agents.map((a) => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} (${esc(a.role)})</option>`).join('');
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<div class="actions" style="justify-content:space-between;margin-bottom:14px"><p class="muted" style="margin:0">The CEO plans work here and agents pick it up automatically. Add your own tasks any time.</p>
+        <button class="btn primary" data-act="new-task">Add task</button></div><div class="board"></div>`;
+      await load();
+    },
+    live(ev) { if (['tasks', 'agents'].includes(ev.type) || (ev.type === 'event' && ['task', 'done', 'run'].includes(ev.kind))) loadSoon(); },
+    act(name, t) {
+      if (name === 'new-task') {
+        const ceo = data().agents.find((a) => a.role === 'ceo');
+        modal({
+          title: 'Add a task',
+          body: `<form class="form-stack" data-form="new-task" id="nt"><label class="field">Title<input type="text" name="title" required maxlength="200"></label>
+            <label class="field">Details<span class="hint">Objective, inputs to read, and what's out of scope.</span><textarea name="description" rows="4"></textarea></label>
+            <div class="form-grid"><label class="field">Deliverable<input type="text" name="deliverable" placeholder="site/pricing.html"></label></div>
+            <label class="field">Acceptance criteria<span class="hint">3-5 checkable points, one per line. Agents can't finish until the deliverable exists.</span><textarea name="acceptance" rows="3" placeholder="- Three plans with prices from the charter&#10;- audit_page reports no blockers"></textarea></label>
+            <div class="form-grid"><label class="field">Assign to<select name="agent_id">${agentOptions(ceo?.id)}</select></label>
+            <label class="field">Priority<select name="priority"><option value="1">Urgent</option><option value="2" selected>Normal</option><option value="3">Later</option></select></label></div></form>`,
+          foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn primary" type="submit" form="nt">Add task</button>`,
+        });
+      }
+      if (name === 'task') {
+        const task = tasks.find((x) => x.id === +t.dataset.id);
+        if (!task) return;
+        modal({
+          title: `Task #${task.id}`,
+          wide: true,
+          body: `<h2 style="font-size:19px;margin-bottom:6px">${esc(task.title)}</h2>
+            <p class="faint small">Created by ${esc(task.created_by)} ${when(task.created_at)}. Attempts: ${task.attempts}.</p>
+            ${task.description ? md(task.description) : '<p class="faint">No details.</p>'}
+            ${task.deliverable ? `<p><b>Deliverable:</b> ${/^[\w./-]+$/.test(task.deliverable) && /[/.]/.test(task.deliverable) ? `<a href="#/c/${cid}/files/${encodeURIComponent(task.deliverable)}">${esc(task.deliverable)}</a>` : esc(task.deliverable)}</p>` : ''}
+            ${task.acceptance ? `<h3 style="margin:12px 0 4px">Acceptance criteria</h3>${md(task.acceptance)}` : ''}
+            ${task.routine ? '<p class="faint small">Recurring duty</p>' : ''}
+            ${task.result ? `<h3 style="margin:16px 0 6px">Notes and results</h3><div class="box">${md(task.result)}</div>` : ''}
+            <form class="form-stack" data-form="edit-task" id="et" data-id="${task.id}" style="margin-top:18px">
+              <div class="form-grid"><label class="field">Status<select name="status">${['todo', 'in_progress', 'waiting', 'blocked', 'done', 'cancelled'].map((s) => `<option value="${s}" ${s === task.status ? 'selected' : ''} ${s === 'in_progress' ? 'disabled' : ''}>${s.replace('_', ' ')}</option>`).join('')}</select></label>
+              <label class="field">Assigned to<select name="agent_id">${agentOptions(task.agent_id)}</select></label>
+              <label class="field">Priority<select name="priority">${[[1, 'Urgent'], [2, 'Normal'], [3, 'Later']].map(([v, l]) => `<option value="${v}" ${v === task.priority ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+              <label class="field">Add a note for the agent<textarea name="note" rows="2"></textarea></label></form>`,
+          foot: `<button class="btn" data-act="close-modal">Close</button><button class="btn primary" type="submit" form="et">Save</button>`,
+        });
+      }
+    },
+    async submit(name, form) {
+      const f = Object.fromEntries(new FormData(form));
+      try {
+        if (name === 'new-task') await api('POST', `/api/companies/${cid}/tasks`, { ...f, agent_id: +f.agent_id, priority: +f.priority });
+        if (name === 'edit-task') {
+          const task = tasks.find((x) => x.id === +form.dataset.id);
+          const body = { agent_id: +f.agent_id, priority: +f.priority, note: f.note };
+          if (f.status !== task.status) body.status = f.status;
+          await api('PATCH', `/api/tasks/${form.dataset.id}`, body);
+        }
+        closeModal();
+        toast('Saved.');
+        await load();
+      } catch (e) { fail(e); }
+    },
+  };
+}
+
+// ---- team
+function TabTeam(cid, data, _arg, reloadCompany) {
+  let el;
+  const draw = async () => {
+    const models = await loadModels();
+    const d = data();
+    $('#team', el).innerHTML = d.agents.map((a) => `
+      <li data-agent="${a.id}" style="flex-wrap:wrap">${avatar(a, 'lg')}
+        <div class="info" style="min-width:200px"><div><b>${esc(a.name)}</b> <span class="role">${esc(a.title)}</span>${!presetByKey(a.preset || a.role) ? ' <span class="badge">custom</span>' : ''}</div>
+          <div class="doing">${!a.enabled ? 'Off' : a.status === 'working' ? esc(a.status_note || 'Working') : a.status === 'error' ? `<span style="color:var(--bad)">${esc(a.status_note)}</span>` : `Idle${a.last_run_at ? `, last active ${rel(a.last_run_at)}` : ''}`}</div></div>
+        <div class="actions">
+          <select data-act-change="model" aria-label="Model for ${esc(a.name)}" style="width:auto;max-width:210px"><option value="">Default model</option>${models.map((m) => `<option ${m === a.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}${a.model && !models.includes(a.model) ? `<option selected>${esc(a.model)}</option>` : ''}</select>
+          <label class="check small" style="align-items:center"><input type="checkbox" data-act-change="enabled" ${a.enabled ? 'checked' : ''} style="margin:0"> On</label>
+          <button class="btn sm" data-act="run">${a.role === 'ceo' ? 'Plan now' : 'Run next task'}</button>
+          <button class="btn sm" data-act="sessions">Sessions</button>
+          ${presetByKey(a.preset || a.role) ? `<button class="btn sm ghost" data-act="preset-info" data-key="${esc(a.preset || a.role)}">Playbook</button>` : ''}
+          <button class="btn sm ghost" data-act="edit-agent">Edit</button>
+        </div></li>`).join('');
+    const hired = new Set(d.agents.map((a) => a.preset || a.role));
+    $('#gallery', el).innerHTML = presetGallery(S.presets, { hire: true, hired });
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      await loadPresets();
+      el.innerHTML = `<section class="panel"><ul class="team-list" id="team"></ul></section>
+        <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Hire from the library</h2><span class="small faint">Agents only use the GPU when they have work, so a bigger team means more work queued, not more load.</span></div>
+          <div class="panel-body" id="gallery"></div></section>
+        <section class="panel" style="margin-top:18px"><details><summary class="panel-head" style="padding-bottom:14px;cursor:pointer"><h2>Create a custom agent</h2></summary>
+        <form class="panel-body form-stack" data-form="hire"><div class="form-grid">
+          <label class="field">Role key<input type="text" name="role" required maxlength="24" placeholder="pricing, translations"></label>
+          <label class="field">Name<input type="text" name="name" maxlength="30"></label>
+          <label class="field">Title<input type="text" name="title" maxlength="60" placeholder="Head of Pricing"></label></div>
+          <label class="field">What they own<span class="hint">Their focus, how they work and how to judge good work. Custom agents get a general tool belt.</span><textarea name="focus" rows="4"></textarea></label>
+          <div><button class="btn primary" type="submit">Add agent</button></div></form></details></section>`;
+      el.addEventListener('change', async (e) => {
+        const t = e.target.closest('[data-act-change]');
+        if (!t) return;
+        const id = +t.closest('[data-agent]').dataset.agent;
+        const body = t.dataset.actChange === 'model' ? { model: t.value } : { enabled: t.checked };
+        try { await api('PATCH', `/api/agents/${id}`, body); toast('Saved.'); } catch (err) { fail(err); }
+      });
+      await draw();
+    },
+    onCompany: () => draw(),
+    async act(name, t) {
+      const li = t.closest('[data-agent]');
+      const a = li ? data().agentsById[+li.dataset.agent] : null;
+      if (name === 'preset-info') { showPreset(t.dataset.key, { hire: !data().agents.some((x) => (x.preset || x.role) === t.dataset.key) }); return; }
+      if (name === 'hire-preset') {
+        t.disabled = true;
+        try {
+          const r = await api('POST', `/api/companies/${cid}/agents`, { preset: t.dataset.key });
+          closeModal();
+          toast(`${r.agent.name} joined as ${r.agent.title}.`);
+          await reloadCompany();
+          refreshState();
+        } catch (e) { fail(e); t.disabled = false; }
+        return;
+      }
+      if (name === 'run') {
+        try { const r = await api('POST', `/api/agents/${a.id}/run`, {}); toast(r.message); } catch (e) { fail(e); }
+      }
+      if (name === 'edit-agent') {
+        const p = presetByKey(a.preset || a.role);
+        modal({
+          title: `Edit ${a.name}`,
+          body: `<form class="form-stack" data-form="edit-agent" id="ea" data-id="${a.id}"><div class="form-grid">
+            <label class="field">Name<input type="text" name="name" value="${esc(a.name)}"></label>
+            <label class="field">Title<input type="text" name="title" value="${esc(a.title)}"></label></div>
+            <label class="field">Extra instructions<span class="hint">Added to ${p ? 'the ' + esc(p.title) + ' playbook' : 'this agent\'s role'} in every session and take priority over it.</span><textarea name="focus" rows="5">${esc(a.focus)}</textarea></label>
+            <div class="form-grid">
+              <label class="field">Reasoning effort<span class="hint">For gpt-oss models. Higher is slower but better at multi-step work.</span><select name="reasoning">
+                <option value="">Playbook default (${esc(p ? p.reasoning : 'medium')})</option>${['low', 'medium', 'high'].map((r) => `<option value="${r}" ${a.reasoning === r ? 'selected' : ''}>${r[0].toUpperCase() + r.slice(1)}</option>`).join('')}</select></label>
+              <label class="check" style="align-self:end"><input type="checkbox" name="routines_on" ${a.routines_on ? 'checked' : ''}><span>Do recurring duties${p && p.routines.length ? `<br><span class="faint small">${p.routines.map((r) => `${esc(r.title)} (${cadence(r.every_hours)})`).join(', ')}</span>` : '<br><span class="faint small">None in this role</span>'}</span></label>
+            </div></form>`,
+          foot: `${a.role !== 'ceo' ? '<button class="btn danger" data-act="remove-agent" style="margin-right:auto">Remove agent</button>' : ''}<button class="btn" data-act="close-modal">Cancel</button><button class="btn primary" type="submit" form="ea">Save</button>`,
+        });
+        S.editAgent = a;
+      }
+      if (name === 'remove-agent') {
+        const ag = S.editAgent;
+        if (!confirm(`Remove ${ag.name}? Their open tasks go back to the CEO.`)) return;
+        try { await api('DELETE', `/api/agents/${ag.id}`); closeModal(); toast('Removed.'); await reloadCompany(); } catch (e) { fail(e); }
+      }
+      if (name === 'sessions') {
+        const r = await GET(`/api/companies/${cid}/runs?agent_id=${a.id}`);
+        modal({
+          title: `${a.name}'s work sessions`, wide: true,
+          body: r.runs.length ? `<ul class="rows">${r.runs.map((x) => `<li><div class="grow"><div><span class="badge ${x.status === 'done' ? 'good' : x.status === 'error' ? 'bad' : x.status === 'partial' ? 'warn' : ''}">${esc(x.status)}</span> <b>${esc(x.kind)}</b>${x.task_id ? ` on task #${x.task_id}` : ''} <span class="faint small">${when(x.started_at)}, ${x.steps} steps, ${Number(x.tokens).toLocaleString()} tokens</span></div>
+            <div class="small muted">${esc((x.summary || '').replace(/^Status: \w+\n?/, '').slice(0, 300))}</div></div><button class="btn sm" data-act="transcript" data-id="${x.id}">Transcript</button></li>`).join('')}</ul>` : '<p class="faint">No sessions yet.</p>',
+        });
+      }
+      if (name === 'transcript') showTranscript(+t.dataset.id);
+    },
+    async submit(name, form) {
+      const f = Object.fromEntries(new FormData(form));
+      try {
+        if (name === 'hire') { await api('POST', `/api/companies/${cid}/agents`, f); form.reset(); toast('Agent added.'); await reloadCompany(); }
+        if (name === 'edit-agent') {
+          await api('PATCH', `/api/agents/${form.dataset.id}`, { name: f.name, title: f.title, focus: f.focus, reasoning: f.reasoning, routines_on: !!form.routines_on.checked });
+          closeModal(); toast('Saved.'); await reloadCompany();
+        }
+      } catch (e) { fail(e); }
+    },
+  };
+}
+
+async function showTranscript(runId) {
+  const { run } = await GET(`/api/runs/${runId}`);
+  const turn = (m) => {
+    if (m.role === 'assistant') {
+      return `<div class="turn assistant"><div class="r">${esc(run.agent_name)}</div>${m.content ? `<div>${md(m.content)}</div>` : ''}
+        ${(m.tool_calls || []).map((c) => `<pre class="small">→ ${esc(c.name)}(${esc(JSON.stringify(c.arguments, null, 1)).slice(0, 4000)})</pre>`).join('')}</div>`;
+    }
+    if (m.role === 'tool') return `<div class="turn tool"><div class="r">Result of ${esc(m.name)}</div><pre class="small">${esc(m.content)}</pre></div>`;
+    return `<div class="turn"><div class="r">${m.role === 'user' ? 'Instructions' : esc(m.role)}</div><pre class="small">${esc(m.content)}</pre></div>`;
+  };
+  modal({ title: `Session #${run.id}: ${run.kind}, ${run.status}`, wide: true, body: `<div class="transcript">${run.transcript.map(turn).join('')}</div>` });
+}
+
+// ---- files
+function TabFiles(cid, data, initial) {
+  let el, files = [], current = initial || null, editing = false, content = null;
+  const slug = () => data().company.slug;
+  const drawTree = () => {
+    const visible = files.filter((f) => !f.dir).sort((a, b) => a.path.localeCompare(b.path));
+    let lastDir = null;
+    $('.tree', el).innerHTML = visible.length ? visible.map((f) => {
+      const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+      const head = dir !== lastDir ? `<div class="dir">${esc(dir || 'top level')}</div>` : '';
+      lastDir = dir;
+      return `${head}<button class="${f.path === current ? 'on' : ''}" data-act="open" data-path="${esc(f.path)}" title="${esc(f.path)}">${esc(f.path.split('/').pop())}</button>`;
+    }).join('') : '<div class="faint" style="padding:14px">No files yet. They appear as agents work.</div>';
+  };
+  const drawViewer = () => {
+    const v = $('.viewer', el);
+    if (!current) { v.innerHTML = `<div class="viewer-body faint">Pick a file to read it here. Text files can be edited.</div>`; return; }
+    const isImg = /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(current);
+    const isSite = current.startsWith('site/');
+    const raw = `/files/${encodeURIComponent(slug())}/${current.split('/').map(encodeURIComponent).join('/')}`;
+    let body;
+    if (isImg) body = `<img src="${raw}" alt="${esc(current)}">`;
+    else if (!content) body = '<span class="spinner"></span>';
+    else if (content.binary) body = `<p class="faint">Binary file (${content.size.toLocaleString()} bytes). <a href="${raw}" download>Download</a></p>`;
+    else if (editing) body = `<textarea id="file-edit">${esc(content.content)}</textarea>`;
+    else if (/\.md$/i.test(current)) body = md(content.content);
+    else body = `<pre class="small">${esc(content.content)}</pre>`;
+    v.innerHTML = `<div class="viewer-head"><code class="small" style="overflow-wrap:anywhere">${esc(current)}</code><div class="actions">
+      ${isSite && /\.html?$/i.test(current) ? `<a class="btn sm" target="_blank" rel="noopener" href="/preview/${encodeURIComponent(slug())}/${current.slice(5).split('/').map(encodeURIComponent).join('/')}">Open preview</a>` : ''}
+      ${!isImg && content && !content.binary ? (editing ? `<button class="btn sm" data-act="cancel-edit">Cancel</button><button class="btn sm primary" data-act="save-file">Save</button>` : `<button class="btn sm" data-act="edit-file">Edit</button>`) : ''}
+      <a class="btn sm ghost" href="${raw}" download>Download</a></div></div><div class="viewer-body">${body}</div>`;
+  };
+  const open = async (path) => {
+    current = path; editing = false; content = null;
+    history.replaceState(null, '', `#/c/${cid}/files/${encodeURIComponent(path)}`);
+    drawTree(); drawViewer();
+    if (!/\.(png|jpe?g|gif|webp|svg|ico)$/i.test(path)) {
+      try { content = await GET(`/api/companies/${cid}/file?path=${encodeURIComponent(path)}`); } catch (e) { content = { binary: false, content: `Couldn't open: ${e.message}` }; }
+      drawViewer();
+    }
+  };
+  const loadTree = async () => { files = (await GET(`/api/companies/${cid}/files`)).files; drawTree(); };
+  const loadSoon = debounce(() => loadTree().catch(() => {}), 800);
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel files"><div class="tree"></div><div class="viewer"></div></section>`;
+      await loadTree();
+      if (current) open(current); else drawViewer();
+    },
+    live(ev) {
+      if (ev.type === 'event' && ev.kind === 'file') {
+        loadSoon();
+        if (ev.data?.path === current && !editing) open(current);
+      }
+    },
+    async act(name, t) {
+      if (name === 'open') open(t.dataset.path);
+      if (name === 'edit-file') { editing = true; drawViewer(); $('#file-edit', el)?.focus(); }
+      if (name === 'cancel-edit') { editing = false; drawViewer(); }
+      if (name === 'save-file') {
+        const text = $('#file-edit', el).value;
+        try { await api('PUT', `/api/companies/${cid}/file`, { path: current, content: text }); content.content = text; editing = false; drawViewer(); toast('Saved.'); } catch (e) { fail(e); }
+      }
+    },
+  };
+}
+
+// ---- memory
+function TabMemory(cid) {
+  let el;
+  const load = async () => {
+    const r = await GET(`/api/companies/${cid}/memory`);
+    $('#mem', el).innerHTML = r.memory.length ? r.memory.map((m) => `<li data-mem="${m.id}"><div class="grow">
+      <div class="small faint">${m.pinned ? '<span class="badge accent">Pinned</span> ' : ''}${esc(m.kind)} from ${esc(m.agent_name || 'you')}, ${when(m.created_at)}</div>
+      <div>${inline(m.content)}</div></div>
+      <button class="btn sm ghost" data-act="pin" data-p="${m.pinned ? 0 : 1}">${m.pinned ? 'Unpin' : 'Pin'}</button>
+      <button class="btn sm ghost" data-act="forget">Delete</button></li>`).join('') : '<li class="faint">Nothing remembered yet.</li>';
+  };
+  const loadSoon = debounce(() => load().catch(() => {}), 800);
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel"><form class="panel-body form-stack" data-form="note">
+          <label class="field">Tell the team something to remember<span class="hint">Pinned notes are shown to every agent in every session. Use them for facts that must never be forgotten.</span>
+          <textarea name="content" rows="2" placeholder="Our refund policy is 30 days, no questions asked."></textarea></label>
+          <div class="actions"><label class="check small"><input type="checkbox" name="pinned"> Pin it</label><button class="btn primary" type="submit">Save note</button></div></form></section>
+        <section class="panel" style="margin-top:18px"><ul class="rows" id="mem"></ul></section>`;
+      await load();
+    },
+    live(ev) { if (ev.type === 'event' && ['memory', 'decision'].includes(ev.kind)) loadSoon(); },
+    async act(name, t) {
+      const id = t.closest('[data-mem]')?.dataset.mem;
+      try {
+        if (name === 'pin') await api('PATCH', `/api/memory/${id}`, { pinned: !!+t.dataset.p });
+        if (name === 'forget') await api('DELETE', `/api/memory/${id}`);
+        await load();
+      } catch (e) { fail(e); }
+    },
+    async submit(name, form) {
+      try {
+        await api('POST', `/api/companies/${cid}/memory`, { content: form.content.value, pinned: form.pinned.checked });
+        form.reset();
+        await load();
+      } catch (e) { fail(e); }
+    },
+  };
+}
+
+// ---- email
+function TabEmail(cid, data) {
+  let el, emails = [];
+  const load = async () => {
+    emails = (await GET(`/api/companies/${cid}/emails`)).emails;
+    $('#mail', el).innerHTML = emails.length ? emails.map((m) => `<li data-act="mail" data-id="${m.id}" style="cursor:pointer">
+      <span class="badge ${m.direction === 'in' ? 'accent' : ''}">${m.direction === 'in' ? 'In' : 'Out'}</span>
+      <div class="grow"><div><b>${esc(m.subject || '(no subject)')}</b></div><div class="small muted">${m.direction === 'in' ? `From ${esc(m.from_addr)}` : `To ${esc(m.to_addr)}`}, ${when(m.created_at)}</div></div>
+      <span class="badge">${esc(m.status)}</span></li>`).join('') : '<li class="faint">No email yet.</li>';
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      const d = data();
+      el.innerHTML = `${!d.email_ready || !d.inbox_ready ? `<div class="banner warn"><div class="grow"><b>${!d.email_ready && !d.inbox_ready ? 'Email isn\'t connected yet.' : !d.email_ready ? 'Sending isn\'t set up yet.' : 'Receiving isn\'t set up yet.'}</b>
+        Give this company its own mailbox (any provider with SMTP and IMAP, e.g. Gmail with an app password, Zoho or Fastmail). Sales and support agents use it for outreach and replies, always through your inbox first.</div>
+        <a class="btn" href="#/c/${cid}/settings">Set up email</a></div>` : ''}
+        <section class="panel"><div class="panel-head"><h2>Mail</h2>${d.inbox_ready ? '<button class="btn sm" data-act="check-mail">Check for new mail</button>' : ''}</div><ul class="rows" id="mail" style="padding-top:8px"></ul></section>`;
+      await load();
+    },
+    live(ev) { if (ev.type === 'event' && ['email', 'decision'].includes(ev.kind)) load().catch(() => {}); },
+    async act(name, t) {
+      if (name === 'check-mail') {
+        try { const r = await api('POST', `/api/companies/${cid}/emails/check`); toast(`${plural(r.new, 'new email')}.`); await load(); } catch (e) { fail(e); }
+      }
+      if (name === 'mail') {
+        const m = emails.find((x) => x.id === +t.dataset.id);
+        modal({ title: m.subject || '(no subject)', body: `<p class="small muted">From ${esc(m.from_addr)} to ${esc(m.to_addr)}, ${when(m.created_at)}</p><pre style="font-family:var(--font);font-size:14px">${esc(m.body)}</pre>` });
+      }
+    },
+  };
+}
+
+// ---- charter
+function TabCharter(cid, data) {
+  let el, editing = false;
+  const draw = () => {
+    const c = data().company;
+    el.innerHTML = `<section class="panel"><div class="panel-head"><h2>Charter</h2><div class="actions">
+      ${editing ? `<button class="btn sm" data-act="cancel">Cancel</button><button class="btn sm primary" data-act="save">Save</button>` : `<button class="btn sm" data-act="edit">Edit</button>`}</div></div>
+      <div class="panel-body">${editing ? `<textarea id="charter" style="min-height:60vh" class="code">${esc(c.charter)}</textarea>`
+        : c.charter ? md(c.charter) : '<p class="faint">The CEO writes the charter while founding the company.</p>'}</div></section>`;
+  };
+  return {
+    async mount(holder) { el = holder; draw(); },
+    onCompany: () => { if (!editing) draw(); },
+    async act(name) {
+      if (name === 'edit') { editing = true; draw(); }
+      if (name === 'cancel') { editing = false; draw(); }
+      if (name === 'save') {
+        try { await api('PATCH', `/api/companies/${cid}`, { charter: $('#charter', el).value }); data().company.charter = $('#charter', el).value; editing = false; draw(); toast('Charter saved. Agents use it from their next session.'); } catch (e) { fail(e); }
+      }
+    },
+  };
+}
+
+// ---- company settings
+function TabSettings(cid, data) {
+  let el, global;
+  const draw = () => {
+    const c = data().company;
+    const s = c.settings;
+    const pol = s.policies || {};
+    const val = (k) => esc(s[k] ?? '');
+    el.innerHTML = `<form class="panel" data-form="co-settings">
+      <div class="section"><h2>Direction</h2>
+        <label class="field">Standing orders<span class="hint">Every agent reads these in every session. Brand rules, things to avoid, priorities.</span>
+          <textarea name="directives" rows="5" placeholder="Never offer discounts. Write in British English. Focus on cafés in Manchester first.">${val('directives')}</textarea></label>
+        <div class="form-grid" style="margin-top:14px">
+          <label class="field">CEO re-plans every (minutes)<input type="number" name="cycle_minutes" min="5" value="${val('cycle_minutes')}"></label>
+          <label class="field">Emails per day, max<input type="number" name="daily_email_limit" min="1" value="${val('daily_email_limit')}"></label>
+          <label class="field">Company name<input type="text" name="name" value="${esc(c.name)}"></label>
+        </div></div>
+      <div class="section"><h2>Approvals for this company</h2><p class="muted">Override your global defaults.</p>
+        <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
+          `<select name="policy_${k}"><option value="">Default (${esc({ approve: 'ask me', auto: 'allowed', off: 'never' }[global.settings.policies[k]])})</option>
+          ${[['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']].map(([v, l]) => `<option value="${v}" ${pol[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`}</label>`).join('')}</div></div>
+      <div class="section"><h2>Email</h2><p class="muted">Sending (SMTP). Port 587 uses STARTTLS, 465 uses SSL. For Gmail, create an app password.</p>
+        <div class="form-grid">
+          <label class="field">SMTP server<input type="text" name="smtp_host" value="${val('smtp_host')}" placeholder="smtp.gmail.com"></label>
+          <label class="field">Port<input type="number" name="smtp_port" value="${val('smtp_port')}"></label>
+          <label class="field">Username<input type="text" name="smtp_user" value="${val('smtp_user')}" autocomplete="off"></label>
+          <label class="field">Password<input type="password" name="smtp_password" value="${val('smtp_password')}" autocomplete="new-password"></label>
+          <label class="field">From address<input type="email" name="smtp_from" value="${val('smtp_from')}"></label>
+          <label class="field">From name<input type="text" name="smtp_from_name" value="${val('smtp_from_name')}" placeholder="${esc(c.name)}"></label>
+        </div>
+        <p class="muted" style="margin-top:16px">Receiving (IMAP). New mail becomes a task for the support agent.</p>
+        <div class="form-grid">
+          <label class="field">IMAP server<input type="text" name="imap_host" value="${val('imap_host')}" placeholder="imap.gmail.com"></label>
+          <label class="field">Port<input type="number" name="imap_port" value="${val('imap_port')}"></label>
+          <label class="field">Username<input type="text" name="imap_user" value="${val('imap_user')}" autocomplete="off"></label>
+          <label class="field">Password<input type="password" name="imap_password" value="${val('imap_password')}" autocomplete="new-password"></label>
+        </div>
+        <div class="actions" style="margin-top:14px"><input type="email" id="test-to" placeholder="Send a test email to…" style="max-width:280px"><button class="btn" type="button" data-act="test-email">Send test</button></div></div>
+      <div class="section"><h2>Website</h2><p class="muted">The site in <code>site/</code> always previews locally. To publish it, add a Netlify personal access token; Holdco creates the site on first deploy.</p>
+        <div class="form-grid">
+          <label class="field">Netlify token<input type="password" name="netlify_token" value="${val('netlify_token')}" autocomplete="off"></label>
+          <label class="field">Netlify site ID<span class="hint">Leave blank to create one.</span><input type="text" name="netlify_site_id" value="${val('netlify_site_id')}"></label>
+          <label class="field">Public address<input type="url" name="site_url" value="${val('site_url')}"></label>
+        </div></div>
+      <div class="section"><h2>Posting webhook</h2><p class="muted">Approved social posts are sent here as JSON, so you can wire them to X, LinkedIn, Discord or anything else with Zapier, Make or n8n. Without it, you get a ready-to-post link.</p>
+        <label class="field">Webhook address<input type="url" name="webhook_url" value="${val('webhook_url')}"></label></div>
+      <div class="section actions" style="justify-content:flex-end"><button class="btn primary" type="submit">Save</button></div>
+    </form>
+    <section class="panel" style="margin-top:18px"><div class="section"><h2>Archive or delete</h2><p class="muted">Archiving stops all work and keeps everything. Deleting removes the company from Holdco and moves its folder to the trash folder in your data directory.</p>
+      <div class="actions">${c.status === 'archived' ? `<button class="btn" data-act="status" data-s="active">Unarchive</button>` : `<button class="btn" data-act="status" data-s="archived">Archive</button>`}
+      <button class="btn danger" data-act="delete">Delete company</button></div></div></section>`;
+  };
+  return {
+    async mount(holder) { el = holder; global = await GET('/api/settings'); draw(); },
+    async submit(name, form) {
+      const f = Object.fromEntries(new FormData(form));
+      const settings = { policies: {} };
+      for (const [k, v] of Object.entries(f)) {
+        if (k.startsWith('policy_')) settings.policies[k.slice(7)] = v;
+        else if (k !== 'name') settings[k] = v;
+      }
+      try {
+        await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
+        toast('Saved.');
+        refreshState();
+      } catch (e) { fail(e); }
+    },
+    async act(name) {
+      if (name === 'test-email') {
+        const to = $('#test-to', el).value.trim();
+        if (!to) { toast('Enter an address to send the test to.', true); return; }
+        await this.submit('co-settings', $('form', el));
+        try { const r = await api('POST', `/api/companies/${cid}/emails/test`, { to }); toast(r.message, !r.ok); } catch (e) { fail(e); }
+      }
+      if (name === 'delete') {
+        const c = data().company;
+        modal({
+          title: `Delete ${c.name}?`,
+          body: `<p>This removes the company, its agents, tasks and history from Holdco. Its folder moves to the trash folder in your data directory.</p>
+            <form data-form="confirm-delete" id="cd" class="form-stack"><label class="field">Type <b>${esc(c.name)}</b> to confirm<input type="text" name="confirm" autocomplete="off"></label></form>`,
+          foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn danger" type="submit" form="cd">Delete for good</button>`,
+        });
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------- global events
+document.addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-act]');
+  if (!t) return;
+  const name = t.dataset.act;
+  if (name === 'overlay') { if (e.target === t) closeModal(); return; }
+  if (name === 'close-modal') { e.preventDefault(); closeModal(); return; }
+  if (name === 'menu') { $('#side').classList.toggle('open'); return; }
+  if (name === 'toggle-autopilot') {
+    const on = !S.st.scheduler_enabled;
+    try { await api('PUT', '/api/settings', { scheduler_enabled: on }); toast(on ? 'Autopilot on. Agents keep working on their own.' : 'Autopilot off. Running sessions finish, then agents wait.'); refreshState(); } catch (err) { fail(err); }
+    return;
+  }
+  if (name === 'decide') { e.preventDefault(); decideRequest(t.closest('[data-req]'), t.dataset.d); return; }
+  if (name === 'pick' && S.view?.actPick) { S.view.actPick(t); return; }
+  if (S.view?.act) { e.preventDefault(); S.view.act(name, t, e); }
+});
+
+document.addEventListener('submit', async (e) => {
+  const form = e.target.closest('form[data-form]');
+  if (!form) return;
+  e.preventDefault();
+  const name = form.dataset.form;
+  if (name === 'confirm-delete') {
+    const cid = route()[1];
+    try { await api('DELETE', `/api/companies/${cid}`, { confirm: form.confirm.value }); closeModal(); await refreshState(); location.hash = '#/'; toast('Company deleted.'); } catch (err) { fail(err); }
+    return;
+  }
+  if (S.view?.submit) S.view.submit(name, form, e);
+});
+
+// Live updates from the server.
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => { if (S.offline) { S.offline = false; refreshState(); } };
+  es.onerror = () => { S.offline = true; renderSide(); };
+  es.onmessage = (m) => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch (_) { return; }
+    if (ev.type === 'event') S.feeds.forEach((f) => f.add(ev));
+    if (ev.type !== 'messages') stateSoon();
+    S.view?.live?.(ev);
+  };
+}
+
+(async function boot() {
+  await refreshState();
+  await render();
+  connect();
+})();

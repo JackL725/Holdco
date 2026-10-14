@@ -1,0 +1,289 @@
+"""Outbound actions and the approval inbox.
+
+Agents never perform these directly. They call `gate()`, which, depending on the company's policy,
+runs the action now, queues it for the owner's approval, or refuses it.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+from . import bus, db, emailer, web, workspace
+
+ACTION_LABELS = {
+    "send_email": "Send email",
+    "social_post": "Social post",
+    "deploy_site": "Deploy website",
+    "http_post": "Outside request",
+    "run_code": "Run code",
+    "spend_money": "Purchase",
+    "question": "Question",
+}
+
+
+def _summary(action: str, p: dict) -> str:
+    if action == "send_email":
+        return f"Email to {p.get('to')}: {p.get('subject')}"
+    if action == "social_post":
+        return f"{(p.get('platform') or 'social').title()} post: {(p.get('content') or '')[:90]}"
+    if action == "deploy_site":
+        return "Publish the website from site/"
+    if action == "http_post":
+        return f"{p.get('method', 'POST')} {p.get('url')}"
+    if action == "run_code":
+        first = (p.get("code") or "").strip().splitlines()[:1]
+        return f"Run {p.get('language', 'python')}: {first[0][:90] if first else ''}"
+    if action == "spend_money":
+        return f"Buy {p.get('item')} for ${p.get('amount_usd')} ({p.get('vendor', '')})"
+    if action == "question":
+        return (p.get("question") or "")[:140]
+    return action
+
+
+def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict) -> str:
+    """Called by agent tools for any outbound action."""
+    if action == "question":
+        policy = "approve"
+    else:
+        policy = db.effective_policy(company, action)
+    if policy == "off":
+        return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    if policy == "auto":
+        try:
+            result = execute(company, action, payload)
+        except Exception as e:  # report failures back to the agent
+            bus.emit(company["id"], "error", f"{ACTION_LABELS.get(action, action)} failed: {e}", agent["id"])
+            return f"FAILED: {e}"
+        bus.emit(company["id"], "action", f"{ACTION_LABELS.get(action, action)}: {_summary(action, payload)}",
+                 agent["id"], {"action": action})
+        return result
+
+    # approve: queue it (deduplicated)
+    blob = json.dumps(payload, sort_keys=True)
+    for row in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND action=? AND status='pending'",
+                    (company["id"], action)):
+        if json.dumps(db.loads(row["payload"], {}), sort_keys=True) == blob:
+            return f"Already waiting for the owner as request #{row['id']}. Don't resubmit; continue with other work."
+    summary = _summary(action, payload)
+    aid = db.run("INSERT INTO approvals(company_id, agent_id, task_id, action, summary, payload, status, created_at)"
+                 " VALUES(?,?,?,?,?,?,?,?)",
+                 (company["id"], agent["id"], task_id, action, summary, blob, "pending", db.now()))
+    verb = "asked the owner" if action == "question" else "requested approval"
+    bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
+    bus.notify("approvals")
+    if action == "question":
+        return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
+                f"without it, finish with status 'waiting'.")
+    return (f"Queued for the owner's approval as request #{aid}. Don't resubmit it. Continue with other work; "
+            f"the decision will appear in your notes.")
+
+
+def decide(approval_id: int, decision: str, payload: dict | None = None, feedback: str = "",
+           answer: str = "") -> dict:
+    """The owner approves or rejects a request (or answers a question)."""
+    row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+    if not row:
+        raise ValueError("Request not found")
+    if row["status"] != "pending":
+        raise ValueError(f"Request #{approval_id} is already {row['status']}")
+    company = db.get_company(row["company_id"])
+    p = db.loads(row["payload"], {})
+    if payload:
+        p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")})
+    ts = db.now()
+    label = ACTION_LABELS.get(row["action"], row["action"])
+
+    if row["action"] == "question":
+        status, result = "answered", answer or feedback or "(no answer)"
+        note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
+    elif decision == "approve":
+        db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
+        try:
+            result = execute(company, row["action"], p)
+            status = "done"
+        except Exception as e:
+            result, status = str(e), "failed"
+        note = f"Owner APPROVED request #{approval_id} ({label}: {_summary(row['action'], p)}). Outcome: {result}"
+    else:
+        status, result = "rejected", ""
+        note = f"Owner REJECTED request #{approval_id} ({label}: {_summary(row['action'], p)})."
+    if feedback and row["action"] != "question":
+        note += f" Owner feedback: {feedback}"
+
+    db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
+              feedback=feedback, summary=_summary(row["action"], p) if row["action"] != "question" else row["summary"])
+    db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
+           (company["id"], row["agent_id"], "decision", note, 0, ts))
+    if row["task_id"]:
+        t = db.get_task(row["task_id"])
+        if t and t["status"] in ("waiting", "blocked"):
+            db.update("tasks", t["id"], status="todo", updated_at=ts,
+                      description=(t["description"] or "") + f"\n\n[Update] {note}")
+    agent = db.get_agent(row["agent_id"]) if row["agent_id"] else None
+    if status == "rejected" and feedback.strip() and agent and agent["enabled"]:
+        # Rejected with feedback: the agent gets a task to revise and resubmit.
+        details = json.dumps(p, ensure_ascii=False, indent=1)[:3000]
+        db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
+               " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (company["id"], f"Revise: {_summary(row['action'], p)[:120]}",
+                f"The owner rejected request #{approval_id} with this feedback:\n\"{feedback.strip()}\"\n\n"
+                f"Original request ({label}):\n{details}\n\nRevise it to address the feedback and submit it again.",
+                agent["role"], agent["id"], "todo", 1, "owner", ts, ts))
+        bus.notify("tasks", company_id=company["id"])
+    db.update("companies", company["id"], cycle_requested=1)
+    kind = "decision" if status != "failed" else "error"
+    bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
+    bus.notify("approvals")
+    return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+# ---------------- executors ----------------
+
+def execute(company: dict, action: str, p: dict) -> str:
+    if action == "send_email":
+        in_reply = ""
+        if p.get("reply_to_email_id"):
+            src = db.one("SELECT message_id FROM emails WHERE id=? AND company_id=?",
+                         (int(p["reply_to_email_id"]), company["id"]))
+            in_reply = (src or {}).get("message_id") or ""
+            db.run("UPDATE emails SET status='replied' WHERE id=?", (int(p["reply_to_email_id"]),))
+        return emailer.send(company, p["to"], p["subject"], p["body"], in_reply)
+    if action == "social_post":
+        return _social(company, p)
+    if action == "deploy_site":
+        return _deploy_netlify(company)
+    if action == "http_post":
+        return _http(p)
+    if action == "run_code":
+        return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)))
+    if action == "spend_money":
+        return "Approved. The owner will complete this purchase themselves and record it."
+    raise ValueError(f"Unknown action {action}")
+
+
+def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float = 30) -> tuple[int, str]:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": web.UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(20000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(2000).decode("utf-8", "replace")
+
+
+def _social(company: dict, p: dict) -> str:
+    cs = db.company_settings(company)
+    content = p.get("content", "")
+    if cs.get("webhook_url"):
+        status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
+                                                      "platform": p.get("platform", ""), "content": content,
+                                                      "link": p.get("link", "")})
+        if status >= 400:
+            raise RuntimeError(f"Webhook returned HTTP {status}: {text[:300]}")
+        return f"Sent to the posting webhook (HTTP {status})."
+    intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": content[:280]})
+    return f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+
+
+def _http(p: dict) -> str:
+    url = web.check_public_url(p["url"])
+    method = (p.get("method") or "POST").upper()
+    body = p.get("body")
+    data = (json.dumps(body) if isinstance(body, (dict, list)) else str(body or "")).encode()
+    headers = {"Content-Type": "application/json", "User-Agent": web.UA}
+    headers.update({k: str(v) for k, v in (p.get("headers") or {}).items()})
+    req = urllib.request.Request(url, data=data if method != "GET" else None, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return f"HTTP {r.status}\n{r.read(8000).decode('utf-8', 'replace')}"
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}\n{e.read(3000).decode('utf-8', 'replace')}"
+
+
+def _deploy_netlify(company: dict) -> str:
+    cs = db.company_settings(company)
+    site_dir = workspace.safe_path(company, "site")
+    if not (site_dir / "index.html").exists():
+        raise RuntimeError("site/index.html doesn't exist yet.")
+    token = cs.get("netlify_token")
+    if not token:
+        return ("Approved, but no Netlify token is set (company Settings). The site is ready in the site/ "
+                "folder and visible in the local preview.")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in site_dir.rglob("*"):
+            if f.is_file():
+                z.write(f, f.relative_to(site_dir).as_posix())
+    auth = {"Authorization": f"Bearer {token}", "User-Agent": web.UA}
+    site_id = cs.get("netlify_site_id")
+    if not site_id:
+        status, text = _post_json("https://api.netlify.com/api/v1/sites", {"name": f"{company['slug']}-{int(time.time()) % 100000}"}, auth)
+        if status >= 400:
+            raise RuntimeError(f"Netlify couldn't create a site: HTTP {status} {text[:300]}")
+        site = json.loads(text)
+        site_id = site["id"]
+        cs["netlify_site_id"] = site_id
+        cs["site_url"] = site.get("ssl_url") or site.get("url", "")
+        db.update("companies", company["id"], settings=json.dumps(cs))
+    req = urllib.request.Request(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
+                                 method="POST", headers={**auth, "Content-Type": "application/zip"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            info = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Netlify deploy failed: HTTP {e.code} {e.read(300).decode('utf-8', 'replace')}") from None
+    url = info.get("ssl_url") or info.get("url") or cs.get("site_url", "")
+    if url:
+        cs["site_url"] = url
+        db.update("companies", company["id"], settings=json.dumps(cs))
+    return f"Website deployed: {url}"
+
+
+def run_code(company: dict, language: str, code: str, timeout: int = 60) -> str:
+    ws = workspace.root(company)
+    runs = ws / ".runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    timeout = max(5, min(int(timeout or 60), 600))
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("HOLDCO", "OLLAMA"))}
+    env["PYTHONIOENCODING"] = "utf-8"
+    if language in ("python", "py"):
+        f = runs / f"run_{int(time.time() * 1000)}.py"
+        f.write_text(code, encoding="utf-8")
+        cmd = [sys.executable, str(f)]
+    elif os.name == "nt":
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
+    else:
+        cmd = ["bash", "-c", code]
+    try:
+        proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, timeout=timeout, env=env,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return f"Timed out after {timeout}s."
+    except FileNotFoundError as e:
+        return f"Couldn't start the interpreter: {e}"
+    out = proc.stdout.decode("utf-8", "replace")
+    err = proc.stderr.decode("utf-8", "replace")
+    res = f"Exit code {proc.returncode}\n"
+    if out:
+        res += f"--- stdout ---\n{out[-6000:]}\n"
+    if err:
+        res += f"--- stderr ---\n{err[-3000:]}\n"
+    return res
+
+
+def retry(approval_id: int) -> dict:
+    """Put a failed request back in the inbox (e.g. after fixing email settings)."""
+    row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+    if not row or row["status"] != "failed":
+        raise ValueError("Only failed requests can be retried.")
+    db.update("approvals", approval_id, status="pending", result="", decided_at=None)
+    bus.notify("approvals")
+    return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
