@@ -303,16 +303,36 @@ def chat(messages: list[dict], tools: list[dict] | None = None, model: str | Non
     if think not in ("low", "medium", "high") or not is_gpt_oss(model) or model in _no_think_models:
         think = None
     try:
-        return _call(s, model, messages, tools, names, use_json_mode, json_output, samp, think)
+        return _call_with_parse_retry(s, model, messages, tools, names, use_json_mode, json_output, samp, think)
     except LLMError as e:
         msg = str(e).lower()
         if think and "think" in msg:
             _no_think_models.add(model)
             return chat(messages, tools, model, settings, json_output, temperature, None, creativity)
-        if tools and not use_json_mode and mode == "auto" and ("support tools" in msg or "tool" in msg and "400" in msg):
+        if (tools and not use_json_mode and mode == "auto" and not is_tool_parse_error(e)
+                and ("support tools" in msg or "tool" in msg and "400" in msg)):
             _json_mode_models.add(model)
             return _call(s, model, messages, tools, names, True, json_output, samp, think)
         raise
+
+
+PARSE_RETRIES = 2   # extra attempts when the model server can't parse the model's tool call
+
+
+def is_tool_parse_error(err: Exception) -> bool:
+    """Ollama answers HTTP 500 "error parsing tool call" when the model emits a malformed tool call
+    (for example invalid JSON inside a long file). Sampling is random, so asking again usually works."""
+    msg = str(err).lower()
+    return "error parsing tool call" in msg or ("500" in msg and "parsing tool" in msg)
+
+
+def _call_with_parse_retry(*args) -> Reply:
+    for attempt in range(PARSE_RETRIES + 1):
+        try:
+            return _call(*args)
+        except LLMError as e:
+            if attempt >= PARSE_RETRIES or not is_tool_parse_error(e):
+                raise
 
 
 def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: set[str], json_mode: bool,

@@ -12,6 +12,16 @@ from . import bus, config, db, llm, presets, roles, tools, workspace
 _running: dict[int, str] = {}
 _running_lock = threading.Lock()
 
+# Loop guard bookkeeping. Re-reading or re-checking a file after it changed is progress, not a loop,
+# so a successful change to the workspace forgets the earlier read-only calls.
+_WORKSPACE_CHANGERS = {"write_file", "delete_file", "run_code"}
+_WORKSPACE_READERS = ("read_file", "list_files", "review_text", "audit_page")
+
+
+def _forget_reads(seen_calls: dict[str, int]) -> None:
+    for fp in [k for k in seen_calls if k.startswith(_WORKSPACE_READERS)]:
+        del seen_calls[fp]
+
 
 def is_running(agent_id: int) -> bool:
     with _running_lock:
@@ -368,6 +378,8 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                             result = "Session stopped: repeated action."
                         else:
                             result = tools.execute(ctx, c.name, c.arguments)
+                            if c.name in _WORKSPACE_CHANGERS and not result.startswith("ERROR"):
+                                _forget_reads(seen_calls)
                         messages.append({"role": "tool", "name": c.name, "tool_call_id": c.id or f"call_{step}_{i}",
                                          "content": result})
                         bus.emit(company["id"], "result", f"{c.name}: {result[:200]}".replace("\n", " "), agent_id,

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-unit-")
 
-from holdco import actions, checks, db, llm, presets, roles, tools, web, workspace  # noqa: E402
+from holdco import actions, agents, checks, db, llm, presets, roles, tools, web, workspace  # noqa: E402
 
 db.init()
 
@@ -150,6 +150,49 @@ class TestModelClient(unittest.TestCase):
                                       "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}])
         self.assertIn("web_search(query?: string)", j[0]["content"])
         self.assertEqual(j[3]["role"], "user")
+
+    PARSE_ERR = ('HTTP 500 from model server: {"error":"error parsing tool call: raw=\'{\\"arguments\\":{\\"content\\":'
+                 '\\"Budget $400 per month\\n')
+
+    def _chat_with_scripted_call(self, outcomes):
+        """Run llm.chat with _call replaced by a script of exceptions / Replies. Returns (result, calls made)."""
+        calls = self.last_calls = []
+
+        def fake_call(*args):
+            calls.append(args)
+            out = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+            if isinstance(out, Exception):
+                raise out
+            return out
+
+        original = llm._call
+        llm._call = fake_call
+        try:
+            tools_spec = [{"name": "write_file", "description": "d", "parameters": {"type": "object", "properties": {}}}]
+            return llm.chat([{"role": "user", "content": "go"}], tools_spec, settings={**db.get_settings(), "tool_mode": "auto"}), calls
+        finally:
+            llm._call = original
+
+    def test_tool_parse_error_is_retried(self):
+        self.assertTrue(llm.is_tool_parse_error(llm.LLMError(self.PARSE_ERR)))
+        self.assertFalse(llm.is_tool_parse_error(llm.LLMError("HTTP 404 from model server: model not found")))
+        ok = llm.Reply(content="fine")
+        reply, calls = self._chat_with_scripted_call([llm.LLMError(self.PARSE_ERR), llm.LLMError(self.PARSE_ERR), ok])
+        self.assertIs(reply, ok)
+        self.assertEqual(len(calls), 3)
+
+    def test_tool_parse_error_gives_up_and_keeps_native_tools(self):
+        before = set(llm._json_mode_models)
+        with self.assertRaises(llm.LLMError):
+            # The error text contains "tool" and "400"; it must not flip the model to prompt-based tool calls.
+            self._chat_with_scripted_call([llm.LLMError(self.PARSE_ERR)])
+        self.assertEqual(llm._json_mode_models, before)
+        self.assertEqual(len(self.last_calls), llm.PARSE_RETRIES + 1)
+
+    def test_other_errors_are_not_retried(self):
+        with self.assertRaises(llm.LLMError):
+            self._chat_with_scripted_call([llm.LLMError("HTTP 503 from model server: busy")])
+        self.assertEqual(len(self.last_calls), 1)
 
 
 class TestPresets(unittest.TestCase):
@@ -317,6 +360,81 @@ class TestTools(unittest.TestCase):
         s["policies"] = {"spend_money": "auto"}
         db.update("companies", self.c["id"], settings=json.dumps(s))
         self.assertEqual(db.effective_policy(db.get_company(self.c["id"]), "spend_money"), "approve")
+
+
+class TestLoopGuard(unittest.TestCase):
+    """The agent loop stops real repetition but lets an agent re-check a file it just changed."""
+
+    DOC = "docs/marketing/positioning.md"
+
+    def setUp(self):
+        self.c = make_company()
+        self.agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='marketing'", (self.c["id"],))
+        self.task_id = db.run("INSERT INTO tasks(company_id, title, role, status, deliverable, created_by, created_at, "
+                              "updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                              (self.c["id"], "Draft positioning", "marketing", "in_progress", self.DOC, "test",
+                               db.now(), db.now()))
+
+    def run_script(self, script):
+        """Run one task session where the model replays `script` (a list of (tool, args)). Returns [(tool, result)]."""
+        steps = iter(script)
+
+        def fake_chat(messages, tools_spec=None, *a, **kw):
+            try:
+                name, args = next(steps)
+            except StopIteration:
+                return llm.Reply(content="")
+            return llm.Reply(tool_calls=[llm.ToolCall(name=name, arguments=args)])
+
+        original = agents.llm.chat
+        agents.llm.chat = fake_chat
+        try:
+            agents.run(self.agent["id"], "task", task_id=self.task_id)
+        finally:
+            agents.llm.chat = original
+        row = db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.agent["id"],))
+        transcript = json.loads(row["transcript"])
+        self.run_row = row
+        return [(m["name"], m["content"]) for m in transcript if m["role"] == "tool"]
+
+    def write(self, text):
+        return ("write_file", {"path": self.DOC, "content": text, "append": False})
+
+    REVIEW = ("review_text", {"path": DOC, "text": "", "kind": "article"})
+    STOPPED = "Session stopped: repeated action."
+    NUDGE = "You already made this exact call"
+
+    def test_recheck_after_rewrite_is_allowed(self):
+        # The exact sequence that stopped a real run: write, review, rewrite, review again with identical arguments.
+        results = self.run_script([
+            self.write("We help Phoenix homeowners find roofers. Every roofer is checked first."), self.REVIEW,
+            self.write("We help Phoenix homeowners find a roofer. Each roofer is checked first."), self.REVIEW,
+            ("finish", {"summary": "done", "deliverable": self.DOC})])
+        second_review = [r for n, r in results if n == "review_text"][1]
+        self.assertNotIn(self.NUDGE, second_review)
+        self.assertIn("words", second_review)
+        self.assertNotEqual(self.run_row["status"], "error")
+        self.assertNotIn("repeating the same action", self.run_row["summary"])
+        self.assertEqual(db.get_task(self.task_id)["status"], "done")
+
+    def test_identical_repeat_without_changes_is_still_stopped(self):
+        text = "We help Phoenix homeowners find roofers. Every roofer is checked first."
+        results = self.run_script([self.write(text), self.REVIEW, self.REVIEW, self.REVIEW])
+        review_results = [r for n, r in results if n == "review_text"]
+        self.assertIn("words", review_results[0])
+        self.assertIn(self.NUDGE, review_results[1])
+        self.assertEqual(review_results[2], self.STOPPED)
+        self.assertIn("repeating the same action", self.run_row["summary"])
+
+    def test_identical_writes_are_still_stopped(self):
+        same = self.write("We help Phoenix homeowners find roofers. Every roofer is checked first.")
+        results = self.run_script([same, self.REVIEW, same, self.REVIEW, same, self.REVIEW])
+        self.assertEqual([r for n, r in results if n == "write_file"][-1], self.STOPPED)
+
+    def test_failed_write_does_not_reset_the_guard(self):
+        bad = ("write_file", {"path": "../outside.md", "content": "x"})
+        results = self.run_script([self.REVIEW, bad, self.REVIEW])
+        self.assertIn(self.NUDGE, [r for n, r in results if n == "review_text"][1])
 
 
 if __name__ == "__main__":
