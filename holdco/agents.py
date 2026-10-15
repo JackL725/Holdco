@@ -82,6 +82,8 @@ def _shared_rules(kind: str, max_steps: int) -> str:
         "owner hasn't approved.",
         "Check your notes and the file list before starting so you don't redo work. If you need a teammate, create "
         "a task for them with a deliverable.",
+        "Outside services (payments, email, a browser, social posting) are reached through find_tool; what you load "
+        "may wait for the owner's approval, like email.",
     ]
     if kind == "chat":
         rules[0] = (f"You have {max_steps} tool calls for this reply; use them only if they help, then answer in "

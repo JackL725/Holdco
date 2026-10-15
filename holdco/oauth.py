@@ -393,6 +393,11 @@ def finish(query: dict) -> dict:
                 "client_id": pending["client_id"], "token_endpoint": pending["token_endpoint"]})
     # An empty status tells the connector framework to check this instance's health again.
     db.run("UPDATE connectors SET status='', detail='' WHERE id=?", (cid,))
+    try:   # the framework drops its cached client and tool list, so the next call signs in with the new token
+        from . import connectors
+        connectors.mark_stale(cid)
+    except Exception:
+        pass
     return db.one("SELECT * FROM connectors WHERE id=?", (cid,)) or {"id": cid}
 
 
