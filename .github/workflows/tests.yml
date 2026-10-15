@@ -19,4 +19,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run tests (standard library only, no installs needed)
-        run: python -m unittest discover -s tests -t . -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -t . -v 2>&1 | tee test-output.txt
+      - name: Show failures as annotations
+        if: failure()
+        shell: bash
+        run: python .github/annotate_failures.py test-output.txt
