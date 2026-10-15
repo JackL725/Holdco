@@ -225,12 +225,44 @@ def find_duplicate(company_id: int, question: str, topics: list[str]) -> dict | 
     return None
 
 
+# The owner reads questions on a phone, often hours later, without the agent's context.
+MIN_QUESTION_CHARS = 12   # "Proceed?" says nothing; "Phoenix or Tucson first?" is fine
+VAGUE_RX = re.compile(r"\b(which|what|the|this|that|these|those)\s+(option|options|one|choice|approach)\b"
+                      r"|\bconfirm\s+(this|that|it)\b|\b(is|are)\s+(this|that|it|these)\s+(ok|okay|fine|good|right)\b"
+                      r"|\bproceed\?*$", re.I)
+# Things only the owner can give: accounts, access, money, legal and identity details, decisions about them.
+OWNER_ONLY_RX = re.compile(r"\b(api[ -]?key|token|password|credential|login|account|mailbox|smtp|domain|dns|"
+                           r"budget|money|card|payment|postal address|address|phone number|legal|llc|contract|"
+                           r"signature|approval|permission|decision|preference|brand|logo|name)\b", re.I)
+# Work a team can do itself: lists, research, notes, data, drafts.
+TEAM_WORK_RX = re.compile(r"\b(provide|send|share|give|supply|upload|compile|find|gather|get)\b[^.?!]{0,60}?"
+                          r"\b(list|lists|file|files|notes|research|data|dataset|contacts?|leads?|emails? of|"
+                          r"spreadsheet|csv|copy|content|template|document|report|interview notes|pricing info)\b",
+                          re.I)
+
+
+def question_problem(question: str, opts: list[str]) -> str | None:
+    """A question the owner could not answer from a phone, or one the team should answer itself."""
+    q = " ".join(question.split())
+    if len(q) < MIN_QUESTION_CHARS or (VAGUE_RX.search(q) and len(re.findall(r"\w+", q)) < 12):
+        return ("ERROR: the owner reads questions on a phone, later, without your context. Say the decision in "
+                "the question itself, for example 'Should we price the starter plan at $29 or $49 a month?', and "
+                "put the choices in options.")
+    if TEAM_WORK_RX.search(q) and not OWNER_ONLY_RX.search(q):
+        return ("ERROR: your team can gather this itself. Create a task for the right teammate with create_task "
+                "instead. Ask the owner only for decisions, accounts, access, money or permission.")
+    return None
+
+
 def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "", context: str = "") -> str:
     """The ask_owner tool body: one open question per topic, at most three from agents, options and a
     recommendation as structured fields the Inbox and the phone turn into buttons."""
     question = (question or "").strip()
     if not question:
         return "ERROR: the question is empty. Write the one thing you need the owner to decide."
+    problem = question_problem(question, parse_options(options))
+    if problem:
+        return problem
     cid = ctx.company["id"]
     opts = parse_options(options)
     rec = _clean_option(recommended)

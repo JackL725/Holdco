@@ -977,5 +977,27 @@ class TestRoutes(unittest.TestCase):
         self.assertTrue(any(r["company_id"] == c["id"] for r in rows))
 
 
+
+class TestQuestionQuality(unittest.TestCase):
+    """From the real gpt-oss run: 'Could you confirm which option we should choose?' reached the owner, and so did a
+    request for the owner to provide a contact list and interview notes the team should gather itself."""
+
+    def test_vague_questions_are_refused(self):
+        for q in ("Could you confirm which option we should choose?", "Proceed?", "Is this ok?"):
+            self.assertIn("Say the decision in the question itself", planning.question_problem(q, ["A", "B"]) or "", q)
+
+    def test_team_work_is_refused(self):
+        q = ("Could you please provide the roofer contact list file 'docs/roofers_contact_list.md' and interview notes "
+             "on provider lead pricing, so we can calculate the cost per inquiry?")
+        self.assertIn("your team can gather this", planning.question_problem(q, []) or "")
+
+    def test_real_owner_questions_pass(self):
+        for q in ("Should we price the starter plan at $29 or $49 a month?",
+                  "Can you add a company mailbox (SMTP) so we can email the 10 roofers on our list?",
+                  "Please provide the postal address we should put in the footer of outreach emails.",
+                  "Do you approve deploying the landing page to Netlify so roofers can sign up?"):
+            self.assertIsNone(planning.question_problem(q, []), q)
+
+
 if __name__ == "__main__":
     unittest.main()

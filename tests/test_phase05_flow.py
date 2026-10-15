@@ -407,7 +407,7 @@ class TestChatClaims(Base):
         self.assertEqual(len(s.calls), 2)
         last = s.calls[1]["messages"][-1]
         self.assertEqual(last["role"], "user")
-        self.assertTrue(last["content"].startswith("ERROR: not sent to the owner"), last["content"])
+        self.assertTrue(last["content"].startswith("Your reply states things the records do not support:"), last["content"])
         self.assertEqual(self.reply(), self.HONEST)
 
     def test_a_second_false_claim_goes_out_with_the_records(self):
