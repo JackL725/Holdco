@@ -12,6 +12,8 @@ prints a traceback, because the end-to-end tests treat one in the server log as 
 """
 from __future__ import annotations
 
+import bisect
+import csv
 import datetime as _dt
 import email.utils
 import hashlib
@@ -23,8 +25,9 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from typing import NamedTuple
 
-from . import bus, checks, db, emailer, workspace
+from . import bus, checks, db, emailer, presets, workspace
 from .actions import ACTION_LABELS
 from .routing import company_or_404, route
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401  (tools register here)
@@ -824,42 +827,135 @@ def records_changed(company: dict) -> None:
 
 # ---------------------------------------------------------------- claims gate
 
-# Words that make a sentence a plan, a draft, a condition or a negation rather than a claim (design 2.4, plus the
-# relatives a model uses). Deliberately broad: a claim missed here is still contradicted by the facts block, while
-# a false refusal blocks honest work.
-_QUALIFIERS = re.compile(
+# Words that make a whole sentence a plan, a draft, a condition or a question rather than a claim (design 2.4,
+# plus the relatives a model uses): "Will deploy the site once approved." They count anywhere in the sentence.
+# Negations are not here: they cancel a claim only when they govern its verb (see _negated).
+_INTENT = re.compile(
     r"\b(?:drafts?|drafted|drafting|plans?|planned|planning|will|won't|would|could|should|shall|must|might|once|"
-    r"pending|queued|queue|waiting|awaiting|wait|if|unless|proposed|propose|proposal|to[- ]do|todo|not\s+yet|"
-    r"next\s+steps?|need(?:s|ed)?\s+to|going\s+to|ready\s+to|aim(?:s|ing)?\s+to|goals?|intend(?:s|ed)?|"
-    r"expect(?:s|ed)?|until|before|request(?:s|ed)?|for\s+approval|after\s+approval|when\s+approved|when\s+ready|"
-    r"when\s+the\s+owner|ask(?:s|ed|ing)?\s+(?:the\s+)?owner|hope|want(?:s|ed)?|try(?:ing)?|examples?|e\.g|"
-    r"hypothetical(?:ly)?|"
-    r"simulat\w*|mock(?:ed|up)?|pretend|imagine|suppose|assum\w*|targets?|can\s+be|to\s+be|not|no|never|nothing|"
-    r"none|nobody|neither|nor|without|haven't|hasn't|hadn't|didn't|doesn't|don't|isn't|aren't|wasn't|weren't|"
-    r"cannot|can't|zero)\b", re.I)
+    r"pending|queued|queue|waiting|awaiting|wait|if|unless|whether|proposed|propose|proposal|to[- ]do|todo|"
+    r"not\s+yet|next\s+steps?|need(?:s|ed)?\s+to|going\s+to|aim(?:s|ing)?\s+to|intend(?:s|ed)?|for\s+approval|"
+    r"after\s+approval|when\s+approved|when\s+ready|when\s+the\s+owner|ask(?:s|ed|ing)?\s+(?:the\s+)?owner|hope|"
+    r"want(?:s|ed)?|try(?:ing)?|e\.g|hypothetical(?:ly)?|simulat\w*|mock(?:ed|up)?|pretend|imagine|suppose|"
+    r"assum\w*|can\s+be|(?<!ready\s)to\s+be)\b", re.I)
+# "the Netlify Pro plan", "Roofr's pricing plans": a product, not an intention. Removed before the intent test.
+_PRODUCT_PLAN = re.compile(r"\b(?:pro|premium|paid|free|starter|basic|business|team|monthly|annual|yearly|pricing|"
+                           r"subscription|hosting|growth|enterprise|personal|plus|data|phone|service)\s+plans?\b", re.I)
+
+# A negation cancels a claim only when it governs the claim's verb: close before it in the same clause ("no emails
+# were sent", "haven't deployed", "never published") or right after it ("sent no emails", "deployed nothing").
+# The first version let any "no" or "without" anywhere cancel the sentence, so "Deployment complete: no errors,
+# site live at ..." and "Site deployed without errors." passed as honest.
+_NEGATIONS = frozenset({"no", "not", "never", "without", "zero", "none", "nothing", "nobody", "neither", "nor",
+                        "cannot", "noone"})
+_NEG_SUBJECT = frozenset({"no", "none", "nothing", "nobody", "zero", "not", "never", "neither"})
+# Small words that do not count toward the distance between a negation and the verb.
+_FILLER = frozenset({"have", "has", "had", "been", "be", "being", "was", "were", "is", "are", "am", "yet", "ever",
+                     "even", "actually", "really", "any", "a", "an", "the", "our", "my", "your", "their", "its",
+                     "his", "her", "of", "single", "all", "these", "those", "this", "that", "it", "they", "we", "i",
+                     "you", "he", "she", "one", "still", "officially", "successfully", "properly", "fully", "just",
+                     "already", "also", "get", "got", "gets", "go", "gone", "truly"})
+# Words that start a new clause: a negation before them belongs to another verb.
+_CLAUSE_WORDS = frozenset({"and", "but", "so", "then", "while", "because", "although", "though", "after", "when",
+                           "since", "until", "before", "whereas", "however", "plus"})
+_AUX_END = re.compile(r"\b(?:was|were|is|are|been|be|got|get|gets)\s+(?:\w+\s+)?$", re.I)
+_NEG_AFTER = re.compile(r"\s+(?:nothing|none|nobody|no\s+one|no|zero)\b", re.I)
+
+
+def _negated(sentence: str, start: int, end: int) -> bool:
+    """Does a negation govern the claim found at sentence[start:end]?"""
+    before = sentence[:start]
+    cut = max(max(before.rfind(ch) for ch in ",;:()[]–—"), before.rfind(" - "))
+    clause = before[cut + 1:]
+    words = re.findall(r"[a-z]+(?:'[a-z]+)?", clause.lower())
+    for i in range(len(words) - 1, -1, -1):
+        if words[i] in _CLAUSE_WORDS:
+            words = words[i + 1:]
+            break
+    if words and words[0] in _NEG_SUBJECT and _AUX_END.search(clause):
+        return True   # "No outreach emails to roofers were sent"
+    if re.search(r"(?<![\w.,])0(?![\w.,])|\bzero\b", sentence[start:end], re.I):
+        return True   # "We have 0 signups", "Got 0 replies": an honest zero
+    content = 0
+    for w in reversed(words):
+        if w in _NEGATIONS or w.endswith("n't"):
+            return True
+        if w not in _FILLER:
+            content += 1
+            if content > 3:
+                break
+    return bool(_NEG_AFTER.match(sentence, end))
+
+
 # Only for the website families: the local preview is real and may be described as working.
 _LOCAL = re.compile(r"\b(?:local(?:ly)?|localhost|preview|staging)\b", re.I)
+# The form family is about the live site: "The contact form works on desktop" is about the local preview unless the
+# sentence names the live site or the site really is deployed.
+_FORM_LIVE = re.compile(r"\b(?:live|production|prod|netlify|deployed|public(?:ly)?)\b|https://", re.I)
 # "Deployed the fix to site/index.html": a file was written, which is not a claim about the internet.
 _TO_LOCAL_FILE = re.compile(r"\bto\s+(?:the\s+)?(?:site/|code/|docs/|[\w./-]+\.(?:html?|css|js|md)\b)", re.I)
-# A section under a heading like "Plan" or "Next steps" describes intentions, not events.
+# A section under a heading like "Plan" or "Next steps" describes intentions, not events. Only the innermost heading
+# decides, and a heading that reports results is never exempt ("## Launch plan status").
 _HEADING_EXEMPT = re.compile(
     r"\b(?:drafts?|plans?|planned|planning|next\s+steps?|to[- ]?do|todo|proposed|proposals?|ideas?|checklist|"
-    r"templates?|examples?|instructions?|how\s+to|goals?|roadmap|backlog|options?|open\s+questions|questions|"
-    r"risks?|assumptions?|hypothes[ie]s|scripts?|sequence|copy)\b", re.I)
+    r"templates?|examples?|instructions?|how\s+to|goals?|roadmap|backlog|assumptions?|hypothes[ie]s)\b", re.I)
+_HEADING_REPORT = re.compile(r"\b(?:status|results?|done|progress|updates?|summary|summaries|reports?|logs?|"
+                             r"completed|shipped)\b", re.I)
+# Lines marked as finished are checked even in a plan section: "- [x] Send the emails", "~~Deploy~~ Done: live".
+_TICKED = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[[xX✓✔]\]\s+")
+_DONE_MARK = re.compile(r"~~[^~]+~~|[✅✔☑]|\b(?:done|completed|finished|shipped)\s*[:!]", re.I)
+_LIST_MARK = re.compile(r"^\s*(?:(?:[-*+]|\d+[.)])\s+)?(?:\[[ xX✓✔]\]\s+)?")
+_SEP_ROW = re.compile(r"^\|?[\s:|-]+\|?$")
 # Research describes what other people did ("Roofers who signed up for Angi report...", "contractors replied on
 # Reddit that...", "was contacted by Angi"). That is about the market, not this company, so the families about
-# people (email, signups, replies, posts) skip such sentences.
+# people (email, signups, replies, posts) skip such sentences. Table rows and data records use the narrower list:
+# a lead list's Source or Reviews column says nothing about who did what.
 _RESEARCH = re.compile(r"\b(?:sources?:|according\s+to|reported|survey(?:s|ed)?|stud(?:y|ies)|reviews?|forums?|"
                        r"competitors?|rivals?|industry|on\s+average)\b|\[fact\s*#?\d+\]", re.I)
+_RESEARCH_DATA = re.compile(r"\b(?:according\s+to|survey(?:s|ed)?|stud(?:y|ies)|on\s+average)\b|\[fact\s*#?\d+\]",
+                            re.I)
 _RELATIVE = re.compile(r"\b(?:who|that|which)\s+(?:have\s+|has\s+|had\s+|already\s+)?(?:signed\s+up|subscribed|joined|"
                        r"registered|enrolled|replied|responded|posted|contacted|e-?mailed|onboarded|recruited)\b", re.I)
+# "Wrote copy for the email that gets sent when a roofer signs up": a template, not an event.
+_TEMPLATE_CLAUSE = re.compile(r"\b(?:that|which)\s+(?:gets?|is|are|goes|go)\s+(?:automatically\s+)?(?:sent|e-?mailed|"
+                              r"delivered|posted|published)\b|\bwhen\s+(?:a|an|the|each|every|new|someone)\s+"
+                              r"(?:\w+\s+)?(?:signs?\s+up|joins|subscribes|replies|registers)\b", re.I)
 _BY_OTHERS = re.compile(r"\b(?:was|were|been|being|get|got|gets)\s+(?:\w+\s+)?(?:contacted|e-?mailed|recruited|"
                         r"signed\s+up|subscribed|onboarded|posted|reached)\s+(?:out\s+to\s+)?by\s+"
                         r"(?!us\b|our\b|me\b|holdco\b|the\s+company\b)", re.I)
 _REPLIED_ELSEWHERE = re.compile(r"\b(?:replied|responded)\s+(?:that\b|(?:on|in|to)\s+(?!(?:our|my|us|me)\b))", re.I)
+# "many have signed up for Angi", "Users joined the waitlist at Roofr": people joining another company.
+_JOINED_ELSEWHERE = re.compile(
+    r"(?i:\b(?:signed\s+up|joined|subscribed|registered|enrolled|onboarded))\s+(?:(?i:the|a|an|their|its)\s+)?"
+    r"(?:(?i:wait\s?list|list|newsletter|platform|network|program(?:me)?|plan|service|site|app|beta|pilot|"
+    r"marketplace|directory|community|membership|subscription|premium|pro|free|paid|trial)\s+){0,2}"
+    r"(?i:for|on|with|to|at)\s+(?:the\s+)?([A-Z][\w&'.-]*)")
+# "Roofers on HomeAdvisor", "Customers of Angi": another company's people.
+_MEMBERS_OF = re.compile(r"(?i:\b(?:users|roofers|customers|members|subscribers|clients|contractors|pros|providers|"
+                         r"homeowners|sellers|buyers|businesses))\s+(?i:of|on|at|from)\s+(?:the\s+)?([A-Z][\w&'.-]*)")
+# Capitalised words that are not another company.
+_NOT_NAMES = frozenset({"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january",
+                        "february", "march", "april", "may", "june", "july", "august", "september", "october",
+                        "november", "december", "our", "us", "this", "the", "holdco", "it", "them", "i", "we",
+                        "pilot", "beta", "launch", "day", "week", "phase"})
+# The owner did it himself ("The owner emailed three roofers himself"): not an agent's claim about the company.
+_OWNER_ACTS = re.compile(r"\b(?:the|our)\s+owner\s+(?:(?:has|had|have|himself|herself|themselves|personally|also|"
+                         r"already|just|then|first)\s+)*(?:e-?mailed|sent|contacted|reached\s+out|called|posted|"
+                         r"tweeted|published|deployed|paid|bought|purchased|registered|booked|launched|signed\s+up|"
+                         r"met|replied|shared)\b", re.I)
+# "Jane said she contacted three roofers": what an interviewee did, reported.
+_REPORTED = re.compile(r"\b(?:said|says|told\s+(?:us|me|the\s+team)|mentioned|explained|claims?|claimed|noted|"
+                       r"recalled|reports?)\b(?:\s+that)?\s+(?:she|he|they)\b", re.I)
+# "Pricing page deployed by Angi last month": someone else's deploy.
+_DEPLOYED_BY = re.compile(r"\b(?:deployed|launched|published)\s+(?:\w+\s+){0,2}?by\s+(?:the\s+)?([\w&'.-]+)", re.I)
+_US_WORDS = frozenset({"us", "me", "our", "holdco", "team", "company", "engineering", "engineer", "we"})
 # Events before the company existed are about the world, whatever the verb.
 _OLD_TIMES = re.compile(r"\b(?:last\s+year|years\s+ago|in\s+the\s+past|historically)\b", re.I)
 _PEOPLE_FAMILIES = ("email", "signups", "replies", "posted")
+# Every claim pattern below contains one of these; a sentence without any is skipped quickly (large files).
+_HINT = re.compile(r"deploy|live|publish|online|launch|\bup\b|e-?mail|reach|contact|sent\b|deliver|went|outreach|"
+                   r"campaign|sign|subscri|recruit|onboard|enrol|regist|join|member|user|customer|submi|form|post|"
+                   r"tweet|thread|announce|shar|paid|purchas|bought|spent|incorporat|domain|payment|repl|respon|"
+                   r"book|schedul|status|update", re.I)
 
 _EMAIL_WORDS = r"\b(?:e-?mails?|outreach|newsletters?|follow[- ]?ups?|pitch(?:es)?|cold)\b|@\w"
 _FAMILIES: dict[str, list[tuple[re.Pattern, re.Pattern | None, re.Pattern | None]]] = {}
@@ -871,28 +967,43 @@ def _fam(name: str, pattern: str, context: str | None = None, exclude: str | Non
                                            re.compile(exclude, re.I) if exclude else None))
 
 
-# A sentence that starts with the verb ("Deployed the site.", "- Posted: launch thread") has the writer as its
-# subject, the way agents write summaries; "Roofr deployed a feature" or "users posted reviews" do not.
-_START = r"^(?:[-*+]\s+)?(?:[\w ]{1,24}:\s+)?"
+# A sentence that starts with the verb ("Deployed the site.", "- Posted: launch thread", "✅ Deployed: https://...")
+# has the writer as its subject, the way agents write summaries; "Roofr deployed a feature" or "users posted
+# reviews" do not. Leading bullets, symbols and emoji and one "Label:" are allowed before the verb.
+_SYM = r"(?:[^\w\s]{1,3}\s*)"
+_START = r"^" + _SYM + r"{0,3}(?:[\w ]{1,24}:\s+" + _SYM + r"{0,2})?"
 _US = r"\b(?:we|i|holdco|we've|i've)\s+(?:have\s+|has\s+|had\s+|just\s+|already\s+|now\s+)*"
 _SITE = r"(?:site|website|web\s*site|landing\s+page|page|homepage|it|app|form|changes|update|fix|new\s+version)"
+_URLISH = r"(?:https?://|www\.|netlify|vercel|[\w-]+\.(?:com|co|net|org|io|app|dev|site)\b)"
 _fam("deployed", _START + r"(?:re)?deployed\b")
 _fam("deployed", _US + r"(?:re)?deployed\b")
 _fam("deployed", r"\b" + _SITE + r"\s+(?:is|are|was|were|has\s+been|have\s+been|got)\s+(?:now\s+|successfully\s+)?"
                  r"(?:re)?deployed\b")
+# "Site deployed without errors.": the headline form, without "is" or "was".
+_fam("deployed", r"\b(?:site|website|web\s*site|landing\s+page|homepage|page|app|changes|update|fix|new\s+version)"
+                 r"\s+(?:now\s+|successfully\s+)?(?:re)?deployed\b")
 _fam("deployed", r"\b(?:re)?deployed\s+(?:the\s+|our\s+)?(?:site|website|landing\s+page|page|homepage|app|form|"
                  r"changes|update|fix|new\s+version)\b")
 _fam("deployed", r"\bdeployed\s+(?:it\s+)?(?:to|on)\s+(?:netlify|vercel|production|the\s+web|the\s+internet|https?://)")
-_fam("deployed", r"\bdeployment\s+(?:is\s+|was\s+)?(?:confirmed|complete[d]?|successful|succeeded|done|live)\b")
+_fam("deployed", r"\bdeploy(?:ment)?s?\s+(?:is\s+|was\s+|has\s+)?(?:now\s+)?(?:confirmed|complete[d]?|successful|"
+                 r"succeeded|done|finished|live)\b")
 _fam("deployed", r"\b(?:site|website|web\s*site|landing\s+page|page|homepage|it|app|form|url|link|domain|we|everything)"
                  r"\s+(?:is\s+|are\s+|was\s+|went\s+|has\s+gone\s+|have\s+gone\s+)(?:now\s+|officially\s+)?live\b")
 _fam("deployed", r"\b(?:we're|it's|we\s+are|we\s+went|now)\s+live\b")
 _fam("deployed", r"\blive\s+(?:url|link|site|website|address)\b")
-_fam("deployed", r"\blive\s+(?:at|on)\s+(?:https?://|www\.|netlify|vercel|[\w-]+\.(?:com|co|net|org|io|app|dev|site)\b)")
+_fam("deployed", r"\blive\s+(?:at|on)\s+" + _URLISH)
 _fam("deployed", r"\bpublished\s+(?:the\s+|our\s+)?(?:site|website|landing\s+page|web\s*page|page)\b")
+_fam("deployed", r"\bpublished\s+(?:it\s+)?(?:at|on|to)\s+(?:https?://|www\.|netlify|vercel)")
 _fam("deployed", r"\b(?:site|website|landing\s+page|page)\s+(?:is|was|has\s+been|went)\s+(?:now\s+)?"
                  r"(?:published|online|launched|up\s+and\s+running|up\s+(?:at|on)\b)")
+_fam("deployed", r"\b(?:site|website|landing\s+page|homepage)\s+(?:now\s+)?(?:published|launched)\b")
 _fam("deployed", r"\blaunched\s+(?:the\s+|our\s+)?(?:site|website|landing\s+page)\b")
+# Label forms: "Deployment: ✅ Done", "Website: LIVE (https://...)", a record's "deploy status: live".
+_fam("deployed", r"(?:^|[,;]\s*)" + _SYM + r"{0,3}deploy(?:ment)?(?:\s+status)?\s*:\s*" + _SYM +
+                 r"{0,3}(?:live|deployed|online|published|done|complete[d]?|success(?:ful)?|succeeded|ok)\b")
+_fam("deployed", r"(?:^|[,;]\s*)" + _SYM + r"{0,3}(?:site|website|web\s*site|landing\s+page|homepage)(?:\s+status)?"
+                 r"\s*:\s*" + _SYM + r"{0,3}(?:live|deployed|online|published)\b")
+_fam("deployed", r"\bstatus\s*:\s*" + _SYM + r"{0,3}(?:live|online)\b")
 _fam("email", r"\be-?mailed\b")
 _fam("email", r"\breached\s+out\s+to\b")
 _fam("email", r"\bcontacted\b")
@@ -900,6 +1011,9 @@ _fam("email", r"\bsent\b", _EMAIL_WORDS)
 _fam("email", r"\bdelivered\b", r"\b(?:e-?mails?|newsletters?|inboxes)\b|\bto\s+(?:their|the|your)\s+inbox\b")
 _fam("email", r"\b(?:e-?mails?|outreach)\s+(?:went\s+out|(?:is\s+|was\s+|has\s+been\s+)?(?:done|complete[d]?|"
               r"launched))\b")
+_fam("email", r"\bcampaign\s+(?:was\s+|has\s+been\s+)?(?:launched|sent|went\s+out|delivered)\s+to\b")
+_fam("email", r"\b(?:e-?mail|outreach)\s+campaign\s+(?:is\s+|was\s+|has\s+been\s+)?(?:now\s+)?(?:launched|sent|live|"
+              r"started|complete[d]?|done)\b")
 _fam("signups", r"\bsigned\s+up\b")
 _fam("signups", r"\bsubscribed\b")
 _fam("signups", r"\brecruited\b")
@@ -933,8 +1047,9 @@ _NOT_MONEY = (r"(?!\s+(?:close\s+)?(?:attention|off|heed|tribute|respect|a\s+vis
               r"search|social|media|traffic|versions?|users?|customers?|subscribers?|subscriptions?|newsletters?|"
               r"options?|products?|courses?|campaigns?|channels?|placements?|listings?|memberships?|acquisition|"
               r"accounts?|leads?|features?|apps?|tools?|members?|content|promotions?)\b)")
-_fam("purchase", _US + r"(?:paid|purchased|bought)\b" + _NOT_MONEY)
-_fam("purchase", _START + r"(?:paid|purchased|bought)\b" + _NOT_MONEY)
+# (?!-): "Bought-in roofers" is an adjective, not a purchase.
+_fam("purchase", _US + r"(?:paid|purchased|bought)\b(?!-)" + _NOT_MONEY)
+_fam("purchase", _START + r"(?:paid|purchased|bought)\b(?!-)" + _NOT_MONEY)
 _fam("purchase", _US + r"spent\s+(?:\$|£|€|\d[\d,.]*\s*(?:usd|dollars|euros|pounds))")
 _fam("purchase", r"\bpaid\s+for\s+(?:the|a|an|our)\b")
 _fam("purchase", r"\b(?:purchased|bought)\s+(?:the\s+|a\s+|an\s+|our\s+)?(?:domain|plan|subscription|tool|licen[cs]e|"
@@ -944,7 +1059,12 @@ _fam("purchase", r"\bregistered\s+(?:the\s+|a\s+|our\s+)?(?:domain|[a-z0-9-]+\.(
 _fam("purchase", r"\bformed\s+(?:the\s+|an\s+|a\s+|our\s+)?(?:llc|company|corporation|corp|ltd|business\s+entity)\b")
 _fam("purchase", _US + r"incorporated\b")
 _fam("purchase", r"\bdomain\s+(?:is\s+|was\s+|has\s+been\s+)?(?:registered|purchased|bought)\b")
+_fam("purchase", r"\bdomain\s+(?:name\s+)?(?:[a-z0-9-]+\.)+[a-z]{2,}\s+(?:is\s+|was\s+|has\s+been\s+)?(?:now\s+)?"
+                 r"(?:registered|purchased|bought|secured)\b")
 _fam("purchase", r"\b(?:purchase|payment)\s+(?:is\s+|was\s+|has\s+been\s+)?(?:complete[d]?|confirmed|made|done)\b")
+_fam("purchase", r"\bpayment\s+of\s+(?:[$£€]\s?\d[\d,.]*|\d[\d,.]*\s*(?:usd|dollars?|euros?|pounds?))\s+"
+                 r"(?:[\w-]+\s+){0,4}?(?:is\s+|was\s+|has\s+been\s+)?(?:complete[d]?|confirmed|made|done|processed|"
+                 r"succeeded|successful|sent)\b")
 _fam("replies", r"\b(?:\d+|one|two|three|several|some|many|they|he|she|prospects?|leads?|roofers?|customers?|"
                 r"contractors?|providers?|people|recipients?)\s+(?:have\s+|has\s+)?(?:replied|responded)\b")
 _fam("replies", r"\b(?:got|received|have|had)\s+(?:\d+\s+|a\s+|some\s+|several\s+)?(?:new\s+)?(?:replies|responses|"
@@ -952,6 +1072,8 @@ _fam("replies", r"\b(?:got|received|have|had)\s+(?:\d+\s+|a\s+|some\s+|several\s
 _fam("replies", r"\breplied\s+to\s+(?:our|my|the)\s+(?:e-?mail|outreach|message)\b")
 _fam("replies", r"\bbooked\s+(?:a\s+|the\s+|\d+\s+)?(?:call|calls|meeting|meetings|demo|demos)\b")
 _fam("replies", r"\bscheduled\s+(?:a\s+|\d+\s+)?(?:call|calls|meeting|meetings|demo|demos)\s+with\b")
+# A ticked checkbox states the task was done: "- [x] Send outreach emails to 10 roofers" says emails were sent.
+_TICK_FAMILY = {"outreach": "email", "deploy": "deployed", "post": "posted", "purchase": "purchase"}
 
 FAMILY_DESC = {
     "deployed": "the site is deployed or live",
@@ -964,8 +1086,8 @@ FAMILY_DESC = {
     "date": "something happened on a date that has not come yet",
 }
 
-_NUMWORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
-             "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
+_NUMWORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+             "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
              "fifty": 50, "hundred": 100, "dozen": 12}
 _NUM = r"(\d[\d,]*|" + "|".join(_NUMWORDS) + r")"
 _EMAIL_COUNT = [re.compile(r"\b(?:sent|e-?mailed|contacted|reached\s+out\s+to)\s+(?:out\s+)?(?:a\s+total\s+of\s+|"
@@ -978,7 +1100,19 @@ _BARE_HOST_RE = re.compile(r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:netlify\.
 _PAST = re.compile(r"\b(?:was|were|did|had|completed|finished|done|held|met|called|reviewed|updated|launched|created|"
                    r"wrote|written|built|ran|confirmed|received|signed|agreed|decided|approved|happened|occurred)\b",
                    re.I)
-_DATE_QUALIFIERS = re.compile(r"\b(?:due|deadline|by|scheduled|schedule|target|starts?|starting|from)\b", re.I)
+# Words that make a future date a target or a schedule rather than the date of an event: "Due 2026-10-20",
+# "Created a reminder to call Bob on 2026-10-20", "the publishing calendar".
+_DATE_QUALIFIERS = re.compile(r"\b(?:due|deadline|by|scheduled|schedules?|scheduling|target|starts?|starting|from|"
+                              r"reminders?|calendar|publish|publishing|publishes|publication|until|upcoming)\b", re.I)
+# "Wrote the post for 2026-10-22", "checklist for October 20, 2026": the date the work is for.
+_FOR_DATE = re.compile(r"\bfor\s+(?:(?:the|a|an|week|weeks|day|of|launch|publish(?:ing)?|release|go[- ]live|our|its|"
+                       r"their|next|this)\s+){0,4}$", re.I)
+_MONTH_NUM = {m.lower(): i + 1 for i, m in enumerate(_MONTHS)}
+_MONTH_NUM.update({m[:3].lower(): i + 1 for i, m in enumerate(_MONTHS)})
+_MON = r"(" + "|".join(sorted(_MONTH_NUM, key=len, reverse=True)) + r")\.?"
+_DATE_ISO = re.compile(r"(?<!\d)(20\d{2})[-_/](0?[1-9]|1[0-2])[-_/](0?[1-9]|[12]\d|3[01])(?!\d)")
+_DATE_DMY = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+" + _MON + r",?\s+(20\d{2})\b", re.I)
+_DATE_MDY = re.compile(r"\b" + _MON + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b", re.I)
 
 
 def _to_int(s: str) -> int:
@@ -986,35 +1120,39 @@ def _to_int(s: str) -> int:
     return _NUMWORDS[s] if s in _NUMWORDS else int(s)
 
 
-def _dates_in(text: str) -> list[_dt.date]:
+def _dates_at(text: str) -> list[tuple[_dt.date, int]]:
+    """Each date in the text with where it starts."""
     out = []
-    for m in re.finditer(r"(?<!\d)(20\d{2})[-_/](0?[1-9]|1[0-2])[-_/](0?[1-9]|[12]\d|3[01])(?!\d)", text):
-        try:
-            out.append(_dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
-        except ValueError:
-            pass
-    months = {m.lower(): i + 1 for i, m in enumerate(_MONTHS)}
-    months.update({m[:3].lower(): i + 1 for i, m in enumerate(_MONTHS)})
-    mon = r"(" + "|".join(sorted(months, key=len, reverse=True)) + r")\.?"
-    for m in re.finditer(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+" + mon + r",?\s+(20\d{2})\b", text, re.I):
-        try:
-            out.append(_dt.date(int(m.group(3)), months[m.group(2).lower()], int(m.group(1))))
-        except (ValueError, KeyError):
-            pass
-    for m in re.finditer(r"\b" + mon + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b", text, re.I):
-        try:
-            out.append(_dt.date(int(m.group(3)), months[m.group(1).lower()], int(m.group(2))))
-        except (ValueError, KeyError):
-            pass
+    for rx, order in ((_DATE_ISO, "ymd"), (_DATE_DMY, "dmy"), (_DATE_MDY, "mdy")):
+        for m in rx.finditer(text):
+            g = m.groups()
+            try:
+                if order == "ymd":
+                    d = _dt.date(int(g[0]), int(g[1]), int(g[2]))
+                elif order == "dmy":
+                    d = _dt.date(int(g[2]), _MONTH_NUM[g[1].lower()], int(g[0]))
+                else:
+                    d = _dt.date(int(g[2]), _MONTH_NUM[g[0].lower()], int(g[1]))
+            except (ValueError, KeyError):
+                continue
+            out.append((d, m.start()))
     return out
 
 
+def _dates_in(text: str) -> list[_dt.date]:
+    return [d for d, _ in _dates_at(text)]
+
+
 def _families_in(sentence: str) -> list[str]:
+    """The claim families stated in one sentence. A match counts only when no negation governs it."""
+    if not _HINT.search(sentence):
+        return []
     found = []
     for fam, pats in _FAMILIES.items():
         for rx, ctx_rx, ex_rx in pats:
-            if rx.search(sentence) and (ctx_rx is None or ctx_rx.search(sentence)) and \
-                    (ex_rx is None or not ex_rx.search(sentence)):
+            if (ctx_rx is not None and not ctx_rx.search(sentence)) or (ex_rx is not None and ex_rx.search(sentence)):
+                continue
+            if any(not _negated(sentence, m.start(), m.end()) for m in rx.finditer(sentence)):
                 found.append(fam)
                 break
     return found
@@ -1130,21 +1268,43 @@ def _ours(host: str, info: dict) -> bool:
     return any(t in flat for t in info["name_tokens"])
 
 
-def _about_others(fam: str, sentence: str, info: dict) -> bool:
+def _joined_elsewhere(sentence: str, info: dict) -> bool:
+    """'signed up for Angi', 'joined the waitlist at Roofr', 'Roofers on HomeAdvisor': another company's people."""
+    for rx in (_JOINED_ELSEWHERE, _MEMBERS_OF):
+        for m in rx.finditer(sentence):
+            name = m.group(1).rstrip(".,'")
+            flat = re.sub(r"[^a-z0-9]", "", name.lower())
+            if not flat or name.lower() in _NOT_NAMES:
+                continue
+            if flat in info["name_tokens"] or any(t in flat for t in info["name_tokens"]):
+                continue   # this company's own name
+            return True
+    return False
+
+
+def _about_others(fam: str, sentence: str, info: dict, data: bool = False) -> bool:
     """True when the sentence is about someone else, a teammate hand-off or a time before the company existed, so
-    it is not this company's claim about the outside world."""
+    it is not this company's claim about the outside world. data: the sentence is a table row or data record."""
     low = sentence.lower()
     years = [int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b", sentence)]
     if _OLD_TIMES.search(sentence) or (years and max(years) < info["year"]):
         return True
-    if fam in _PEOPLE_FAMILIES and (_RESEARCH.search(sentence) or _RELATIVE.search(sentence)
-                                    or _BY_OTHERS.search(sentence)):
-        return True
+    if _OWNER_ACTS.search(sentence) or _REPORTED.search(sentence):
+        return True   # "The owner emailed three roofers himself", "Jane said she contacted three roofers"
+    if fam in _PEOPLE_FAMILIES:
+        if (_RESEARCH_DATA if data else _RESEARCH).search(sentence) or _RELATIVE.search(sentence) \
+                or _BY_OTHERS.search(sentence) or _TEMPLATE_CLAUSE.search(sentence):
+            return True
+        if _joined_elsewhere(sentence, info):
+            return True
     if fam == "replies" and _REPLIED_ELSEWHERE.search(sentence):
         return True
     if fam in ("deployed", "posted") and _TO_LOCAL_FILE.search(sentence):
         return True   # "Deployed the fix to site/index.html", "Posted findings to research/x.md"
     if fam == "deployed":
+        m = _DEPLOYED_BY.search(sentence)
+        if m and m.group(1).lower() not in _US_WORDS and m.group(1).lower() not in info["team"]:
+            return True   # "Pricing page deployed by Angi last month"
         m = re.search(r"\b([\w-]+)'s\s+(?:new\s+)?(?:site|website|landing\s+page|page|homepage|app)\b", low)
         if m and m.group(1) not in ("our", "my") and not any(t in m.group(1).replace("-", "")
                                                              for t in info["name_tokens"]):
@@ -1180,76 +1340,360 @@ def _claim_info(company: dict) -> dict:
                                     re.I) if name else None}
 
 
-def check_claims(company: dict, text: str, path: str = "", skip_lines: set | None = None) -> list[dict]:
-    """Sentences in `text` that state a real-world event the records do not support (design 2.4).
+# ---------------------------------------------------------------- what the claims gate reads: units
+#
+# The gate judges "units": a sentence-bearing line of prose, one Markdown table row, or one record of a JSON, YAML
+# or CSV file. A table row or record is read as a whole, each value with its column or key in front of it
+# ("Roofer: Bob's Roofing, Email: bob@bobsroofing.com, Status: Sent"), so a Status column that says Sent is judged
+# together with the address next to it. Values that say no, none, pending or planned are left out, so a column
+# named Contacted with "no" in it claims nothing.
 
-    Each problem is a dict: line, sentence, family, records (what Holdco's records say), rewrite (a suggestion)
-    and text (all of it in one line for the agent). Plans, drafts, questions, negations, quoted text, code blocks,
-    sections under a plan-like heading and files in a drafts/ folder are not claims. Lines in skip_lines (stripped)
-    are left alone: write_guard passes the lines a file already had, so only new text is judged."""
-    if not text or not text.strip() or _draft_path(path):
+class _Unit(NamedTuple):
+    no: int          # the line it starts on
+    text: str        # what is judged
+    parts: tuple     # the "key: value" pieces of a table row or record; empty for prose
+    ticked: str      # the text of a ticked checkbox ("- [x] Send the emails"), else ""
+    key: tuple       # identifies the unit: its text with the heading (and table header) that governs it
+    lines: tuple     # the stripped source lines, for the older form of skip_lines
+    last: int = 0    # the last line of a unit that spans several (a block of 'Key: value' lines)
+
+
+_NEG_VALUE = re.compile(r"^(?:no|n|false|none|null|nil|0|-+|—|–|n/?a|tbd|tba|never|pending|queued|planned|"
+                        r"draft(?:ed)?|to\s*do|todo|not\s.*|waiting.*|☐|✗|✘|❌|\[\s?\])\.?$", re.I)
+_JSON_TOKEN = re.compile(r'"(?:[^"\\\n]|\\.)*"|[{}\[\]:,]|[^\s{}\[\]:,"]+')
+
+
+def _humanize(key) -> str:
+    """'sent_at' -> 'sent at', 'deployStatus' -> 'deploy Status'."""
+    k = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(key or ""))
+    return " ".join(re.sub(r"[_\-]+", " ", k).split())
+
+
+def _pair_ok(label: str, value: str) -> bool:
+    """A value that states something: not empty, not a 'no' or 'pending', not a plan or a question."""
+    if not value or _NEG_VALUE.match(value):
+        return False
+    if "?" in _URL_RE.sub(" ", value):
+        return False
+    return not _INTENT.search(_PRODUCT_PLAN.sub(" ", f"{label} {value}"))
+
+
+def _record_unit(prefix: str, pairs: list, lines: list[str]) -> _Unit | None:
+    """One table row or data record as a unit. pairs: (line number, key, value)."""
+    parts = []
+    for _no, key, val in pairs:
+        label = " ".join(x for x in (prefix, _humanize(key)) if x)
+        v = " ".join(str(val).split())
+        if _pair_ok(label, v):
+            parts.append(f"{label}: {v}" if label else v)
+    if not parts:
+        return None
+    src = tuple(dict.fromkeys(lines[n - 1].strip() for n, _, _ in pairs if 0 < n <= len(lines)))
+    return _Unit(pairs[0][0], ", ".join(parts), tuple(parts), "", ("data", prefix, src), src)
+
+
+def _json_scalar(tok: str):
+    if tok.startswith('"'):
+        try:
+            return json.loads(tok)
+        except ValueError:
+            return tok.strip('"')
+    return tok
+
+
+def _json_records(text: str) -> list[tuple[str, list]]:
+    """(key path, [(line, key, value)]) for every object and array in JSON text. A small tokenizer instead of
+    json.loads: it keeps line numbers and still reads a file a model left half-broken."""
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    nodes: list[dict] = []
+    stack: list[dict] = []
+    for m in _JSON_TOKEN.finditer(text):
+        tok = m.group(0)
+        top = stack[-1] if stack else None
+        if tok in ("{", "["):
+            prefix = ""
+            if top is not None:
+                key = ""
+                if top["obj"]:
+                    key, top["key"] = _humanize(top["key"] or ""), None
+                prefix = " ".join((top["prefix"].split() + key.split())[-3:])
+            node = {"obj": tok == "{", "prefix": prefix, "pairs": [], "key": None, "cand": None}
+            stack.append(node)
+            nodes.append(node)
+        elif tok in ("}", "]"):
+            if stack:
+                stack.pop()
+        elif tok == ":":
+            if top is not None and top["obj"] and top["cand"] is not None:
+                top["key"], top["cand"] = str(top["cand"]), None
+        elif tok == ",":
+            if top is not None:
+                top["key"] = top["cand"] = None
+        else:
+            val = _json_scalar(tok)
+            line = bisect.bisect_right(starts, m.start())
+            if top is None:
+                nodes.append({"prefix": "", "pairs": [(line, "", val)]})
+            elif top["obj"]:
+                if top["key"] is not None:
+                    top["pairs"].append((line, top["key"], val))
+                    top["key"] = None
+                else:
+                    top["cand"] = val
+            else:
+                top["pairs"].append((line, "", val))
+    return [(n["prefix"], n["pairs"]) for n in nodes if n["pairs"]]
+
+
+def _yaml_scalar(v: str) -> str:
+    v = re.split(r"\s+#", v, 1)[0].strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return v
+
+
+def _yaml_records(lines: list[str]) -> list[tuple[str, list]]:
+    """(key path, [(line, key, value)]) per YAML mapping: '- name: Bob / email: bob@x / status: sent' is one
+    record. Enough YAML for what agents write (lists of mappings, nested keys, plain values); not a full parser."""
+    records: list[list] = []
+    open_recs: list[tuple[int, list]] = []   # (indent, record) still open
+    parents: list[tuple[int, str]] = []      # (indent, key) of keys that hold a nested block
+    for no, raw in enumerate(lines, 1):
+        s = raw.rstrip()
+        body = s.lstrip(" \t")
+        if not body or body.startswith("#") or body in ("---", "..."):
+            continue
+        indent = len(s) - len(body)
+        item = False
+        while body.startswith("-") and (len(body) == 1 or body[1] in " \t"):
+            item = True
+            rest = body[1:].lstrip(" \t")
+            indent += len(body) - len(rest)
+            body = rest
+        if not body:
+            continue   # a bare "-": the item's keys follow on the next lines
+        while open_recs and open_recs[-1][0] > indent:
+            open_recs.pop()
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        if item and open_recs and open_recs[-1][0] == indent:
+            open_recs.pop()
+        if not open_recs or open_recs[-1][0] != indent:
+            rec = [" ".join([k for _, k in parents][-3:]), []]
+            records.append(rec)
+            open_recs.append((indent, rec))
+        rec = open_recs[-1][1]
+        m = re.match(r"""^(?:"([^"]{1,80})"|'([^']{1,80})'|([^:#'"\s][^:#]{0,79}?))\s*:(?:\s+(.*))?$""", body)
+        if m:
+            key = _humanize(m.group(1) or m.group(2) or m.group(3))
+            val = _yaml_scalar(m.group(4) or "")
+            if not val or val in ("|", ">", "|-", ">-", "|+", ">+"):
+                parents.append((indent, key))
+                continue
+            rec[1].append((no, key, val))
+        else:
+            rec[1].append((no, "", _yaml_scalar(body)))
+    return [(r[0], r[1]) for r in records if r[1]]
+
+
+def _csv_records(lines: list[str], delimiter: str) -> list[tuple[str, list]]:
+    """(key path, [(line, column, value)]) per CSV row, the first row naming the columns when it looks like a
+    header (short labels, no addresses or links)."""
+    rows = []
+    for no, raw in enumerate(lines, 1):
+        if raw.strip():
+            try:
+                rows.append((no, next(csv.reader([raw], delimiter=delimiter))))
+            except (csv.Error, StopIteration):
+                continue
+    if not rows:
         return []
-    if path.lower().endswith((".html", ".htm")):
+    head = rows[0][1]
+    is_head = len(rows) > 1 and all(c.strip() and len(c) <= 40 and "@" not in c and "://" not in c
+                                    and not re.search(r"\d{3,}", c) for c in head)
+    out = []
+    for no, cells in (rows[1:] if is_head else rows):
+        names = head if is_head else []
+        out.append(("", [(no, names[i] if i < len(names) else "", c) for i, c in enumerate(cells)]))
+    return out
+
+
+def _heading_exempt(heading: str) -> bool:
+    return bool(_HEADING_EXEMPT.search(heading)) and not _HEADING_REPORT.search(heading)
+
+
+_KV_LINE = re.compile(r"^([-*+]\s+)?([A-Za-z][\w ./()&-]{0,30}?)\s*:\s+(\S.*)$")
+
+
+def _md_units(lines: list[str]):
+    """Units of prose, Markdown and plain text: one per line, one per table row, one per JSON object written on a
+    line, and one per block of 'Key: value' lines (a log entry written as 'To: bob@x.com / Status: sent')."""
+    in_fence = False
+    heading, exempt = "", False
+    head_cells: list[str] | None = None
+    run: list[tuple[int, str, str, str]] = []   # consecutive 'Key: value' lines: (line, key, value, raw)
+
+    def flush():
+        if len(run) >= 2:
+            u = _record_unit("", [(n, k, v) for n, k, v, _ in run], lines)
+            if u:
+                yield u._replace(key=(heading.lower(), "kv", tuple(r for *_, r in run)), last=run[-1][0])
+        run.clear()
+
+    for no, raw in enumerate(lines, 1):
+        s = raw.strip()
+        if s.startswith(("```", "~~~")):
+            yield from flush()
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if not s:
+            yield from flush()
+            head_cells = None
+            continue
+        hm = re.match(r"^(#{1,6})\s+(.*?)\s*#*$", s)
+        if hm:
+            yield from flush()
+            heading = hm.group(2).strip()
+            exempt = _heading_exempt(heading)   # only the innermost heading decides
+            head_cells = None
+            s = heading
+        if not s.startswith("|"):
+            head_cells = None
+        s = s.replace("**", "").replace("__", "")
+        if s.startswith(">"):
+            yield from flush()
+            continue   # quoted text is someone else's words
+        ticked = bool(_TICKED.match(s))
+        if exempt and not (ticked or _DONE_MARK.search(s)):
+            yield from flush()
+            continue
+        hkey = heading.lower()
+        if s.startswith("|"):
+            yield from flush()
+            # A table row is one unit; a header row (the next line is |---|) only names columns.
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            nxt = lines[no].strip() if no < len(lines) else ""
+            if _SEP_ROW.match(s):
+                continue
+            if _SEP_ROW.match(nxt) and "-" in nxt:
+                head_cells = [_strip_quotes(c).strip() for c in cells]
+                continue
+            u = _record_unit("", [(no, head_cells[i] if head_cells and i < len(head_cells) else "",
+                                   _strip_quotes(c).strip()) for i, c in enumerate(cells)], lines)
+            if u:
+                yield u._replace(key=(hkey, "|".join(head_cells or []), raw.strip()))
+            continue
+        body = _LIST_MARK.sub("", s, count=1)
+        if body[:1] in ("{", "[") and body[-1:] in ("}", "]") and '":' in body:
+            yield from flush()
+            for prefix, pairs in _json_records(body):   # {"to": "bob@x.com", "status": "sent"} on one line
+                u = _record_unit(prefix, [(no, k, v) for _, k, v in pairs], lines)
+                if u:
+                    yield u._replace(key=(hkey, "json", raw.strip()))
+            continue
+        kv = None if hm else _KV_LINE.match(s)
+        if kv:
+            if kv.group(1):   # "- name: Bob" starts a new record
+                yield from flush()
+            run.append((no, kv.group(2), _strip_quotes(kv.group(3)).strip(), raw.strip()))
+        else:
+            yield from flush()
+        yield _Unit(no, _strip_quotes(body), (), body if ticked else "", (hkey, "", raw.strip()), (raw.strip(),))
+    yield from flush()
+
+
+def _units(text: str, path: str = "") -> list[_Unit]:
+    p = (path or "").lower()
+    if p.endswith((".html", ".htm")):
         try:
             from . import web
             text = web.html_to_text(text)[1]
         except Exception:
             pass
+    text = text.replace("’", "'")
+    lines = text.splitlines()
+    records = None
+    if p.endswith((".json", ".jsonl", ".ndjson")) and text.lstrip()[:1] in ("{", "["):
+        records = _json_records(text)
+    elif p.endswith((".yaml", ".yml")):
+        records = _yaml_records(lines)
+    elif p.endswith((".csv", ".tsv")):
+        records = _csv_records(lines, "\t" if p.endswith(".tsv") else ",")
+    if records is None:
+        return list(_md_units(lines))
+    return [u for u in (_record_unit(prefix, pairs, lines) for prefix, pairs in records) if u]
+
+
+def claim_keys(text: str, path: str = "") -> set:
+    """What check_claims would judge in this text, as keys for its skip_lines: write_guard passes the keys of the
+    file's current content so only new or changed lines are judged. A line counts as changed when the heading
+    that governs it changed, so a claim written under '## Plan' and then moved under '## Status' by renaming the
+    heading is judged."""
+    try:
+        return {u.key for u in _units(text or "", path)}
+    except Exception as e:
+        _warn("claim keys", e)
+        return set()
+
+
+def check_claims(company: dict, text: str, path: str = "", skip_lines: set | None = None) -> list[dict]:
+    """Sentences in `text` that state a real-world event the records do not support (design 2.4).
+
+    Each problem is a dict: line, sentence, family, records (what Holdco's records say), rewrite (a suggestion)
+    and text (all of it in one line for the agent). Plans, drafts, questions, negated claims, quoted text, code
+    blocks, sections under a plan-like heading and files in a drafts/ folder are not claims. Units whose key is in
+    skip_lines (claim_keys of the old text) are left alone; the older form, a set of stripped lines, still works."""
+    if not text or not text.strip() or _draft_path(path):
+        return []
     st = None
     problems: list[dict] = []
     seen: set = set()
-    in_fence = False
-    stack: list[tuple[int, bool]] = []
     today = _today()
     info = _claim_info(company)
     name_live = info["name_live"]
-    lines = text.replace("’", "'").splitlines()
-    for no, raw in enumerate(lines, 1):
-        s = raw.strip()
-        if s.startswith(("```", "~~~")):
-            in_fence = not in_fence
+    skip = skip_lines or set()
+    for u in _units(text, path):
+        if u.key in skip or (u.lines and all(x in skip for x in u.lines)):
             continue
-        if in_fence or not s:
-            continue
-        hm = re.match(r"^(#{1,6})\s+(.*)$", s)
-        if hm:
-            level = len(hm.group(1))
-            while stack and stack[-1][0] >= level:
-                stack.pop()
-            stack.append((level, bool(_HEADING_EXEMPT.search(hm.group(2)))))
-            s = hm.group(2)
-        if any(ex for _, ex in stack):
-            continue
-        if s.startswith(">") or (skip_lines and raw.strip() in skip_lines):
-            continue
-        if s.startswith("|"):
-            # A table row: each cell is read on its own ("| Bob | Recruited |"); a header row (the next line is
-            # |---|) only names columns, and a separator row says nothing.
-            nxt = lines[no].strip() if no < len(lines) else ""
-            if re.match(r"^\|?[\s:|-]+\|?$", s) or re.match(r"^\|?[\s:|-]+\|?$", nxt) and "-" in nxt:
-                continue
-            s = ". ".join(c.strip() for c in s.strip("|").split("|") if c.strip())
-        for sentence in re.split(r"(?<=[.!?;])\s+", _strip_quotes(s)):
+        no, data = u.no, bool(u.parts)
+        # A row or record is one unit (its values were already filtered); prose is judged sentence by sentence.
+        for sentence in ([u.text] if data else re.split(r"(?<=[.!?;])\s+", u.text)):
             sentence = sentence.strip()
-            if not sentence or "?" in sentence or _QUALIFIERS.search(sentence):
+            if not sentence:
                 continue
+            if not data:
+                bare = _URL_RE.sub(" ", sentence)   # a "?" inside a link is not a question
+                if "?" in bare or _INTENT.search(_PRODUCT_PLAN.sub(" ", bare)):
+                    continue
             fams = _families_in(sentence)
+            for part in u.parts:   # "Status: deployed" in a row: the label form needs the cell on its own
+                fams += [f for f in _families_in(part) if f not in fams]
+            if u.ticked:
+                f = _TICK_FAMILY.get(classify_task(u.ticked))
+                if f and f not in fams:
+                    fams.append(f)
             if name_live and "deployed" not in fams and name_live.search(sentence):
                 fams.append("deployed")
-            fams = [f for f in fams if not _about_others(f, sentence, info)]
-            future = [d for d in _dates_in(sentence) if d > today]
-            if future and (fams or _PAST.search(sentence)) and not _DATE_QUALIFIERS.search(sentence):
+            fams = [f for f in fams if not _about_others(f, sentence, info, data)]
+            future = [(d, at) for d, at in _dates_at(sentence) if d > today]
+            if future and (fams or _PAST.search(sentence)) and not _DATE_QUALIFIERS.search(sentence) \
+                    and not any(_FOR_DATE.search(sentence[:at]) for _, at in future):
                 if (no, "date") not in seen:
                     seen.add((no, "date"))
-                    problems.append(_problem(no, sentence, "date", f"that date ({_long_date(future[0])}) has not "
+                    problems.append(_problem(no, sentence, "date", f"that date ({_long_date(future[0][0])}) has not "
                                              f"come yet; today is {_long_date(today)}",
                                              "Use the real date, or describe it as planned."))
                 continue
+            span = range(no, max(no, u.last) + 1)
             for fam in fams:
-                if (fam in ("deployed", "form") and _LOCAL.search(sentence)) or (no, fam) in seen:
+                if (fam in ("deployed", "form") and _LOCAL.search(sentence)) or any((n, fam) in seen for n in span):
                     continue
                 if st is None:
                     st = _state(company)
+                if fam == "form" and not _FORM_LIVE.search(sentence) and not st["website"]["deployed"]:
+                    continue   # a form tested while the site is local was tested in the preview
                 ok, records, rewrite = _judge(st, fam, sentence)
                 if not ok:
                     seen.add((no, fam))
@@ -1285,11 +1729,39 @@ _LOG_PARTS = {"log", "logs", "confirmation", "confirmations", "receipt", "receip
               "submissions"}
 _TEXT_EXT = {"", ".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".log", ".yaml", ".yml", ".rtf",
              ".html", ".htm"}
-_FILE_DATE = re.compile(r"(?<!\d)(20\d{2})[-_](0[1-9]|1[0-2])[-_](0[1-9]|[12]\d|3[01])(?!\d)")
+# A date in a file name: 2026-12-01, 2026_12_01, 2026.12.01 or 20261201 (the same separator both times).
+_FILE_DATE = re.compile(r"(?<!\d)(20\d{2})([-_.]?)(0[1-9]|1[0-2])\2(0[1-9]|[12]\d|3[01])(?!\d)")
+# Code and web pages are not records of events, so the claims gate and the log-name rule leave them alone. Only
+# real code and page files count: a .md, .txt or .csv under site/ or code/ is a document like any other (a
+# site/deployment_confirmation.md or code/email_log.txt is refused).
+_CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".css", ".scss", ".sass", ".less", ".sh", ".bash",
+             ".bat", ".cmd", ".ps1", ".sql", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp",
+             ".hpp", ".cs", ".swift", ".vue", ".svelte", ".lua", ".pl"}
+_SITE_EXT = {".html", ".htm", ".webmanifest", ".svg", ".xml", ".map", ".toml", ".ico", ".png", ".jpg", ".jpeg",
+             ".gif", ".webp", ".avif", ".woff", ".woff2", ".ttf", ".otf"}
+_SITE_NAMES = {"robots.txt", "humans.txt", "ads.txt", "security.txt", "llms.txt", "_redirects", "_headers", "cname",
+               "manifest.json"}
+_CODE_DIR_EXT = _SITE_EXT | {".json", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".lock", ".properties"}
+_CODE_NAMES = {"dockerfile", "makefile", "procfile", "requirements.txt", ".gitignore", ".env.example"}
 RECORDS_REFUSAL = "ERROR: records/ is written by Holdco from what really happened. Write plans and notes elsewhere."
 CONTEXT_REFUSAL = "ERROR: context/ is the owner's. Save your notes elsewhere, for example docs/."
 LOG_REFUSAL = ("ERROR: Holdco keeps the real record of what happened in records/. If this is a plan, name it as a "
                "plan, for example docs/outreach-plan.md.")
+
+
+def _is_code_file(rel: str) -> bool:
+    """A real code or web page file: source code anywhere, page and asset files under site/, code and config files
+    under code/."""
+    low = (rel or "").replace("\\", "/").lower().strip("/")
+    p = Path(low)
+    first = low.split("/", 1)[0]
+    if p.suffix in _CODE_EXT:
+        return True
+    if first == "site":
+        return p.suffix in _SITE_EXT or p.name in _SITE_NAMES
+    if first == "code":
+        return p.suffix in _CODE_DIR_EXT or p.name in _CODE_NAMES
+    return False
 
 
 def _log_like(rel: str) -> bool:
@@ -1300,16 +1772,19 @@ def _log_like(rel: str) -> bool:
         return False
     if ext == ".log":
         return True
+    if any(d.lower() in _LOG_PARTS for d in p.parent.parts):
+        return True   # logs/outreach.md, sales/sent/bob.md
     stem = re.sub(r"([a-z])([A-Z])", r"\1_\2", p.stem)   # emailLog -> email_Log
     return any(part in _LOG_PARTS for part in re.split(r"[_\-.\s]+", stem.lower()))
 
 
 def future_date_in(rel: str) -> _dt.date | None:
-    """A YYYY-MM-DD or YYYY_MM_DD date in a path that is after today's local date (design 2.8)."""
+    """A date in a path (2026-12-01, 2026_12_01, 2026.12.01 or 20261201) that is after today's local date
+    (design 2.8)."""
     today = _today()
     for m in _FILE_DATE.finditer(rel or ""):
         try:
-            d = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            d = _dt.date(int(m.group(1)), int(m.group(3)), int(m.group(4)))
         except ValueError:
             continue
         if d > today:
@@ -1319,7 +1794,8 @@ def future_date_in(rel: str) -> _dt.date | None:
 
 def write_guard(ctx: Ctx, rel_path: str, content: str, is_edit: bool = False) -> str | None:
     """Before write_file/edit_file saves: records/ and context/ protection, future dates in names, log-like names
-    for new files, unsupported claims in the new lines of files outside code/ and site/. Returns the refusal."""
+    for new files, unsupported claims in the new lines of documents (code and web pages are left alone). Returns
+    the refusal."""
     try:
         where = "edit_file" if is_edit else "write_file"
         rel = re.sub(r"^(?:\./)+", "", (rel_path or "").replace("\\", "/")).strip("/")
@@ -1335,7 +1811,7 @@ def write_guard(ctx: Ctx, rel_path: str, content: str, is_edit: bool = False) ->
                    "date or without a date.")
             _refused(ctx, where, "future_date", msg, path=rel)
             return msg
-        if first in ("code", "site"):
+        if _is_code_file(rel):
             return None   # code and the website are not records of events; deploy_guard checks the site
         try:
             target = workspace.safe_path(ctx.company, rel)
@@ -1349,14 +1825,15 @@ def write_guard(ctx: Ctx, rel_path: str, content: str, is_edit: bool = False) ->
             if problems:
                 return (f"{LOG_REFUSAL}\nIt also states things Holdco's records do not show:\n{_list(problems, 5)}")
             return LOG_REFUSAL
-        old_lines: set = set()
+        old_keys: set = set()
         if existed and target is not None:
             try:
-                old_lines = {x.strip() for x in target.read_text(encoding="utf-8", errors="replace").splitlines()
-                             if x.strip()}
+                # Only new or changed lines are judged. A line whose heading changed counts as changed: a claim
+                # written under "## Plan" and then put under "## Status" by renaming the heading is judged.
+                old_keys = claim_keys(target.read_text(encoding="utf-8", errors="replace"), rel)
             except OSError:
                 pass
-        problems = check_claims(ctx.company, content, rel, old_lines)
+        problems = check_claims(ctx.company, content, rel, old_keys)
         if problems:
             _refused(ctx, where, "claims", problems[0]["text"], path=rel, count=len(problems))
             return (f"ERROR: not saved: {rel} states things Holdco's records do not show:\n{_list(problems)}\n"
@@ -1368,12 +1845,24 @@ def write_guard(ctx: Ctx, rel_path: str, content: str, is_edit: bool = False) ->
     return None
 
 
+def _plain(p: dict) -> str:
+    """A problem without its line number, for a chat reply."""
+    return f"\"{p['sentence']}\" says {FAMILY_DESC[p['family']]}, but {p['records']}. {p['rewrite']}"
+
+
 def claims_guard(ctx: Ctx, text: str, where: str) -> str | None:
-    """Before report_to_owner / ask_owner sends text to the owner (where = 'report' | 'ask')."""
+    """Before text reaches the owner: report_to_owner and ask_owner (where = 'report' | 'ask'), and a chat reply
+    (where = 'chat'). Returns the refusal, or None when the text is supported by the records."""
     try:
         problems = check_claims(ctx.company, text or "")
         if problems:
             _refused(ctx, where, "claims", problems[0]["text"], count=len(problems))
+            if where == "chat":
+                listed = "\n".join(f"- {_plain(p)}" for p in problems[:8])
+                if len(problems) > 8:
+                    listed += f"\n- ...and {len(problems) - 8} more."
+                return ("Your reply states things the records do not support:\n" + listed + "\nRewrite those "
+                        "sentences and reply again. The Facts block says what has really happened.")
             return ("ERROR: not sent to the owner: the message states things Holdco's records do not show:\n"
                     f"{_list(problems)}\nRewrite those sentences and send again. The Facts block says what has "
                     "really happened.")
@@ -1408,11 +1897,50 @@ def _audit_done(action: str, result: str) -> bool:
     return True
 
 
+def _approval_id(value) -> int | None:
+    """An approval id from ctx.waiting_on: 12, "12" or "#12"."""
+    if isinstance(value, dict):
+        value = value.get("id")
+    m = re.fullmatch(r"\s*#?(\d+)\s*", str(value)) if value not in (None, "", False) else None
+    return int(m.group(1)) if m else None
+
+
+def _ask_rows(ctx: Ctx) -> list[dict]:
+    """The approvals an ask task is waiting on: the one named by ctx.waiting_on first (planning.ask_owner sets it
+    when the question was refused as a duplicate of one already pending), then every approval of this task."""
+    cid, task = ctx.company["id"], ctx.task or {}
+    rows = db.q("SELECT * FROM approvals WHERE company_id=? AND task_id=? ORDER BY id DESC", (cid, task["id"])) \
+        if task.get("id") else []
+    wid = _approval_id(getattr(ctx, "waiting_on", None))
+    if wid:
+        named = db.one("SELECT * FROM approvals WHERE id=? AND company_id=?", (wid, cid))
+        if named:
+            rows = [named] + [r for r in rows if r["id"] != wid]
+    return rows
+
+
+def _ask_state(ctx: Ctx) -> str:
+    rows = _ask_rows(ctx)
+    wid = _approval_id(getattr(ctx, "waiting_on", None))
+    named = rows[0] if rows and rows[0]["id"] == wid else None
+    if named:
+        if named["status"] in ("pending", "running"):
+            return "waiting"
+        if named["action"] == "question" and named["status"] == "answered":
+            return "done"
+    if any(r["action"] == "question" and r["status"] == "answered" for r in rows):
+        return "done"
+    return "waiting" if any(r["status"] in ("pending", "running") for r in rows) else "missing"
+
+
 def action_state(ctx: Ctx, kind: str) -> str:
     """'done' when this task's action really happened, 'waiting' while it is queued for the owner, otherwise
-    'missing'. tools.finish can use it to end a task 'waiting' instead of 'partial'."""
+    'missing'. tools.finish can use it to end a task 'waiting' instead of 'partial'. For an ask task, a question
+    that was refused as a duplicate of a pending one (ctx.waiting_on) counts as waiting, and done once answered."""
     task = ctx.task or {}
     action = ACTION_KINDS.get(kind)
+    if kind == "ask":
+        return _ask_state(ctx) if (task.get("id") or _approval_id(getattr(ctx, "waiting_on", None))) else "missing"
     if not action or not task.get("id"):
         return "missing"
     cid = ctx.company["id"]
@@ -1435,8 +1963,9 @@ def _action_problem(ctx: Ctx, kind: str, deliverable: str) -> str | None:
     if state == "done":
         return None
     task = ctx.task or {}
-    rows = db.q("SELECT * FROM approvals WHERE company_id=? AND task_id=? AND action=? ORDER BY id DESC",
-                (ctx.company["id"], task.get("id"), ACTION_KINDS[kind]))
+    rows = _ask_rows(ctx) if kind == "ask" else \
+        db.q("SELECT * FROM approvals WHERE company_id=? AND task_id=? AND action=? ORDER BY id DESC",
+             (ctx.company["id"], task.get("id"), ACTION_KINDS[kind]))
     noun = _KIND_NOUN[kind]
     article = "an" if kind[0] in "aeiou" else "a"
     if state == "waiting":
@@ -1489,20 +2018,20 @@ def finish_guard(ctx: Ctx, status: str, deliverable: str, summary: str, evidence
                 if p:
                     parts.append(p)
                     rule = rule or "action_task"
-        d = (deliverable or "").strip().strip("`'\"")
-        if d and (d.lower().startswith("research/") or d.lower() == "docs/charter.md"):
+        d = re.sub(r"^(?:\./)+", "", (deliverable or "").strip().strip("`'\"").replace("\\", "/"))
+        charter = d.lower() == CHARTER_FILE
+        if d and (d.lower().startswith("research/") or charter):
             try:
                 p = workspace.safe_path(ctx.company, d)
-                bad = source_problems(ctx.company, p.read_text(encoding="utf-8", errors="replace")) \
+                bad = source_problems(ctx.company, p.read_text(encoding="utf-8", errors="replace"), charter) \
                     if p.is_file() else []
             except Exception:
                 bad = []
             if bad:
                 shown = "; ".join(f"line {n}: {_one_line(t, 80)}" for n, t, _ in bad[:5])
                 more = f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""
-                parts.append(f"{d} has {_plural(len(bad), 'line')} with numbers and no source: {shown}{more}. Add the "
-                             "URL you fetched or a [fact N] reference, label estimates as 'estimate', or remove the "
-                             "numbers (check_sources lists them).")
+                parts.append(f"{d} has {_plural(len(bad), 'line')} with numbers and no source: {shown}{more} "
+                             f"(check_sources lists them). {_sources_advice(ctx.company)}")
                 rule = rule or "sources"
         if not parts:
             return None
@@ -1645,17 +2174,23 @@ _KIND_SYNONYMS = {"email": "outreach", "emails": "outreach", "sales": "outreach"
                   "publish": "deploy"}
 # Matched against the start of the title only. The first rules catch titles that start with an action word but
 # describe writing ("Email sequence for roofers", "Post ideas"), so they are not taken for the action itself.
+# Outreach has its own test (_outreach_title): the action word must reach real recipients.
 _KIND_RULES = [
     ("write", r"(?:e-?mail\s+(?:sequence|templates?|copy|drafts?|campaign\s+plan|plan|strategy|outline|lists?)|"
               r"(?:cold\s+)?outreach\s+(?:plan|strategy|templates?|copy|drafts?|sequence|script|lists?)|"
               r"post\s+(?:ideas|drafts?|calendar|plan|schedule|templates?|copy))\b"),
     ("", r"send\b.*\b(?:to\s+)?(?:the\s+)?owner\b"),
     ("ask", r"ask\s+(?:the\s+)?owner\b"),
-    ("outreach", r"(?:send|e-?mail|reach\s+out|contact|cold[- ]e-?mail|follow\s+up\s+with|outreach\s+to)\b"),
-    ("deploy", r"(?:(?:re)?deploy\b|go\s+live\b|publish\s+(?:the\s+|our\s+)?(?:site|website|landing\s+page|"
-               r"web\s*site|page)\b|launch\s+(?:the\s+|our\s+)?(?:site|website|landing\s+page)\b)"),
-    ("post", r"(?:post(?=\s)|tweet\b|publish\s+(?:a\s+|the\s+|our\s+)?(?:post|tweet|thread)s?\b|share\s+on\b)"),
-    ("purchase", r"(?:buy|purchase|register\s+(?:the\s+|a\s+|our\s+)?domain)\b"),
+    ("outreach", ""),
+    ("deploy", r"(?:(?:re)?deploy\b(?![- ](?:checklists?|plans?|notes|guides?|docs?|documentation|instructions|"
+               r"scripts?|steps|process|readiness|reviews?|checks?|tests?|testing|pipeline|config(?:uration)?|"
+               r"setup|set[- ]up|previews?|strategy|requirements?|qa)\b)|go\s+live\b|publish\s+(?:the\s+|our\s+)?"
+               r"(?:site|website|landing\s+page|web\s*site|page)\b|launch\s+(?:the\s+|our\s+)?(?:site|website|"
+               r"landing\s+page)\b)"),
+    ("post", r"(?:post(?=\s)(?!\s+(?:mortems?|-?mortem|ideas|drafts?|templates?|copy|calendar|schedule|plan|"
+             r"outline)\b)|tweet\b|publish\s+(?:a\s+|the\s+|our\s+)?(?:post|tweet|thread)s?\b|share\s+on\b)"),
+    ("purchase", r"(?:buy|purchase|register\s+(?:the\s+|a\s+|our\s+)?domain)\b(?![- ](?:side|in|ers?|personas?|"
+                 r"journey|intent|signals?|research|cycle|process|behaviou?r)\b)"),
     ("research", r"(?:research|find|analy[sz]e|scan|survey|interview|investigate|identify|compare|benchmark|"
                  r"look\s+up)\b"),
     ("build", r"(?:build|implement|create\s+(?:the\s+|a\s+|an\s+)?(?:[\w-]+\s+){0,2}(?:page|site|website|form|app|"
@@ -1664,6 +2199,69 @@ _KIND_RULES = [
     ("write", r"(?:write|draft|edit|rewrite|revise|outline|create\s+(?:a\s+|an\s+|the\s+)?(?:document|doc|brief|"
               r"plan|outline|post|copy|guide|faq|checklist|template|script|one-pager|report|proposal))\b"),
 ]
+# Outreach: the action word ("Email signup form" and "Contact page" are not outreach) ...
+_OUTREACH_VERB = re.compile(
+    r"(?:send|e-?mail|reach\s+out|contact|cold[- ]e-?mail|follow\s+up\s+with|outreach\s+to)\b"
+    r"(?![- ](?:sign[- ]?ups?|signup|capture|forms?|pages?|fields?|lists?|templates?|deliverability|checklists?|"
+    r"mortem|side|copy|sequences?|opt[- ]?ins?|buttons?|address(?:es)?|integration|settings?|set[- ]?up|server|"
+    r"providers?|tools?|footer|signatures?|domain|dns|warm[- ]?up|validation|verification|info(?:rmation)?|details|"
+    r"us|test|tests|testing)\b)", re.I)
+# ... and someone outside the company to reach: a number of people, a kind of recipient, an address, or a name.
+_RECIPIENTS = re.compile(
+    r"\b\d+\s+\w|\b(?:outreach|cold)\b|\b(?:roofers?|prospects?|leads?|customers?|clients?|providers?|partners?|"
+    r"contractors?|owners?|people|persons?|list|businesses|companies|shops?|stores?|bakeries|bakers?|"
+    r"restaurants?|caf[eé]s?|agencies|vendors?|suppliers?|influencers?|journalists?|reporters?|press|investors?|"
+    r"users?|subscribers?|homeowners?|landlords?|buyers?|sellers?|brokers?|realtors?|dentists?|doctors?|"
+    r"clinics?|salons?|gyms?|schools?|teachers?|plumbers?|electricians?|builders?|merchants?|retailers?|"
+    r"venues?|members?|signups?|sign-ups|recipients?|contacts|firms?|studios?|freelancers?|creators?|"
+    r"bloggers?|podcasters?|editors?|founders?|managers?|sponsors?|donors?|parents?|patients?|tenants?|"
+    r"farmers?|growers?|breeders?|vets?|veterinarians?|groomers?|trainers?|coaches?|pros|professionals|"
+    r"operators|installers|technicians|testers?|everyone)\b", re.I)
+_WAITLIST_OBJECT = re.compile(r"^\s+(?:to\s+)?(?:the|our|everyone\s+on\s+the)\s+(?:wait\s?list|mailing\s+list)\b",
+                              re.I)
+_ROLE_WORDS = (r"owner|ceo|cto|cmo|coo|team|teammates?|qa|engineering|engineers?|marketing|sales|research|"
+               r"researchers?|ops|operations|support|design|designers?|product|finance|legal|growth|content|seo|"
+               r"analytics|devs?|developers?")
+
+
+def _teammates_rx() -> re.Pattern:
+    """A teammate or a role: work handed inside the company is not outreach ("Send the copy to QA")."""
+    names = "|".join(sorted({re.escape(p["name"].lower()) for p in presets.PRESETS.values() if p.get("name")},
+                            key=len, reverse=True))
+    who = rf"(?:the\s+|our\s+)?(?:{_ROLE_WORDS}{'|' + names if names else ''})\b"
+    not_people = (r"(?!\s+(?:leads?|prospects?|agencies|firms?|teams?\s+at|managers?|directors?|people|contacts|"
+                  r"owners?|companies|businesses|list)\b)")
+    return re.compile(rf"(?:^\s+|\b(?:to|with|cc)\s+){who}{not_people}", re.I)
+
+
+_TEAMMATE = _teammates_rx()
+_NOT_RECIPIENT_NAMES = frozenset({"the", "a", "an", "our", "my", "i", "x", "linkedin", "twitter", "reddit", "facebook",
+                                  "instagram", "netlify", "google", "gmail", "phone", "monday", "tuesday", "wednesday",
+                                  "thursday", "friday", "saturday", "sunday"})
+
+
+def _outreach_title(t: str, raw: str) -> bool:
+    """Is this title outreach to people outside the company? t is the lower-cased title, raw the same text with
+    its case kept (for names: "Follow up with Bob")."""
+    m = _OUTREACH_VERB.match(t)
+    if not m:
+        return False
+    rest, rest_raw = t[m.end():], raw[m.end():]
+    if re.search(r"\bby\s+(?:phone|telephone|call(?:ing)?|text|sms|whatsapp|dm)\b", rest):
+        return False   # Holdco's outreach is email
+    if _ADDR_RE.search(rest):
+        return True
+    if _TEAMMATE.search(rest):
+        return False
+    if _RECIPIENTS.search(t) or _WAITLIST_OBJECT.match(rest):
+        return True
+    # A name: "Email Bob at Bob's Roofing", "Follow up with Bob", "Send the pilot details to Acme"
+    name_rx = r"\bto\s+([A-Z][\w'&.-]*)" if t.startswith("send") else r"^\s*(?:to\s+)?([A-Z][\w'&.-]*)"
+    names = [n for n in re.findall(name_rx, rest_raw)
+             if re.sub(r"'s$", "", n.lower()) not in _NOT_RECIPIENT_NAMES]
+    return bool(names)
+
+
 _DELIVERABLE_HINTS = [("outreach", r"\be-?mails?\s+(?:queued|sent)\b|\boutreach\s+(?:queued|sent)\b"),
                       ("deploy", r"\b(?:deploy(?:ment)?\s+(?:queued|requested|done)|site\s+(?:deployed|live)|"
                                  r"live\s+site)\b"),
@@ -1675,16 +2273,21 @@ def classify_task(title: str, description: str = "", deliverable: str = "", kind
     """outreach | deploy | post | purchase | ask | research | build | write ('' when unknown).
 
     An explicit kind wins. Otherwise the leading words of the title decide, conservatively: "Write launch post"
-    is write and "Find 20 leads" is research. The description is not used because it mentions everything; the
-    deliverable only decides when the title does not ("10 emails queued")."""
+    is write, "Find 20 leads" is research, and outreach needs someone outside the company to reach ("Email signup
+    form" and "Send the copy to QA" are not outreach). The description is not used because it mentions everything;
+    the deliverable only decides when the title does not ("10 emails queued")."""
     k = (kind or "").strip().lower()
     k = _KIND_SYNONYMS.get(k, k)
     if k in _VALID_KINDS:
         return k
-    t = (title or "").strip().lower()
-    t = re.sub(r"^(?:[\-*#>\s]+|\d+[.)]\s*|\[[^\]]*\]\s*|task\s*:\s*|todo\s*:\s*)+", "", t)
+    raw = re.sub(r"^(?:[\-*#>\s]+|\d+[.)]\s*|\[[^\]]*\]\s*|task\s*:\s*|todo\s*:\s*)+", "", (title or "").strip(),
+                 flags=re.I)
+    t = raw.lower()
     for name, rx in _KIND_RULES:
-        if re.match(rx, t):
+        if name == "outreach":
+            if _outreach_title(t, raw):
+                return name
+        elif re.match(rx, t):
             return name
     d = (deliverable or "").lower()
     for name, rx in _DELIVERABLE_HINTS:
@@ -1838,10 +2441,67 @@ def _states_number(line: str) -> bool:
     return bool(re.search(r"\b\d+(?:\.\d+)?\b", s) and _STAT_WORDS.search(s))
 
 
-def source_problems(company: dict, text: str) -> list[tuple[int, str, str]]:
+CHARTER_FILE = "docs/charter.md"
+# Which charter sections describe the world, and so need sources for their numbers (design 5.3). The company's
+# own decisions and targets (offer and price, channels, business model, riskiest assumption, North Star, the
+# 30-day plan) need none: in the owner's first gpt-oss run the check flagged a charter's own price and pass
+# threshold, and the model deleted its threshold and labelled every number "(estimate)", fetched ones included.
+_WORLD_STRONG = re.compile(r"\b(?:competit\w*|alternatives?|landscape|market\s+size|size|tam|sam|som|spend\w*|"
+                           r"current\s+(?:solutions?|options|tools|spending|costs?))\b", re.I)
+_OWN_SECTION = re.compile(r"\b(?:offer|pric\w*|reach|go-to-market|gtm|channels?|acquisition|business\s+model|"
+                          r"revenue\s+model|economics|margins?|riskiest|assumptions?|north\s*-?\s*star|metrics?|"
+                          r"kpis?|30-day|thirty-day|plan|roadmap|milestones?|tests?|experiments?|goals?|budget|"
+                          r"one-liner|mission|vision|team)\b", re.I)
+_WORLD_SECTION = re.compile(r"\b(?:problems?|customers?|market\w*|industry|demand|pain\w*|users?|buyers?|"
+                            r"segments?|audience)\b", re.I)
+_CTX_REF = re.compile(r"\b(?:context|global):[^\s,;)\]>\"'`]+", re.I)
+
+
+def _section_kind(heading: str) -> bool | None:
+    """True for a charter section about the world, False for the company's own decisions, None when unknown."""
+    h = re.sub(r"[\u2010-\u2015\u2212]", "-", heading)   # gpt-oss writes "30‑Day Plan" with a non-ASCII hyphen
+    if _WORLD_STRONG.search(h):
+        return True
+    if _OWN_SECTION.search(h):
+        return False
+    if _WORLD_SECTION.search(h):
+        return True
+    return None
+
+
+def _context_ref_ok(company: dict, ref: str) -> bool:
+    """context:<path> or global:<path> names a file in the owner's context library."""
+    try:
+        from . import context as _cx   # imported here: context imports tools, which loads this module
+        f, _, _ = _cx.resolve(company, ref.rstrip(".,:;!"))
+        return f.is_file()
+    except Exception:
+        return False
+
+
+def _recent_fetched(cid: int, n: int = 5) -> list[str]:
+    out: list[str] = []
+    for r in db.q("SELECT url FROM fetched WHERE company_id=? ORDER BY id DESC LIMIT 200", (cid,)):
+        if r["url"] not in out:
+            out.append(r["url"])
+        if len(out) >= n:
+            break
+    return out
+
+
+def _sources_advice(company: dict) -> str:
+    urls = _recent_fetched(company["id"])
+    pages = ("Pages this company fetched, newest first: " + ", ".join(urls) + "." if urls else
+             "This company has not fetched any pages yet.")
+    return (f"{pages} If a number came from a page you fetched, cite its URL or record it with record_fact and cite "
+            "[fact N]. Label only your own guesses as estimates. Targets and prices you set do not need a source.")
+
+
+def source_problems(company: dict, text: str, charter: bool = False) -> list[tuple[int, str, str]]:
     """(line number, line, reason) for lines that state a number, price, percentage or statistic without a URL this
-    company fetched or a [fact N] reference (design 5.3). Lines that say 'estimate' pass, and Markdown reference
-    links ([1] with '[1]: https://...' further down) count as the URL they point to."""
+    company fetched, a [fact N] reference or a file in the owner's context (context:<path>, global:<path>)
+    (design 5.3). Lines that say 'estimate' pass, and Markdown reference links ([1] with '[1]: https://...' further
+    down) count as the URL they point to. charter: only sections about the world are checked (see _section_kind)."""
     cid = company["id"]
     fetched = _fetched_keys(cid)
     facts = {r["id"] for r in db.q("SELECT id FROM facts WHERE company_id=?", (cid,))}
@@ -1853,12 +2513,37 @@ def source_problems(company: dict, text: str) -> list[tuple[int, str, str]]:
             refs[m.group(1).lower()] = m.group(2)
     out = []
     in_fence = False
+    sections: list[tuple[int, bool]] = []   # (heading level, checked) for a charter
+    checked = not charter
     for no, ln in enumerate(lines, 1):
         s = ln.strip()
         if s.startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
-        if in_fence or not s or re.match(r"^\|?[\s:|-]+\|?$", s) or re.match(r"^\[\^?[\w-]+\]:", s):
+        if in_fence or not s:
+            continue
+        if charter:
+            hm = re.match(r"^(#{1,6})\s+(.*)$", s)
+            if hm:
+                level = len(hm.group(1))
+                while sections and sections[-1][0] >= level:
+                    sections.pop()
+                kind = _section_kind(hm.group(2))
+                checked = (sections[-1][1] if sections else False) if kind is None else kind
+                sections.append((level, checked))
+                continue
+            # "**Offer & Pricing:** $45 per lead": a bold label that names a section starts one
+            bm = re.match(r"^\*\*([^*\n]{2,80}?)\*\*\s*(.*)$", s)
+            if bm and (bm.group(1).rstrip().endswith(":") or bm.group(2).startswith(":")):
+                kind = _section_kind(bm.group(1).rstrip(" :"))
+                if kind is not None:
+                    checked = kind
+                    s = bm.group(2).lstrip(" :")
+                    if not s:
+                        continue
+            if not checked:
+                continue
+        if re.match(r"^\|?[\s:|-]+\|?$", s) or re.match(r"^\[\^?[\w-]+\]:", s):
             continue
         if not _states_number(s) or re.search(r"\bestimat(?:e|ed|es|ion)\b", s, re.I):
             continue
@@ -1868,10 +2553,15 @@ def source_problems(company: dict, text: str) -> list[tuple[int, str, str]]:
         urls = _URL_RE.findall(s) + [refs[k.lower()] for k in re.findall(r"\[\^?([\w-]+)\]", s) if k.lower() in refs]
         if any(_url_key(u.rstrip(".,;)")) in fetched for u in urls):
             continue
+        owner_refs = _CTX_REF.findall(s)
+        if any(_context_ref_ok(company, r) for r in owner_refs):
+            continue
         if cited:
             reason = f"fact {cited[0]} does not exist"
         elif urls:
             reason = f"{_one_line(urls[0], 80)} was never fetched by this company"
+        elif owner_refs:
+            reason = f"{_one_line(owner_refs[0], 80)} is not in the owner's context"
         else:
             reason = "no source"
         out.append((no, s, reason))
@@ -1879,20 +2569,21 @@ def source_problems(company: dict, text: str) -> list[tuple[int, str, str]]:
 
 
 @tool("check_sources", "List lines in a document that state a number, price, percentage or statistic without a "
-      "source: a URL this company fetched, or a [fact N] reference. Lines labelled 'estimate' pass.",
+      "source: a URL this company fetched, a [fact N] reference or the owner's context (context:<path>). Lines "
+      "labelled 'estimate' pass. In docs/charter.md only the sections about the world are checked.",
       {"path": S("A file in the company folder, e.g. research/market.md")}, ("path",))
 def check_sources(ctx: Ctx, path: str) -> str:
     p = workspace.safe_path(ctx.company, path)
     if not p.is_file():
         raise ToolError(f"{path} doesn't exist.")
-    bad = source_problems(ctx.company, p.read_text(encoding="utf-8", errors="replace"))
+    charter = workspace.rel(ctx.company, p).lower() == CHARTER_FILE
+    bad = source_problems(ctx.company, p.read_text(encoding="utf-8", errors="replace"), charter)
     if not bad:
         return "All numbers are sourced."
     rows = "\n".join(f"- Line {n}: {_one_line(t, 140)} ({why})" for n, t, why in bad[:25])
     more = f"\n- ...and {len(bad) - 25} more" if len(bad) > 25 else ""
-    return (f"{_plural(len(bad), 'line')} state numbers without a source (a URL this company fetched, or a [fact N] "
-            f"reference):\n{rows}{more}\nAdd the source, cite a recorded fact as [fact N], label the line as an "
-            "estimate, or remove the number.")
+    return (f"{_plural(len(bad), 'line')} state numbers without a source (a URL this company fetched, a [fact N] "
+            f"reference or the owner's context):\n{rows}{more}\n{_sources_advice(ctx.company)}")
 
 
 @tool("company_status", "The real state of the company from Holdco's records: website, email, accounts, money, what "
@@ -1904,7 +2595,7 @@ def company_status(ctx: Ctx) -> str:
 # ---------------------------------------------------------------- one-time truth check on upgrade
 
 _SCAN_EXT = {".md", ".markdown", ".txt", ".csv", ".json", ".html", ".htm", ".yaml", ".yml", ".log"}
-_SCAN_SKIP = {"code", "site", "records", "context"}
+_SCAN_SKIP = {"records", "context"}   # code and page files are skipped by _is_code_file
 _scan_lock = threading.Lock()
 
 
@@ -1921,9 +2612,9 @@ def _mark_scanned(cid: int) -> None:
 
 
 def scan_existing(company: dict) -> list[str]:
-    """Run the claims gate once over files written before this version (outside code/, site/ and records/). When
-    files claim what the records do not show, the owner hears it once. Files are never changed. Returns the paths
-    with problems."""
+    """Run the claims gate once over files written before this version (documents only: not code or web pages, not
+    records/ or context/). When files claim what the records do not show, the owner hears it once. Files are never
+    changed. Returns the paths with problems."""
     cid = company["id"]
     with _scan_lock:
         if cid in _scanned:
@@ -1935,7 +2626,8 @@ def scan_existing(company: dict) -> list[str]:
         n = 0
         for f in (sorted(root.rglob("*")) if root.exists() else []):
             rel = f.relative_to(root).as_posix()
-            if rel.split("/", 1)[0] in _SCAN_SKIP or any(x.startswith(".") for x in rel.split("/")):
+            if rel.split("/", 1)[0] in _SCAN_SKIP or any(x.startswith(".") for x in rel.split("/")) \
+                    or _is_code_file(rel):
                 continue
             if not f.is_file() or f.suffix.lower() not in _SCAN_EXT or f.stat().st_size > 300_000:
                 continue
