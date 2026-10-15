@@ -17,7 +17,8 @@ Auth: `Authorization: Bearer <key>`; a key containing "_test_" is accepted, any 
 Endpoints: GET /v1/balance; POST /v1/products, GET /v1/products[/<id>]; POST /v1/prices, GET /v1/prices/<id>;
 POST/GET /v1/payment_links, GET /v1/payment_links/<id>[/line_items]; GET /pay/<id> (an HTML checkout page with a
 title, an h1 with the product name and a <form>, no auth); GET /v1/charges (created[gte], created[gt], limit,
-starting_after); GET /v1/customers; GET /v1/subscriptions (status filter); POST /v1/refunds. Test hooks (no auth):
+starting_after); GET /v1/charges/<id> and GET /v1/payment_intents/<id> (from the stored charges); GET
+/v1/customers; GET /v1/subscriptions (status filter); POST /v1/refunds. Test hooks (no auth):
 POST /_test/charges, /_test/customers, /_test/subscriptions with a JSON body, or the Python methods add_charge,
 add_customer, add_subscription.
 
@@ -245,6 +246,17 @@ class FakeStripe:
             if created.get("gt"):
                 items = [c for c in items if c["created"] > int(created["gt"])]
             return 200, self._list(items, query)
+        m = re.match(r"^/v1/(charges|payment_intents)/([^/]+)$", path)
+        if m and method == "GET":   # one payment, as a refund looks up its currency
+            field = "id" if m.group(1) == "charges" else "payment_intent"
+            charge = next((c for c in self.charges if c[field] == m.group(2)), None)
+            if not charge:
+                return 404, {"error": {"message": f"No such {m.group(1)[:-1]}: '{m.group(2)}'"}}
+            if m.group(1) == "charges":
+                return 200, charge
+            return 200, {"id": charge["payment_intent"], "object": "payment_intent", "amount": charge["amount"],
+                         "currency": charge["currency"], "status": "succeeded", "latest_charge": charge["id"],
+                         "livemode": False}
         if path == "/v1/customers" and method == "GET":
             return 200, self._list(list(reversed(self.customers)), query)
         if path == "/v1/subscriptions" and method == "GET":

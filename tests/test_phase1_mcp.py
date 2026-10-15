@@ -133,9 +133,11 @@ class TestMCP(FakesCase):
         self.assertIn("not found", str(cm.exception))
 
     def test_stdio_env_is_merged_over_the_environment(self):
-        code = ("import os, sys; sys.stderr.write('vars: %s %s' % (os.environ.get('HOLDCO_T_PARENT'), "
+        # The parent's variable is not a HOLDCO_* one: those never reach a server unless its env sets them
+        # (tests/test_phase1_review.py), which HOLDCO_T_CLIENT checks here.
+        code = ("import os, sys; sys.stderr.write('vars: %s %s' % (os.environ.get('MCPTEST_T_PARENT'), "
                 "os.environ.get('HOLDCO_T_CLIENT'))); sys.exit(2)")
-        with mock.patch.dict(os.environ, {"HOLDCO_T_PARENT": "from-parent"}):
+        with mock.patch.dict(os.environ, {"MCPTEST_T_PARENT": "from-parent"}):
             with self.assertRaises(mcp.MCPError) as cm:
                 script_client(code, env={"HOLDCO_T_CLIENT": "from-client"}).connect()
         self.assertIn("vars: from-parent from-client", str(cm.exception))

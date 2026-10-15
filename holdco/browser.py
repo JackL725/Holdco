@@ -268,19 +268,47 @@ def _content(result) -> tuple[str, list[dict]]:
     return "\n".join(texts), images
 
 
-class _Browser:
-    """Thin wrapper over the connection's MCP client: any error result raises, so the check falls back."""
+class _Landed(RuntimeError):
+    """The page went to this PC or the home network (other than the company's own preview)."""
 
-    def __init__(self, inst: dict):
+
+class _Browser:
+    """Thin wrapper over the connection's MCP client: any error result raises, so the check falls back. After
+    every call it checks where the page ended up (conn_playwright.check_result): this PC or the home network,
+    other than the company's own preview when `allow` accepts it, sends the browser to about:blank and raises
+    _Landed. HOLDCO_ALLOW_LOCAL does not open this."""
+
+    def __init__(self, inst: dict, allow=None):
         from . import connectors
         self.client = connectors.client(inst)
+        self.allow = allow
+        self.inst_id = inst.get("id")
 
     def call(self, name: str, args: dict | None = None) -> tuple[str, list[dict]]:
+        from . import conn_playwright
         result = self.client.call_tool(name, args or {})
         text, images = _content(result)
+        refusal = conn_playwright.check_result(name, args or {}, text, allow=self.allow)
+        if refusal:
+            try:
+                self.client.call_tool(*conn_playwright.RESET_CALL)
+            except Exception:
+                pass
+            raise _Landed(refusal.removeprefix("ERROR: "))
         if isinstance(result, dict) and result.get("isError"):
             raise RuntimeError(f"{name}: {text.strip()[:300] or 'error'}")
         return text, images
+
+    def close_page(self) -> None:
+        """Close the page at the end of a check, so the next run starts from a clean browser (best effort). The
+        framework's memory of the page goes too: a click asked for on the page before is refused after this."""
+        try:
+            self.client.call_tool("browser_close", {})
+        except Exception:
+            pass
+        from . import connectors
+        with connectors._lock:
+            connectors._pages[self.inst_id] = ""
 
     def screenshot(self, path: Path, company: dict) -> str:
         text, images = self.call("browser_take_screenshot", {"type": "png"})
@@ -319,31 +347,32 @@ def _snapshot_links(snap: str) -> list[str]:
     return [u.strip().strip('"') for u in re.findall(r"/url:\s*(\S+)", snap or "")]
 
 
+def _own_preview(company: dict):
+    """allow(url) for _Browser: the company's own preview pages, which browser_check alone may open."""
+    base = urllib.parse.urlparse(_preview_base(company))
+
+    def allow(url: str) -> bool:
+        p = urllib.parse.urlparse(str(url or ""))
+        return (p.scheme, p.netloc) == (base.scheme, base.netloc) and p.path.startswith(base.path)
+    return allow
+
+
+def _lock(inst: dict):
+    """The connection's call lock: browser_check's whole sequence runs without another agent steering the
+    browser in between."""
+    from . import connectors
+    return connectors.call_lock(inst["id"])
+
+
 def _with_playwright(ctx: Ctx, inst: dict, page: Path, rel: str, url: str, mobile: bool) -> str:
     company = ctx.company
     site = workspace.safe_path(company, "site")
-    b = _Browser(inst)
-    desktop = {"width": DESKTOP[0], "height": DESKTOP[1]}
-    try:
-        b.call("browser_resize", desktop)   # a previous phone-sized check may have left the window small
-    except Exception:
-        pass   # resizing is a nicety; navigation and the snapshot below decide whether rendering works
-    b.call("browser_navigate", {"url": url})
-    console, _ = b.call("browser_console_messages", {})
-    snap, _ = b.call("browser_snapshot", {})
-    qa = workspace.root(company) / ".qa"
-    name = _page_name(rel)
-    shots = [b.screenshot(qa / f"{name}.png", company)]
-    if mobile:
+    with _lock(inst):
+        b = _Browser(inst, allow=_own_preview(company))
         try:
-            b.call("browser_resize", {"width": MOBILE[0], "height": MOBILE[1]})
-            shots.append(b.screenshot(qa / f"{name}-mobile.png", company))
-        except Exception as e:   # keep the desktop results; say what is missing
-            shots.append(f"no phone-sized screenshot ({_reason(e)})")
-        try:
-            b.call("browser_resize", desktop)
-        except Exception:
-            pass
+            console, snap, shots = _render_site_page(b, company, rel, url, mobile)
+        finally:
+            b.close_page()
     status, html, err = _fetch(url)
     served = 0 < status < 400
     if not served:
@@ -362,6 +391,38 @@ def _with_playwright(ctx: Ctx, inst: dict, page: Path, rel: str, url: str, mobil
         lines += _link_lines(checked, problems, external) + _form_lines(parser)
     lines.append(f"Screenshots: {', '.join(shots)}")
     return "\n".join(lines)
+
+
+def _render_site_page(b: _Browser, company: dict, rel: str, url: str, mobile: bool) -> tuple[str, str, list[str]]:
+    """The browser part of a site page check: (console text, snapshot text, screenshot lines)."""
+    desktop = {"width": DESKTOP[0], "height": DESKTOP[1]}
+    try:
+        b.call("browser_resize", desktop)   # a previous phone-sized check may have left the window small
+    except _Landed:
+        raise
+    except Exception:
+        pass   # resizing is a nicety; navigation and the snapshot below decide whether rendering works
+    b.call("browser_navigate", {"url": url})
+    console, _ = b.call("browser_console_messages", {})
+    snap, _ = b.call("browser_snapshot", {})
+    qa = workspace.root(company) / ".qa"
+    name = _page_name(rel)
+    shots = [b.screenshot(qa / f"{name}.png", company)]
+    if mobile:
+        try:
+            b.call("browser_resize", {"width": MOBILE[0], "height": MOBILE[1]})
+            shots.append(b.screenshot(qa / f"{name}-mobile.png", company))
+        except _Landed:
+            raise
+        except Exception as e:   # keep the desktop results; say what is missing
+            shots.append(f"no phone-sized screenshot ({_reason(e)})")
+        try:
+            b.call("browser_resize", desktop)
+        except _Landed:
+            raise
+        except Exception:
+            pass
+    return console, snap, shots
 
 
 # ---------------------------------------------------------------- the site page, with or without Playwright
@@ -412,16 +473,24 @@ def _static(ctx: Ctx, page: Path, rel: str, url: str, why: str) -> str:
 # ---------------------------------------------------------------- external pages
 
 def _render_external(inst: dict, url: str) -> list[str]:
-    """Open a public page in the browser for its console errors. Nothing is clicked, typed or submitted."""
-    b = _Browser(inst)
-    b.call("browser_navigate", {"url": url})
-    console, _ = b.call("browser_console_messages", {})
+    """Open a public page in the browser for its console errors. Nothing is clicked, typed or submitted. Where
+    the page ended up is checked like every connector call (no exemption: a public page that sends the browser
+    to this PC or the home network raises _Landed). The page is closed at the end."""
+    with _lock(inst):
+        b = _Browser(inst)
+        try:
+            b.call("browser_navigate", {"url": url})
+            console, _ = b.call("browser_console_messages", {})
+        finally:
+            b.close_page()
     return _console_errors(console)
 
 
 def _external(ctx: Ctx, url: str) -> str:
     web.check_public_url(url)   # this PC and the home network stay off limits (HOLDCO_ALLOW_LOCAL: tests only)
     status, ctype, body, final = web.http_get(url)
+    if final and final != url:
+        web.check_public_url(final)   # a redirect may not end on this PC or the home network either
     text = web._decode(body, ctype)
     title, content, _ = web.html_to_text(text, final)
     has_form = bool(re.search(r"<form[\s>]", text, re.I))
@@ -430,6 +499,8 @@ def _external(ctx: Ctx, url: str) -> str:
     if inst is not None:
         try:
             errors = _render_external(inst, url)
+        except _Landed as e:   # the page itself is the problem, not Playwright: report it, not the page
+            raise ToolError(str(e)) from None
         except Exception as e:
             why = f"Playwright failed: {_reason(e)}"
     lines = [f"Browser check (Playwright) of {url}" if errors is not None else f"Static check only: {why}",

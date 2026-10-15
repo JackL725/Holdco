@@ -17,7 +17,8 @@ Changes Phase 0.5 makes to this design: `find_tool` reaches every role through `
 preset's list; the Phase 0.5 tools carry risk tags (search, grep, company_status, check_sources read; edit_file,
 record_fact write); built-in tags come from `tools.BUILTIN_RISK`; E2E tests are numbered from `test_26`; the facts
 block (`truth.facts_section`) lists connected services as accounts the company has, and revenue from a connector
-counts as a real signal; secrets in `records/` files are redacted like events and transcripts.
+counts as a real signal (independent review: rows a connector polled in test mode are shown labelled "(test mode)"
+and never count); secrets in `records/` files are redacted like events and transcripts.
 
 Related: [../architecture.md](../architecture.md), [../operating-model.md](../operating-model.md),
 [../reliability.md](../reliability.md), [../owner-experience.md](../owner-experience.md),
@@ -80,10 +81,15 @@ never touch a developer's keyring.
 | `secret-service` | the desktop keyring; `data/vault.json` keeps `{"backend": "secret-service"}` per name so `names()` works | `secret-tool store --label "Holdco <name>" app holdco name <name>` (value on stdin), `secret-tool lookup app holdco name <name>`, `secret-tool clear app holdco name <name>` |
 | `file` | `data/vault.json`: `{"version": 1, "salt": base64, "secrets": {"<name>": {"backend": "file", "nonce": base64, "ct": base64, "tag": base64}}}` | master key = `PBKDF2-HMAC-SHA256(HOLDCO_VAULT_PASSPHRASE, salt, 200000)` when the env var is set, else 32 random bytes in `data/vault.key` (mode 0600, created with `os.open(..., 0o600)`); `enc_key = HMAC-SHA256(master, b"enc")`, `mac_key = HMAC-SHA256(master, b"mac")`; per secret a random 16-byte nonce; keystream block i = `HMAC-SHA256(enc_key, nonce + i.to_bytes(8, "big"))`, XORed with the plaintext; `tag = HMAC-SHA256(mac_key, nonce + ciphertext)`; `get` verifies the tag with `hmac.compare_digest` before decrypting |
 
-The backend name is recorded per secret. `get` on a secret whose backend is not the active one raises
+The backend name is recorded per secret. `get` reads a secret with the backend it was stored with when that backend
+works here; one whose backend does not work here raises
 `VaultError("Secret <name> was stored with <backend> on another machine; enter it again in Settings")`, so a
 backup restored elsewhere fails loudly. The Doctor gets a row `vault` (ok: backend name; bad: unreadable file or
-a secret with a foreign backend).
+a secret with a foreign backend). Independent review: a brief secret-tool outage at start makes the active backend
+`file`, but the vault's recorded backend is not changed while secrets stored with it remain; new secrets go to the
+file (recorded per secret), keyring secrets read again once the keyring answers, and the Doctor's row warns
+("keyring unavailable; new secrets are stored in the file vault") instead of failing. Only the keys in
+`SECRET_SETTINGS` and `SECRET_COMPANY_SETTINGS` resolve `vault:` markers.
 
 Migration on start. `db.init()` ends with `vault.migrate()` (lazy import): for each key in
 `config.SECRET_SETTINGS = ("llm_api_key", "brave_api_key", "telegram_bot_token")` whose stored value is non-empty
@@ -113,18 +119,22 @@ Code touch points. New `holdco/vault.py` (`VaultError`, the three backends behin
 
 ### 2. MCP client (`mcp.py`)
 
-Behaviour. `mcp.Client(name, transport, command=None, args=(), env=None, url=None, headers=None, auth=None)`
-with `transport` in `stdio | http`. Methods: `connect()`, `list_tools() -> list[dict]` (each
+Behaviour. `mcp.Client(name, transport, command=None, args=(), env=None, url=None, headers=None, auth=None,
+connect_timeout=None)` with `transport` in `stdio | http`. Methods: `connect()`, `list_tools() -> list[dict]` (each
 `{name, description, inputSchema}`), `call_tool(name, args) -> {"content": [...], "isError": bool,
 "structuredContent": ...}`, `close()`, and the module function `mcp.text_of(result) -> str`. JSON-RPC 2.0
-with integer ids; `connect` has a 30 s timeout, `call_tool` 120 s; a timeout raises `mcp.MCPError`. In the
+with integer ids; `connect` has a 30 s timeout (`connect_timeout` overrides it: the framework passes a stdio
+definition's `health_timeout`, 120 s for Playwright's first start), `call_tool` 120 s, and the deadline holds
+while an HTTP reply arrives; an HTTP reply or one SSE event over 5 MB raises; a timeout raises `mcp.MCPError`. In the
 current generation every request carries the namespaced `_meta` keys (see below). `client.protocol` records the
 generation in use (`"2026-07-28"` or the version the server returned on `initialize`).
 
 Transports:
 
 - `stdio`: `subprocess.Popen` of `command` resolved with `shutil.which` (so `npx` finds `npx.cmd` on Windows),
-  with `env` merged over `os.environ`, `stdin`/`stdout` pipes, newline-delimited JSON frames, a reader thread
+  with `env` merged over `os.environ` without its `HOLDCO_*` and `OLLAMA_*` variables (the vault passphrase and
+  the dashboard password never reach a server unless its `env` sets one), `stdin`/`stdout` pipes, newline-delimited
+  JSON frames, a reader thread
   that dispatches responses by id into per-request `queue.Queue`s and ignores notifications, and `stderr`
   captured into a ring buffer (last 4,000 chars) that is included in error messages. `close()` ends the process
   (`terminate`, then `kill` after 5 s).
@@ -275,7 +285,7 @@ Instances live in a new table:
 | `company_id` | INTEGER NULL | NULL for global scope |
 | `key` | TEXT | definition key |
 | `enabled` | INTEGER DEFAULT 1 | |
-| `config` | TEXT JSON | non-secret fields only, plus `api_base` when overridden (fakes) |
+| `config` | TEXT JSON | non-secret fields only, plus `api_base` when overridden (fakes; `api_base` and hidden fields such as `mcp_url` are accepted by `POST /api/connectors` only while `HOLDCO_ALLOW_LOCAL` is set, else 400 "<field> can only be changed in a test setup") |
 | `status`, `detail` | TEXT | last health result |
 | `last_check` | TEXT | iso |
 | `created_at` | TEXT | iso |
@@ -353,10 +363,19 @@ The top 3 are appended to `ctx.loaded_tools` (deduplicated); no match returns "N
    `actions.gate(company, agent, task_id, "connector_call", payload, policy_action=<mapping from item 4>)`.
    `gate` gains the keyword `policy_action: str | None = None` and uses it for the policy lookup when given.
 
-`actions.execute` gains `if action == "connector_call": return connectors.execute(p)`.
-`connectors.execute(payload) -> str`: `api` → the spec's `fn(inst, company, **args)`; `mcp-*` →
-`connectors.client(inst).call_tool(tool, args)` then `mcp.text_of(result)`; an `isError` result or an
+`actions.execute` gains `if action == "connector_call": return connectors.execute(p, company=company,
+approval_id=...)`. `connectors.execute(payload, company=None, approval_id=None) -> str` first checks that the
+instance is still the one the request was made for (its key is `payload.connector` and its company is the
+request's or none; SQLite reuses a deleted row's id), else `RuntimeError("... ask again")`; then `api` → the spec's
+`fn(inst, company, **args)` (plus `approval_id=` for a spec with `takes_approval_id`); `mcp-*` →
+`connectors.client(inst).call_tool(tool, args)` under the instance's call lock (one call at a time; `browser_check`
+holds it for its whole sequence) then `mcp.text_of(result)`; an `isError` result or an
 `MCPError` raises `RuntimeError(text)` so `gate` reports `FAILED:` and the approval row records the failure.
+A definition's `check_result(tool, args, text)` runs after every MCP result (Playwright: a page that ended up on
+this PC or the home network is left with `reset_call` and becomes an error), and a definition with `page_of` and
+`page_query` ties every call that is not read to the page the browser was on when it was asked for
+(`payload.page_url`): after approval, a different page refuses it ("the page changed since this was requested;
+ask again"). `tag_for_call` may only raise a tag, unless the definition sets `tag_for_call_lowers` (Stripe MCP).
 `actions.ACTION_LABELS["connector_call"] = "Connected service call"`; `_summary` returns
 `"<connector> <tool>(<args JSON, first 90 chars>) [<tag>]"`. Every non-read connector call is audited through
 `actions.audit` exactly like other outbound actions (it passes through `gate`); read calls are events only.
@@ -392,9 +411,11 @@ has a hidden config field `api_base` (default the vendor's API origin) so tests 
   `Sign in` through item 3. Classification map (the hosted server's tool names, verified Oct 14, 2026; ordered,
   first match wins): `stripe_api_search`, `stripe_api_details`, `stripe_api_read`, `get_stripe_account_info`,
   `stripe_analytics`, `search_stripe_documentation`, `stripe_implementation_planner` → read; `stripe_api_write`
-  → publish (asks), and irreversible when the method it carries is a refund, cancel or delete (`connectors.call`
-  inspects the arguments before the gate); `send_money`, `transfer_money`, `convert_currency` (Treasury) →
-  spend (locked); `setup_recipient` → write; `atlas_company_formation`, `send_stripe_feedback` → irreversible.
+  → irreversible (locked), lowered to publish only when it POSTs to one of products, prices or payment links
+  (create or update, never a deletion) and to spend for a payout or a transfer (`connectors.call` inspects the
+  arguments before the gate; independent review); `send_money`, `transfer_money`, `convert_currency` (Treasury) →
+  spend (locked); `setup_recipient` → write; `atlas_company_formation`, `send_stripe_feedback` and any tool the
+  map does not name → irreversible.
   Stripe itself requires human confirmation (a URL to approve, 24 h expiry) for some writes such as refunds and
   outbound payments, on top of Holdco's gate. Holdco's typed REST tools below stay the primary path; the MCP
   server covers what they do not.
@@ -418,7 +439,7 @@ has a hidden config field `api_base` (default the vendor's API origin) so tests 
 | `stripe__list_payment_links()` | read | newest 20 links: id, url, active, created |
 | `stripe__get_payment_link(id)` | read | id, url, active, line item name and amount; this is how the CEO's review and the gate test check a handoff in this phase (the Phase 3 verification gate automates it) |
 | `stripe__recent_payments(days=7)` | read | succeeded charges in the window: created, amount, currency, customer email when present, refunded |
-| `stripe__create_refund(payment_intent, amount_usd)` | irreversible | always asks; posts a refund for the amount |
+| `stripe__create_refund(payment_intent, amount_usd)` | irreversible | always asks; looks up the payment's currency (whole units for zero-decimal currencies, three-decimal ones refused), then posts a refund for the amount with an `Idempotency-Key` built from the approval id (random without one) |
 
 Stripe calls are form-encoded POSTs and GETs with Bearer auth against `api_base` (default
 `https://api.stripe.com`); nested parameters (line items, recurring interval, created-date filters) use Stripe's
@@ -447,8 +468,8 @@ bracket syntax (verify).
 
 #### `playwright` (`conn_playwright.py`; kind `mcp-stdio`; scope `global`)
 
-- Config: `enabled`, `command` override (default `npx -y @playwright/mcp@latest --headless --isolated --browser
-  chromium`).
+- Config: `enabled`, `command` override (default `npx -y @playwright/mcp@0.0.83 --headless --isolated --browser
+  chromium`, pinned; 0.0.83 was the latest release on Oct 15, 2026).
 - Health: start the server and `list_tools()`; ok when `browser_navigate` is among them; warn "npx not found:
   install Node.js" when `shutil.which("npx")` is None (so CI and a PC without Node get a warning, not a daily
   alert); bad when the process starts and fails (stderr tail in the detail). The first start downloads a
@@ -464,9 +485,15 @@ bracket syntax (verify).
   `allow`: `{"*": [read tools], "qa": ["*"], "engineering": ["*"], "research": ["*"], "design": ["*"],
   "marketing": ["*"]}`. The server's `--allowed-origins` / `--blocked-origins` flags are not a security boundary;
   the preview rule below and the risk gate are.
-- `browser_navigate` to the local preview (`127.0.0.1`, `localhost`) is refused through `find_tool`-loaded calls
-  ("use browser_check for your own site"); only `browser_check` (item 8) may use it. `--isolated` keeps the
-  browser profile separate from the owner's logins.
+- `browser_navigate` to the local preview (`127.0.0.1`, `localhost`, and the other forms a browser reads as this
+  PC: `::1`, `2130706433`, `0177.0.0.1`, `127.1`) is refused through `find_tool`-loaded calls ("use browser_check
+  for your own site"); only `browser_check` (item 8) may use it. `--isolated` keeps the browser profile separate
+  from the owner's logins. Independent review: after every call the framework reads the result's "Page URL:" line
+  (`check_result`); a page that ended up on this PC, the home network or a local file (a redirect, a link the page
+  followed, a name that now resolves privately) sends the browser to about:blank and the agent gets "ERROR: the
+  page went to a local or private address (<host>); Holdco blocks that". `HOLDCO_ALLOW_LOCAL` does not open this.
+  Calls that are not read (click, type, upload) record the page they were asked for on and are refused after
+  approval when the browser is on another page.
 
 #### `buffer` (`conn_buffer.py`; kind `api`; scope `company`)
 
@@ -476,8 +503,11 @@ bracket syntax (verify).
 - Tools: `buffer__list_channels()` [read] (id, service, name), `buffer__create_post(text, channel_ids, link="",
   schedule="")` [publish] (`channel_ids` defaults to `default_channels`; `schedule` is an ISO time or empty for
   "add to queue").
-- `actions._social` posts through Buffer when a healthy instance exists for the company and the platform
-  matches a channel's service; otherwise the webhook or the manual link as today.
+- `actions._social` posts through Buffer when a healthy instance exists for the company and one of its
+  `default_channels` is a channel of the platform; otherwise the webhook or the manual link as today, with a note
+  saying why Buffer was not used (independent review: without default channels a post would have gone to every
+  channel of that platform in the Buffer account). It posts channel by channel and keeps the channels that went
+  out in the request's payload (`buffer_posted`), so a retry after a partial failure skips them.
 
 #### `brave` (kind `builtin`; scope `global`)
 
@@ -514,7 +544,10 @@ Behaviour. Tool `browser_check(path_or_url, mobile=True)` (tag `read`; in the `e
 
 For an external URL (`http(s)://`): `web.check_public_url`, then `web.http_get`; the report gives status, title
 (from `web.html_to_text`), whether a `<form>` exists, and the first 300 characters of text. With Playwright
-available the external page is also rendered for console errors, but never clicked or submitted. For tests the
+available the external page is also rendered for console errors, but never clicked or submitted; a page (or a
+redirect of the static fetch) that ends up on this PC or the home network is an error, not a report. Each check
+holds the Playwright instance's call lock for its whole sequence and closes the page (`browser_close`) at the end;
+on a site page only the company's own preview may be open. For tests the
 environment variable `HOLDCO_ALLOW_LOCAL` (comma-separated `host:port` pairs) exempts those origins from
 `check_public_url`; it is empty by default and documented as test-only.
 
@@ -637,6 +670,11 @@ host wildcard for tests only).
 | `TestBuffer` | `list_channels` and `create_post` against the fake; `social_post` executor posts through Buffer when configured and falls back to the webhook otherwise |
 | `TestPlaywright` | health returns warn with "npx not found" when `shutil.which` is patched to None; the classification map tags the named tools; `browser_evaluate` and `browser_run_code_unsafe` never appear in `find_tool` results and `connectors.call` refuses them for every role, including `engineering`; `browser_file_upload` queues under `connector_publish`; `find_tool`-loaded `browser_navigate` to `127.0.0.1` is refused |
 | `TestBrowserCheck` | static fallback on `site/index.html` with no server: first line "Static check only", audit included, a broken same-site link reported, a form without a target reported; with a local `ThreadingHTTPServer` as the preview: the status line; an external URL (fake Stripe `/pay/...` under `HOLDCO_ALLOW_LOCAL`) reports 200, the title and "form found" |
+
+The independent review's findings each have a regression test in `tests/test_phase1_review.py` (connector
+identity at execution, browser landing checks, Stripe MCP tags, the browser lock and page binding, test-only
+hidden fields, secret-only marker resolution, bounded MCP reads, the stdio environment, the first-start timeout,
+refund currency and idempotency, test-mode revenue, Buffer default channels, and a keyring outage).
 
 ### E2E additions (`tests/test_e2e.py`)
 

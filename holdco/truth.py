@@ -174,6 +174,11 @@ def _cap(text: str, cap: int) -> str:
 
 # ---------------------------------------------------------------- the state, gathered once per use
 
+_TEST_MODE = re.compile(r"\btest mode\b", re.I)   # in a polled row's note: the connector ran on test data
+_SIGNUP_NAME = re.compile(r"sign|subscri|waitlist|member|registr|join", re.I)
+_REVENUE_NAME = re.compile(r"revenue|mrr|sale|paid|payment|order", re.I)
+
+
 def _real_metrics(cid: int) -> list[dict]:
     """The latest value of each metric a connector recorded (metrics.source is a connector key, not 'manual'),
     newest first. record_metric writes 'manual' because an agent can type any number, so those never count."""
@@ -181,7 +186,7 @@ def _real_metrics(cid: int) -> list[dict]:
         cols = {r["name"] for r in db.q("PRAGMA table_info(metrics)")}
         if "source" not in cols:
             return []
-        rows = db.q("SELECT name, value, source, created_at FROM metrics WHERE company_id=? AND "
+        rows = db.q("SELECT name, value, source, note, created_at FROM metrics WHERE company_id=? AND "
                     "COALESCE(source, '') NOT IN ('', 'manual', 'agent') ORDER BY id DESC LIMIT 200", (cid,))
     except Exception:
         return []
@@ -407,10 +412,14 @@ def _state(company: dict) -> dict:
             bits.append(f"{_plural(len(aps), 'approval')} ({shown})")
         st["waiting_line"] = "Waiting on the owner: " + ", ".join(bits) + "."
 
-    # ---- signups, revenue, replies: only from a real source (a connector wrote the row; Phase 1 metric pipes)
-    real = _real_metrics(cid)
-    signup_rows = [m for m in real if re.search(r"sign|subscri|waitlist|member|registr|join", m["name"] or "", re.I)]
-    revenue_rows = [m for m in real if re.search(r"revenue|mrr|sale|paid|payment|order", m["name"] or "", re.I)]
+    # ---- signups, revenue, replies: only from a real source (a connector wrote the row; Phase 1 metric pipes).
+    # A connector in test mode (Stripe with a test key) writes "test mode" in its notes: test purchases are not
+    # customers, so those rows are shown labelled and never count as a real signal.
+    polled = _real_metrics(cid)
+    test_rows = [m for m in polled if _TEST_MODE.search(m.get("note") or "")]
+    real = [m for m in polled if m not in test_rows]
+    signup_rows = [m for m in real if _SIGNUP_NAME.search(m["name"] or "")]
+    revenue_rows = [m for m in real if _REVENUE_NAME.search(m["name"] or "")]
     # The revenue figure itself first (stripe.revenue_usd_30d), before counts like payments_30d or mrr.
     revenue_rows.sort(key=lambda m: 0 if re.search(r"revenue", m["name"] or "", re.I) else 1)
     form_rows = [m for m in real if re.search(r"form|submission", m["name"] or "", re.I)]
@@ -420,6 +429,13 @@ def _state(company: dict) -> dict:
     if revenue_rows:
         parts.append(f"revenue {revenue_rows[0]['value']:g} ({revenue_rows[0]['name']}, from "
                      f"{revenue_rows[0]['source']})")
+    test_parts = []
+    for word, pattern in (("signups", _SIGNUP_NAME), ("revenue", _REVENUE_NAME)):
+        rows = sorted((m for m in test_rows if pattern.search(m["name"] or "")),
+                      key=lambda m: 0 if re.search(r"revenue", m["name"] or "", re.I) else 1)
+        if rows:
+            test_parts.append(f"{word} {rows[0]['value']:g} ({rows[0]['name']}, from {rows[0]['source']}) "
+                              "(test mode)")
     if in_rows:
         parts.append(f"replies: {_plural(len(in_rows), 'inbound email')} from "
                      f"{_plural(len(st['in_addrs']), 'address', 'addresses')}")
@@ -431,6 +447,8 @@ def _state(company: dict) -> dict:
         line = "Recorded from a real source: " + "; ".join(parts) + "."
         if missing:
             line += f" {' and '.join(missing).capitalize()}: none."
+    if test_parts:
+        line += " Test data, not real customers: " + "; ".join(test_parts) + "."
     st["signals"] = {"signups": [dict(m) for m in signup_rows[:5]], "revenue": [dict(m) for m in revenue_rows[:5]],
                      "replies": len(in_rows), "line": line}
     st["signup_ok"] = bool(signup_rows)

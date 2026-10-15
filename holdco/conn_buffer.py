@@ -6,8 +6,9 @@ API docs; they live in the QUERY_* constants so they can be corrected in one pla
 default with a beta note.
 
 Tools: list_channels (read) and create_post (publish). actions._social posts through Buffer when the company has a
-healthy instance with a channel for the post's platform (post_for_platform); otherwise the webhook or the manual
-link as before.
+healthy instance whose default channels include one for the post's platform (post_for_platform), channel by
+channel, remembering which ones went out so a retry skips them; otherwise the webhook or the manual link as before,
+with a note saying why Buffer was not used.
 """
 from __future__ import annotations
 
@@ -195,17 +196,38 @@ def create_post(inst: dict, company: dict, text: str, channel_ids: str = "", lin
     return f"Buffer: {when} on {', '.join(done)}."
 
 
-def post_for_platform(inst: dict, company: dict, platform: str, content: str, link: str = "") -> str | None:
-    """actions._social: post through the channels whose service matches the platform (the default channels first
-    when any of them match). None when no channel matches, so the caller falls back to the webhook or the link."""
-    rows = channels(inst)
-    matching = [c for c in rows if _service_matches(platform, c["service"])]
-    if not matching:
+def post_for_platform(inst: dict, company: dict, platform: str, content: str, link: str = "",
+                      posted: list | None = None) -> str | None:
+    """actions._social: post through the card's default channels whose service matches the platform, one channel
+    at a time. None when no default channel matches (or none is set), so the caller falls back to the webhook or
+    the link: a post never goes to every channel of a platform in the whole Buffer account.
+
+    posted is the list of channel ids already done for this request (kept in the approval's payload): they are
+    skipped, and each channel that succeeds is appended, so retrying a request that failed half way does not post
+    twice. When a channel fails after others succeeded, BufferError says which ones went out."""
+    defaults = default_channels(inst)
+    if not defaults:
         return None
-    defaults = set(default_channels(inst))
-    preferred = [c for c in matching if c["id"] in defaults] or matching
+    rows = channels(inst)
+    chosen = [c for c in rows if c["id"] in set(defaults) and _service_matches(platform, c["service"])]
+    if not chosen:
+        return None
+    posted = posted if posted is not None else []
     body = _text_with_link(content, link)
-    done = [f"{c['service']} {c['name'] or c['id']} (post {_post_one(inst, c['id'], body, '')})" for c in preferred]
+    done = []
+    for c in chosen:
+        label = f"{c['service']} {c['name'] or c['id']}"
+        if c["id"] in posted:
+            done.append(f"{label} (already posted)")
+            continue
+        try:
+            pid = _post_one(inst, c["id"], body, "")
+        except BufferError as e:
+            went = f"Posted on {', '.join(done)}; " if done else ""
+            raise BufferError(f"{went}failed on {label}: {e}. A retry posts only to the channels that failed.",
+                              e.status) from None
+        posted.append(c["id"])
+        done.append(f"{label} (post {pid})")
     return f"Added to the Buffer queue: {', '.join(done)}."
 
 
@@ -259,7 +281,8 @@ DEFINITION = {
             {"key": "api_key", "label": "Personal access token", "secret": True, "hint": "From Buffer's developer "
              "settings", "placeholder": ""},
             {"key": "default_channels", "label": "Default channels", "secret": False,
-             "hint": "Comma-separated channel ids (Test lists them); blank posts to every channel of the platform",
+             "hint": "Comma-separated channel ids (Test lists them); approved social posts go only to these, and "
+                     "with none set they use the webhook or the manual link",
              "placeholder": "id1, id2"},
             {"key": "api_base", "label": "API address", "secret": False, "hidden": True,
              "hint": "Only for tests", "placeholder": API_BASE},

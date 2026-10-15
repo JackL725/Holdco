@@ -479,7 +479,13 @@ def put(name: str, value: str) -> None:
         if old and old.get("backend") == "secret-service" and active != "secret-service":
             _forget_keyring(data, name)
         data["secrets"][name] = entry
-        data["backend"] = active
+        # The recorded backend is what the next start tries first. While other secrets still live with the recorded
+        # one (the keyring, after a brief secret-tool outage at start sent this one to the file), keep it: switching
+        # would strand them. Each entry records its own backend, so both kinds read.
+        recorded = data.get("backend")
+        if not (recorded and recorded != active
+                and any(e.get("backend") == recorded for n, e in data["secrets"].items() if n != name)):
+            data["backend"] = active
         _save(data)
         _remember(name, value)
 
@@ -501,14 +507,25 @@ def get(name: str) -> str | None:
         return value
 
 
+def _keyring_down(data: dict, stored_with) -> bool:
+    """A secret kept in the keyring this vault records as its own, while secret-tool does not answer: an outage
+    (a locked or not yet started keyring), not a secret from another machine."""
+    return stored_with == "secret-service" and data.get("backend") == "secret-service" and not _available(stored_with)
+
+
 def _open(data: dict, name: str, entry: dict) -> str:
+    """Read one entry with the backend it was stored with. That is usually the active one; it can differ after a
+    keyring outage (new secrets went to the file) or a backend change, and either still reads while it works here."""
     stored_with, active = entry.get("backend"), backend()
-    if stored_with != active:
+    if stored_with != active and not (stored_with in BACKENDS and _available(stored_with)):
+        if _keyring_down(data, stored_with):
+            raise VaultError(f"Secret {name} is kept in the desktop keyring, which is unavailable right now; unlock "
+                             "the keyring and restart Holdco, or enter it again in Settings")
         raise VaultError(f"Secret {name} was stored with {stored_with or 'an unknown backend'} on another machine; "
                          "enter it again in Settings")
-    if active == "file":
+    if stored_with == "file":
         return _file_open(data, name, entry)
-    if active == "dpapi":
+    if stored_with == "dpapi":
         try:
             blob = _unb64(entry.get("blob"))
         except (ValueError, TypeError):
@@ -688,7 +705,12 @@ def doctor_rows() -> list[dict]:
         return [doctor._row("vault", label, "bad", f"HOLDCO_VAULT_BACKEND asks for {active}, but {why}.", doctor._text(
             "Set HOLDCO_VAULT_BACKEND to auto or file and restart Holdco."))]
     entries = data["secrets"]
-    foreign = sorted(n for n, e in entries.items() if e.get("backend") != active)
+    # Secrets whose backend does not work here. Those in the keyring this vault records as its own, while
+    # secret-tool does not answer, are an outage (a warning); any other kind came from another machine.
+    unreadable = {n for n, e in entries.items() if e.get("backend") != active
+                  and not (e.get("backend") in BACKENDS and _available(e.get("backend")))}
+    waiting = sorted(n for n in unreadable if _keyring_down(data, entries[n].get("backend")))
+    foreign = sorted(unreadable - set(waiting))
     if foreign:
         others = sorted({str(entries[n].get("backend") or "an unknown backend") for n in foreign})
         shown = ", ".join(foreign[:6]) + (f" and {len(foreign) - 6} more" if len(foreign) > 6 else "")
@@ -698,7 +720,7 @@ def doctor_rows() -> list[dict]:
                                 f"Enter these keys again in Settings (and on the connector cards); Holdco then keeps "
                                 f"them with {active} on this PC."))]
     broken = []
-    for n in sorted(entries):
+    for n in sorted(set(entries) - set(waiting)):
         try:
             get(n)
         except VaultError as e:
@@ -708,6 +730,14 @@ def doctor_rows() -> list[dict]:
                             f"read: {broken[0][1]}", doctor._text(
                                 "Enter the named keys again in Settings, or restore the passphrase or data/vault.key "
                                 "they were stored with."))]
+    if waiting:
+        shown = ", ".join(waiting[:6]) + (f" and {len(waiting) - 6} more" if len(waiting) > 6 else "")
+        return [doctor._row("vault", label, "warn",
+                            f"keyring unavailable; new secrets are stored in the file vault. {len(waiting)} "
+                            f"secret{'' if len(waiting) == 1 else 's'} in the keyring cannot be read until it answers "
+                            f"again: {shown}.", doctor._text(
+                                "Unlock the desktop keyring (or start it), then restart Holdco. Nothing needs to be "
+                                "entered again."))]
     n = len(entries)
     if not n:
         return [doctor._row("vault", label, "ok", f"{active}: ready, no secrets stored yet.")]

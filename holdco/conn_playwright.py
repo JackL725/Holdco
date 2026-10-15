@@ -6,22 +6,29 @@ read from the Playwright MCP README on Oct 14, 2026 and change between releases,
 
 Rules Holdco adds on top of the risk gate:
 - browser_evaluate and browser_run_code_unsafe are blocked: never listed, always refused.
-- browser_navigate to this PC (127.0.0.1, localhost) or the home network is refused for find_tool-loaded calls;
-  only browser_check opens the local preview. Non-http(s) addresses (file:, data:, javascript:) are refused too.
+- browser_navigate to this PC (127.0.0.1, localhost, ::1, 2130706433, 0177.0.0.1) or the home network is refused
+  for find_tool-loaded calls; only browser_check opens the local preview. Non-http(s) addresses (file:, data:,
+  javascript:) are refused too.
+- Where the page really ended up is checked after every call (check_result): a redirect, a link the page
+  followed or a name that now resolves to this PC or the home network sends the browser to about:blank, and the
+  agent gets an error instead of the page. HOLDCO_ALLOW_LOCAL (the test switch) does not open this.
+- A click, a typed field or an upload is tied to the page it was asked for on (page_of, page_query): when the
+  owner approves it and the browser is on another page by then, it is refused.
 """
 from __future__ import annotations
 
 import fnmatch
-import ipaddress
 import json
 import os
+import re
 import shlex
 import shutil
-import socket
 import threading
 import urllib.parse
 
-DEFAULT_COMMAND = "npx -y @playwright/mcp@latest --headless --isolated --browser chromium"
+# Pinned, so an upgrade never arrives unannounced (0.0.83 was the latest release on Oct 15, 2026). The card's
+# command field overrides it.
+DEFAULT_COMMAND = "npx -y @playwright/mcp@0.0.83 --headless --isolated --browser chromium"
 HEALTH_TIMEOUT = 120   # the first start downloads the package (and maybe a browser)
 
 READ_TOOLS = ["browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_take_screenshot",
@@ -69,26 +76,22 @@ def classify(tool: str) -> str | None:
 
 
 def _local_reason(host: str) -> str | None:
-    """Why a host is off limits for the agents' browser, or None when it is a public address."""
+    """Why a host is off limits for the agents' browser, or None when it is a public address. Numbers are read the
+    way the browser reads them (2130706433 and 0177.0.0.1 are 127.0.0.1, ::ffff:127.0.0.1 too); names are
+    resolved. Uses web's checks, without the HOLDCO_ALLOW_LOCAL test exemption."""
+    from . import web   # imported here: web is only needed for these checks
     h = (host or "").strip("[]").lower().rstrip(".")
     if not h:
         return "That address has no host."
     if h == "localhost" or h.endswith(".localhost"):
         return f"This PC's addresses are off limits here: {OWN_SITE}."
-    try:
-        ips = [ipaddress.ip_address(h)]
-    except ValueError:
-        from . import web
-        if web.is_relay(h):
-            return f"{h} is a relay that fetches other sites; Holdco blocks relays."
-        try:
-            ips = [ipaddress.ip_address(i[4][0].split("%")[0]) for i in socket.getaddrinfo(h, None)]
-        except (socket.gaierror, UnicodeError, ValueError):
-            return None   # the browser reports a name that does not resolve on its own
-    for ip in ips:
-        if ip.is_loopback or ip.is_unspecified:
+    if web.is_relay(h):
+        return f"{h} is a relay that fetches other sites; Holdco blocks relays."
+    for ip in web.host_ips(h):   # [] for a name that does not resolve: the browser reports that on its own
+        inner = getattr(ip, "ipv4_mapped", None) or ip
+        if inner.is_loopback or inner.is_unspecified:
             return f"This PC's addresses are off limits here: {OWN_SITE}."
-        if ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if web.blocked_ip(ip):
             return "Local and private network addresses are blocked for agents."
     return None
 
@@ -103,6 +106,60 @@ def refuse_call(tool: str, args: dict | None) -> str | None:
         if parsed.scheme.lower() not in ("http", "https"):
             return "Only http(s) pages can be opened in the browser."
         return _local_reason(parsed.hostname or "")
+    return None
+
+
+# ---------------------------------------------------------------- where the page ended up
+
+_PAGE_URL = re.compile(r"Page URL:\s*(\S+)")
+_CURRENT_TAB = re.compile(r"\(current\).*\((\S*)\)\s*$")   # "- 0: (current) [Title] (https://...)"
+BLANK = "about:blank"
+RESET_CALL = ("browser_navigate", {"url": BLANK})        # leaves a page that must not stay open
+PAGE_QUERY = ("browser_tabs", {"action": "list"})        # names the page the browser is on right now
+
+
+def page_urls(text: str) -> list[str]:
+    """Every page address a result names: the "Page URL:" lines Playwright MCP adds after an action or a snapshot,
+    and the current tab of a browser_tabs listing."""
+    text = str(text or "")
+    found = _PAGE_URL.findall(text)
+    for line in text.splitlines():
+        m = _CURRENT_TAB.search(line.strip())
+        if m:
+            found.append(m.group(1))
+    return found
+
+
+def page_of(text: str) -> str | None:
+    """The page the browser is on according to a result (the last address it names), or None when it names none."""
+    found = page_urls(text)
+    return found[-1] if found else None
+
+
+def landing_problem(url: str) -> str | None:
+    """What to name when a page address is this PC, the home network or a file on this PC, else None. Pages
+    without a host (about:blank, a browser error page) are fine. HOLDCO_ALLOW_LOCAL does not apply."""
+    from . import web   # imported here: web is only needed for these checks
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    scheme = parsed.scheme.lower()
+    if scheme == "file":
+        return "a file on this PC"
+    if scheme not in ("http", "https", "ws", "wss", "ftp"):
+        return None
+    host = parsed.hostname or ""
+    return web.private_host(host) if host else None
+
+
+def check_result(tool: str, args: dict | None, text: str, allow=None) -> str | None:
+    """After every result of this connector (the framework calls it; browser_check calls it after its own calls):
+    an error text when a page the result names is this PC or the home network, else None. The caller then sends
+    the browser to about:blank (RESET_CALL). allow(url) -> bool lets browser_check accept its own preview."""
+    for url in page_urls(text):
+        if allow is not None and allow(url):
+            continue
+        host = landing_problem(url)
+        if host:
+            return f"ERROR: the page went to a local or private address ({host}); Holdco blocks that"
     return None
 
 
@@ -178,4 +235,10 @@ DEFINITION = {
     "mcp": {"command": _command, "args": _args, "env": {}, "classify": CLASSIFY, "allow": ALLOW,
             "blocked": list(BLOCKED)},
     "refuse_call": refuse_call,
+    # Read by the framework (connectors.py): where every result's page ended up, how to leave a page that must not
+    # stay open, and how to tell which page a click or a typed field was asked for on.
+    "check_result": check_result,
+    "reset_call": RESET_CALL,
+    "page_of": page_of,
+    "page_query": PAGE_QUERY,
 }

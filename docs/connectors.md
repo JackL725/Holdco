@@ -415,10 +415,11 @@ mode (`test` | `live`) is derived from the key prefix and shown on the setup car
 
 MCP classification map when `use_mcp` is on (the hosted server's tool names, verified Oct 14, 2026):
 `stripe_api_search`, `stripe_api_details`, `stripe_api_read`, `get_stripe_account_info`, `stripe_analytics`,
-`search_stripe_documentation`, `stripe_implementation_planner` -> `read`; `stripe_api_write` -> `publish` (asks),
-and `irreversible` when the method it carries is a refund, cancel or delete; `send_money`, `transfer_money`,
-`convert_currency` (Treasury) -> `spend` (locked); `setup_recipient` -> `write`; `atlas_company_formation`,
-`send_stripe_feedback` -> `irreversible`. Stripe itself requires human confirmation for some writes such as
+`search_stripe_documentation`, `stripe_implementation_planner` -> `read`; `stripe_api_write` -> `irreversible`
+(locked), lowered to `publish` (asks) only when it creates or updates a product, a price or a payment link, and to
+`spend` for a payout or a transfer; `send_money`, `transfer_money`, `convert_currency` (Treasury) -> `spend`
+(locked); `setup_recipient` -> `write`; `atlas_company_formation`, `send_stripe_feedback` and any tool the map
+does not name -> `irreversible`. Stripe itself requires human confirmation for some writes such as
 refunds and outbound payments (a URL to approve, 24 h expiry), on top of Holdco's gate. Holdco's typed REST tools
 above stay the primary path; the MCP server covers what they do not. Guardrails: refunds and payouts always
 ask; a live key is flagged on the card. Test mode: a test key; the Phase 1 gate runs entirely against
@@ -442,8 +443,11 @@ policy. Verify against Resend's docs: domain verification, the send endpoint's r
 
 #### playwright
 
-Kind `mcp-stdio`, scope `global`. Command: `npx -y @playwright/mcp@latest --headless --isolated --browser chromium`;
-config: `enabled` and a command override. Health: start the server and list its tools. Metrics: none. Tools are
+Kind `mcp-stdio`, scope `global`. Command: `npx -y @playwright/mcp@0.0.83 --headless --isolated --browser chromium`
+(pinned; 0.0.83 was the latest release on Oct 15, 2026); config: `enabled` and a command override. Where every page
+ends up is checked after each call: this PC, the home network or a local file sends the browser to about:blank
+and the agent gets an error. One call at a time steers the shared browser, and a click or a typed field is tied to
+the page it was asked for on. Health: start the server and list its tools. Metrics: none. Tools are
 reachable through `find_tool` with this classification (the tool list verified Oct 14, 2026):
 `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_take_screenshot`,
 `browser_console_messages`, `browser_network_requests`, `browser_resize`, `browser_wait_for`, `browser_find`,
@@ -468,8 +472,9 @@ them when upgrading the package.
 Kind `api`, scope `company`. GraphQL at `https://api.buffer.com/` with a personal access token. Fields: `api_key`
 (secret), `default_channels`. Health: a small account query. Metrics: none in Phase 1. Tools:
 `buffer__list_channels()` [`read`], `buffer__create_post(text, channel_ids, link, schedule)` [`publish`].
-Behaviour: when configured, the `social_post` executor posts through Buffer; otherwise the webhook or the manual
-link as today. Guardrails: `social_post` stays under its policy, and Phase 2 adds the `posts_per_week` budget.
+Behaviour: when configured, the `social_post` executor posts through Buffer to the card's default channels of the
+post's platform, channel by channel (a retry skips the channels that already went out); without default channels,
+or none for that platform, the webhook or the manual link as today, with a note. Guardrails: `social_post` stays under its policy, and Phase 2 adds the `posts_per_week` budget.
 Test mode: none; keep the policy on `approve`. Verify against Buffer's docs: the plan calls the GraphQL API beta
 and says one key posts to 11 networks; confirm the endpoint, the token type and channel ids.
 

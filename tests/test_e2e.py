@@ -621,7 +621,8 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(out["health"], {"status": "ok", "detail": "pawplan.example verified"})
         self.assertTrue(self.api.get(f"/api/companies/{cid}")["email_ready"])   # Resend counts without SMTP
         out = self.api.post("/api/connectors", {"key": "buffer", "company_id": cid, "enabled": True, "config": {
-            "api_key": self.buffer.token, "api_base": self.buffer.url}})
+            "api_key": self.buffer.token, "api_base": self.buffer.url,
+            "default_channels": "chan_x"}})   # approved posts go only to the default channels
         self.assertEqual(out["health"]["status"], "ok", out["health"])
         self.assertTrue(out["instance"]["enabled"])
 

@@ -14,7 +14,8 @@ a query mentioning createPost records the post and returns {"post": {"id", "text
 channels returns two channels (services "x" and "linkedin"); one mentioning account returns the account with one
 organization. Buffer's real API is in beta, so this only mirrors the shapes Holdco sends.
 
-Records: posts ([{"id", "input", "query"}]), queries (every request body).
+Records: posts ([{"id", "input", "query"}]), queries (every request body). Test hooks: `channels` (the list the
+channels query returns; tests may add to it) and `fail_channels` (createPost for these ids answers an error).
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ class FakeBuffer:
     def __init__(self, port: int = 0, token: str = "buffer-test-token"):
         self.token = token
         self.channels = [dict(c) for c in CHANNELS]
+        self.fail_channels: set[str] = set()   # test hook: createPost for these channel ids answers an error
         self.posts: list[dict] = []
         self.queries: list[dict] = []
         self._lock = threading.Lock()
@@ -72,6 +74,9 @@ class FakeBuffer:
                         if not post_input.get("channelId") or not post_input.get("text"):
                             return self._json(200, {"data": {"createPost": {
                                 "message": "channelId and text are required"}}})
+                        if post_input.get("channelId") in outer.fail_channels:
+                            return self._json(200, {"data": {"createPost": {
+                                "message": "The channel needs to be reconnected"}}})
                         pid = f"post_{len(outer.posts) + 1}"
                         outer.posts.append({"id": pid, "input": post_input, "query": query})
                         return self._json(200, {"data": {"createPost": {"post": {

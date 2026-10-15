@@ -114,6 +114,10 @@ class Base(unittest.TestCase):
         p = mock.patch.object(notify, "send", side_effect=lambda text, *a, **kw: self.alerts.append(text))
         p.start()
         self.addCleanup(p.stop)
+        # The test switch: only with it may a card's hidden api_base or mcp_url point at the fakes.
+        env = mock.patch.dict(os.environ, {"HOLDCO_ALLOW_LOCAL": "127.0.0.1:*"})
+        env.start()
+        self.addCleanup(env.stop)
         db.set_settings({"kill_switch": False})
         self.before = {r["id"] for r in db.q("SELECT id FROM connectors")}
         self.addCleanup(self._remove_new_instances)
@@ -230,9 +234,11 @@ class TestStripe(Base):
                     if i["id"] == iid)
         self.assertIn("stripe.revenue_usd_30d", {m["name"] for m in card["metrics"]})
         self.assertNotIn(sk, json.dumps(card))
-        # the facts block counts polled revenue as a real signal and lists the account
+        # The facts block lists the account and shows the polled revenue, labelled test mode: a test purchase is
+        # not a real signal (independent review; a live key counts, tests/test_phase1_review.py).
         facts = truth.facts_section(db.get_company(c["id"]))
-        self.assertIn("revenue 19 (stripe.revenue_usd_30d, from stripe)", facts)
+        self.assertIn("revenue 19 (stripe.revenue_usd_30d, from stripe) (test mode)", facts)
+        self.assertIn("Signups, revenue, replies: none recorded from a real source.", facts)
         self.assertIn("Stripe (payments, test mode)", facts)
 
     def test_stripe_mcp_stays_off_until_use_mcp(self):
@@ -262,9 +268,10 @@ class TestStripe(Base):
         self.assertEqual(auth, {f"Bearer {sk}"})   # mcp_headers: the Stripe card's key
         self.assertEqual(sorted(i["key"] for i in connectors.visible(c)), ["stripe", "stripe_mcp"])
         found = tools.execute(ctx, "find_tool", {"query": "echo"})
-        self.assertIn("stripe_mcp__echo [unclassified]", found)
+        # A tool Stripe's map does not name is irreversible (independent review; it was unclassified)
+        self.assertIn("stripe_mcp__echo [irreversible]", found)
         self.assertIn("Loaded: stripe_mcp__echo", found)
-        queued = tools.execute(ctx, "stripe_mcp__echo", {"text": "hi"})   # unclassified asks
+        queued = tools.execute(ctx, "stripe_mcp__echo", {"text": "hi"})   # locked to the owner's approval
         self.assertIn("Queued for the owner's approval", queued)
         # tag_for_call: a refund through stripe_api_write is irreversible (locked), whatever the map says.
         ctx.loaded_by_name["stripe_mcp__stripe_api_write"] = {
@@ -353,7 +360,9 @@ class TestBuffer(Base):
     def test_saved_off_by_default_then_posts_through_social(self):
         buffer = self.fake(FakeBuffer)
         c = make_company("BufferCo")
-        out = self.save("buffer", c, {"api_key": buffer.token, "api_base": buffer.url})   # no "enabled": beta
+        # default channels: approved posts go only there (independent review)
+        out = self.save("buffer", c, {"api_key": buffer.token, "api_base": buffer.url,
+                                      "default_channels": "chan_x"})   # no "enabled": beta
         inst = out["instance"]
         self.assertFalse(inst["enabled"])
         self.assertEqual(out["health"], {"status": "warn", "detail": connectors.OFF_TEXT})

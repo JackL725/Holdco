@@ -138,7 +138,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     elif decision == "approve":
         db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
         try:
-            result = execute(company, row["action"], p)
+            result = execute(company, row["action"], p, approval_id=approval_id)
             status = "done"
         except Exception as e:
             result, status = str(e), "failed"
@@ -243,10 +243,12 @@ def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payl
 
 # ---------------- executors ----------------
 
-def execute(company: dict, action: str, p: dict) -> str:
+def execute(company: dict, action: str, p: dict, approval_id: int | None = None) -> str:
+    """Run one outbound action. approval_id is the request being run, when it is one (decide passes it)."""
     if action == "connector_call":
         from . import connectors   # imported here: connectors imports tools, which imports this module
-        return connectors.execute(p)
+        # The request's company goes along, so the connector it names is checked to still be this company's.
+        return connectors.execute(p, company=company, approval_id=approval_id)
     if action == "send_email":
         in_reply = ""
         if p.get("reply_to_email_id"):
@@ -288,20 +290,35 @@ def _social(company: dict, p: dict) -> str:
         buffer = connectors.instance("buffer", company)
     except Exception:
         buffer = None
+    note = ""
     if buffer and buffer.get("enabled", 1) and buffer.get("status") == "ok":
         from . import conn_buffer
-        via = conn_buffer.post_for_platform(buffer, company, p.get("platform", ""), content, p.get("link", ""))
-        if via is not None:
-            return via
+        platform = p.get("platform", "") or "social"
+        if not conn_buffer.default_channels(buffer):
+            note = " Buffer was not used: its card has no default channels, so Holdco does not know where to post."
+        else:
+            # Channel by channel; the ones that went out are kept in the request (decide stores the payload), so a
+            # retry after a partial failure skips them.
+            posted = [str(x) for x in (p.get("buffer_posted") or [])]
+            try:
+                via = conn_buffer.post_for_platform(buffer, company, platform, content, p.get("link", ""),
+                                                    posted=posted)
+            finally:
+                if posted:
+                    p["buffer_posted"] = posted
+            if via is not None:
+                return via
+            note = f" Buffer was not used: none of its default channels is a {platform} channel."
     if cs.get("webhook_url"):
         status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
                                                       "platform": p.get("platform", ""), "content": content,
                                                       "link": p.get("link", "")})
         if status >= 400:
             raise RuntimeError(f"Webhook returned HTTP {status}: {text[:300]}")
-        return f"Sent to the posting webhook (HTTP {status})."
+        return f"Sent to the posting webhook (HTTP {status}).{note}"
     intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": content[:280]})
-    return f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+    return (f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+            f"{note}")
 
 
 def _http(p: dict) -> str:
