@@ -237,7 +237,9 @@ def write_file(ctx: Ctx, path: str, content: str, append: bool = False) -> str:
     ctx.written.add(r)
     _log(ctx, "file", f"{'updated' if existed else 'created'} {r}", path=r, task_id=_task_id(ctx))
     context.after_write(ctx, r)
-    return f"Saved {r} ({len(content)} characters)."
+    return f"Saved {r} ({len(content)} characters)." + (
+        " For big files, write a first section, then add the rest with append=true or change parts with edit_file."
+        if len(content) > 8000 else "")
 
 
 @tool("delete_file", "Move a file to the company's trash folder.", {"path": S("Path relative to the company folder")},
