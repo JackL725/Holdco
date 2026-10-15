@@ -281,6 +281,18 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float
 def _social(company: dict, p: dict) -> str:
     cs = db.company_settings(company)
     content = p.get("content", "")
+    # Phase 1: a healthy Buffer connection with a channel for this platform queues the post there. A Buffer failure
+    # after that point is a real failure (the approval shows it and can be retried), not a silent fallback.
+    try:
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        buffer = connectors.instance("buffer", company)
+    except Exception:
+        buffer = None
+    if buffer and buffer.get("enabled", 1) and buffer.get("status") == "ok":
+        from . import conn_buffer
+        via = conn_buffer.post_for_platform(buffer, company, p.get("platform", ""), content, p.get("link", ""))
+        if via is not None:
+            return via
     if cs.get("webhook_url"):
         status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
                                                       "platform": p.get("platform", ""), "content": content,

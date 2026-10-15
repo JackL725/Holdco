@@ -1,10 +1,15 @@
-"""Company mailboxes: send with SMTP, receive with IMAP (standard library only)."""
+"""Company mailboxes: send with SMTP or Resend, receive with IMAP (standard library only).
+
+The company setting email_provider picks the sender (Phase 1): smtp, resend, or auto (Resend when the company has
+an enabled Resend connection whose last health check was ok, else SMTP). Inbound mail is always IMAP.
+"""
 from __future__ import annotations
 
 import datetime as _dt
 import email
 import email.policy
 import email.utils
+import hashlib
 import imaplib
 import smtplib
 import ssl
@@ -25,8 +30,82 @@ def imap_configured(cs: dict) -> bool:
     return bool(cs.get("imap_host") and cs.get("imap_user") and cs.get("imap_password"))
 
 
-def send(company: dict, to: str, subject: str, body: str, in_reply_to: str = "") -> str:
+def _resend_instance(company: dict, cs: dict) -> dict | None:
+    """The Resend connection to send through, or None for SMTP. Raises EmailError when the owner chose resend and
+    there is no enabled Resend connection."""
+    choice = str(cs.get("email_provider") or "auto").strip().lower()
+    if choice == "smtp":
+        return None
+    try:
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        inst = connectors.instance("resend", company)
+    except Exception as e:   # the framework failing must not stop SMTP mail
+        if choice == "resend":
+            raise EmailError(f"Resend isn't available: {e}") from None
+        return None
+    usable = bool(inst and inst.get("enabled", 1))
+    if choice == "resend":
+        if not usable:
+            raise EmailError("email_provider is resend, but Resend isn't connected for this company. Set it up in "
+                             "the company's Settings > Connectors, or set email_provider to auto.")
+        return inst
+    return inst if usable and inst.get("status") == "ok" else None
+
+
+def _idempotency_key(company: dict, to: str, subject: str, body: str) -> str:
+    """Resend's Idempotency-Key, so a retried approval cannot send twice. The approval id when this send runs one
+    (actions.decide marks the row 'running' before executing it), plus a hash of the content so an edited retry is
+    a new request; a send without an approval row uses the hash of company, recipient, subject and body alone."""
+    digest = hashlib.sha256(f"{company['id']}\n{to}\n{subject}\n{body}".encode("utf-8")).hexdigest()
+    for row in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND action='send_email' AND status='running' "
+                    "ORDER BY id DESC LIMIT 20", (company["id"],)):
+        p = db.loads(row["payload"], {}) or {}
+        if p.get("to") == to and p.get("subject") == subject and p.get("body") == body:
+            return f"holdco-approval-{row['id']}-{digest[:16]}"
+    return f"holdco-{digest[:40]}"
+
+
+def _reply_address(cs: dict, sender: str) -> str:
+    """Replies to Resend mail go to the mailbox Holdco reads over IMAP, when that is a different address."""
+    for candidate in (cs.get("imap_user"), cs.get("smtp_from"), cs.get("smtp_user")):
+        c = str(candidate or "").strip()
+        if "@" in c:
+            return "" if c.lower() == sender.lower() else c
+    return ""
+
+
+def _send_resend(company: dict, cs: dict, inst: dict, to: str, subject: str, body: str, in_reply_to: str,
+                 idempotency_key: str) -> str:
+    from . import conn_resend
+    sender = conn_resend.from_address(inst)
+    if "@" not in sender:
+        raise EmailError("Resend needs a from address: add it on the Resend card in the company's Settings.")
+    msgid = email.utils.make_msgid(domain=sender.split("@")[-1])
+    headers = {"Message-ID": msgid}
+    if in_reply_to:
+        headers["In-Reply-To"] = in_reply_to
+        headers["References"] = in_reply_to
+    try:
+        rid = conn_resend.send(
+            inst, company, sender=email.utils.formataddr((conn_resend.from_name(inst) or company["name"], sender)),
+            to=to, subject=subject, text=body, reply_to=_reply_address(cs, sender), headers=headers,
+            idempotency_key=idempotency_key or _idempotency_key(company, to, subject, body))
+    except conn_resend.ResendError as e:
+        raise EmailError(str(e)) from None
+    # Holdco's Message-ID stays in message_id (replies are matched on it); Resend's id goes in uid.
+    db.run("INSERT INTO emails(company_id, direction, uid, message_id, from_addr, to_addr, subject, body, status,"
+           " created_at, in_reply_to) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+           (company["id"], "out", rid, msgid, sender, to, subject, body, "sent", db.now(), in_reply_to or ""))
+    return f"Email sent to {to} (through Resend)."
+
+
+def send(company: dict, to: str, subject: str, body: str, in_reply_to: str = "", idempotency_key: str = "") -> str:
+    """Send one email through Resend or SMTP (email_provider) and record it. idempotency_key (Resend only) defaults
+    to the running approval's id, else a hash of the message (_idempotency_key)."""
     cs = db.company_settings(company)
+    inst = _resend_instance(company, cs)
+    if inst is not None:
+        return _send_resend(company, cs, inst, to, subject, body, in_reply_to, idempotency_key)
     if not smtp_configured(cs):
         raise EmailError("Email isn't set up for this company. Add SMTP details in the company's Settings tab.")
     sender = cs.get("smtp_from") or cs["smtp_user"]
@@ -54,9 +133,9 @@ def send(company: dict, to: str, subject: str, body: str, in_reply_to: str = "")
                 s.send_message(msg)
     except (smtplib.SMTPException, OSError) as e:
         raise EmailError(f"Sending failed: {e}") from None
-    db.run("INSERT INTO emails(company_id, direction, message_id, from_addr, to_addr, subject, body, status, created_at)"
-           " VALUES(?,?,?,?,?,?,?,?,?)",
-           (company["id"], "out", msg["Message-ID"], sender, to, subject, body, "sent", db.now()))
+    db.run("INSERT INTO emails(company_id, direction, message_id, from_addr, to_addr, subject, body, status,"
+           " created_at, in_reply_to) VALUES(?,?,?,?,?,?,?,?,?,?)",
+           (company["id"], "out", msg["Message-ID"], sender, to, subject, body, "sent", db.now(), in_reply_to or ""))
     return f"Email sent to {to}."
 
 
@@ -165,9 +244,9 @@ def poll_inbox(company: dict) -> int:
                 body = _body_text(msg)[:20000]
                 eid = db.run(
                     "INSERT INTO emails(company_id, direction, uid, message_id, from_addr, to_addr, subject, body,"
-                    " status, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    " status, created_at, in_reply_to) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (company["id"], "in", uid.decode(), str(msg.get("Message-ID", "")), str(msg.get("From", "")),
-                     str(msg.get("To", "")), str(msg.get("Subject", "")), body, "new", db.now()))
+                     str(msg.get("To", "")), str(msg.get("Subject", "")), body, "new", db.now(), _in_reply_to(msg)))
                 new += 1
                 bus.emit(company["id"], "email", f"New email from {msg.get('From', '?')}: {msg.get('Subject', '')}",
                          data={"email_id": eid})
@@ -175,6 +254,15 @@ def poll_inbox(company: dict) -> int:
     except (imaplib.IMAP4.error, OSError) as e:
         bus.emit(company["id"], "error", f"Checking the inbox failed: {e}")
     return new
+
+
+def _in_reply_to(msg) -> str:
+    """The Message-ID an inbound email answers: its In-Reply-To header, else the last id in References."""
+    value = " ".join(str(msg.get("In-Reply-To", "") or "").split())
+    if not value:
+        refs = str(msg.get("References", "") or "").split()
+        value = refs[-1] if refs else ""
+    return value[:998]
 
 
 def _route_inbound(company: dict, email_id: int, sender: str, subject: str) -> None:
