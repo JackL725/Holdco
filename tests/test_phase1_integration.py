@@ -711,5 +711,22 @@ class TestSecretsStayOutOfTheDatabase(Base):
         self.assertIsNone(db.get_company(c["id"]))
 
 
+
+class TestConnectingIsNewsForPlanning(Base):
+    """Connecting a service, or one breaking, changes planning's change stamp, so the CEO plans with it at once."""
+
+    def test_saving_and_breaking_a_connector_changes_the_stamp(self):
+        from holdco import planning
+        stripe = self.fake(FakeStripe)
+        c = make_company("NewsCo")
+        before = planning.change_stamp(c)
+        out = self.save("stripe", c, {"api_key": key("sk_test_news"), "api_base": stripe.url}, enabled=True)
+        self.assertEqual(out["health"]["status"], "ok")
+        connected = planning.change_stamp(c)
+        self.assertNotEqual(before, connected)
+        db.update("connectors", out["instance"]["id"], status="bad", detail="key rejected")
+        self.assertNotEqual(connected, planning.change_stamp(c))
+
+
 if __name__ == "__main__":
     unittest.main()
