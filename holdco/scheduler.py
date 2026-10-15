@@ -29,22 +29,23 @@ def _seconds_ago(n: float) -> str:
 class Scheduler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="scheduler")
-        self._stop = threading.Event()
+        # Not '_stop': Thread has an internal _stop() method on Python 3.12 and older.
+        self._stop_event = threading.Event()
         self._last_inbox: dict[int, float] = {}
         self._last_routines: dict[int, float] = {}
         self._model_waiting = False    # the outage notice was posted; the "back" notice is still owed
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
         recover()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self.tick()
             except Exception:
                 traceback.print_exc()
-            self._stop.wait(TICK_SECONDS)
+            self._stop_event.wait(TICK_SECONDS)
 
     def tick(self) -> None:
         s = db.get_settings()
