@@ -601,12 +601,14 @@ class Poller(threading.Thread):
             for u in updates or []:
                 try:
                     self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
-                    self._handle(s, u)
+                    self._handle_update(s, u)
                 except Exception as e:
                     print(f"notify: poller could not handle an update: {scrub(e, s)}")
                 self.handled += 1
 
-    def _handle(self, s: dict, u: dict) -> None:
+    # Not '_handle': Python 3.13's Thread keeps its own internal _handle attribute, which would replace
+    # this method and make every update fail.
+    def _handle_update(self, s: dict, u: dict) -> None:
         cq = u.get("callback_query")
         if cq:
             msg = cq.get("message") or {}
