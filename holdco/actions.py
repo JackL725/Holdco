@@ -27,10 +27,14 @@ ACTION_LABELS = {
     "run_code": "Run code",
     "spend_money": "Purchase",
     "question": "Question",
+    "connector_call": "Connected service call",
 }
 
 
 def _summary(action: str, p: dict) -> str:
+    if action == "connector_call":
+        args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
+        return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
     if action == "send_email":
         return f"Email to {p.get('to')}: {p.get('subject')}"
     if action == "social_post":
@@ -49,12 +53,19 @@ def _summary(action: str, p: dict) -> str:
     return action
 
 
-def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict) -> str:
-    """Called by agent tools for any outbound action."""
+# Phase 1: the risk tag of each built-in outbound action, shown on the Inbox card.
+TAG_OF_ACTION = {"send_email": "contact", "social_post": "publish", "deploy_site": "publish", "http_post": "publish",
+                 "run_code": "write", "spend_money": "spend", "question": "read"}
+
+
+def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict,
+         policy_action: str | None = None) -> str:
+    """Called by agent tools for any outbound action. policy_action (Phase 1) names the policy to apply when it
+    differs from the action, as for connector_call, whose policy comes from the tool's risk tag."""
     if action == "question":
         policy = "approve"
     else:
-        policy = db.effective_policy(company, action)
+        policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
     killed = False
@@ -220,10 +231,12 @@ def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payl
           approval_id: int | None = None) -> int:
     """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent.
     records/ is refreshed after the row is written, so it includes this action."""
+    from . import vault   # imported here: vault imports db; a secret in a result never reaches the audit log
     aid = db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
                  "approval_id) VALUES(?,?,?,?,?,?,?,?)",
-                 (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
-                  default=str)[:20000], str(result or "")[:4000], approval_id))
+                 (db.now(), company_id, action, proposed_by or "", approved_by,
+                  vault.redact(json.dumps(payload, sort_keys=True, default=str))[:20000],
+                  vault.redact(str(result or ""))[:4000], approval_id))
     _records_changed(company_id)
     return aid
 
@@ -231,6 +244,9 @@ def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payl
 # ---------------- executors ----------------
 
 def execute(company: dict, action: str, p: dict) -> str:
+    if action == "connector_call":
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        return connectors.execute(p)
     if action == "send_email":
         in_reply = ""
         if p.get("reply_to_email_id"):

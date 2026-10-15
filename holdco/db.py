@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, task_id INTEGER, claim TEXT, url TEXT,
     quote TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS connectors (
+    id INTEGER PRIMARY KEY, company_id INTEGER, key TEXT, enabled INTEGER DEFAULT 1, config TEXT DEFAULT '{}',
+    status TEXT DEFAULT '', detail TEXT DEFAULT '', last_check TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_connectors_key ON connectors(key, company_id);
 CREATE INDEX IF NOT EXISTS ix_fetched_company ON fetched(company_id, url);
 CREATE INDEX IF NOT EXISTS ix_facts_company ON facts(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
@@ -136,6 +141,10 @@ MIGRATIONS = {
               "kind": "TEXT DEFAULT ''"},
     # Phase 0.5: the change stamp and backoff that stop idle re-planning
     "companies": {"last_cycle_stamp": "TEXT DEFAULT ''", "cycle_backoff": "INTEGER DEFAULT 0"},
+    # Phase 1: where a number came from (a connector key, or 'manual' when an agent typed it)
+    "metrics": {"source": "TEXT DEFAULT 'manual'"},
+    # Phase 1: the Message-ID an inbound email answers, so replies to outreach can be counted
+    "emails": {"in_reply_to": "TEXT DEFAULT ''"},
 }
 
 
@@ -164,6 +173,11 @@ def init() -> None:
         except sqlite3.OperationalError:
             HAS_FTS = False
         _conn.commit()
+    try:   # Phase 1: plain-text secrets move into the vault (a no-op once done)
+        from . import vault
+        vault.migrate()
+    except Exception as e:   # a vault problem must not stop Holdco from starting; the Doctor reports it
+        print(f"Vault migration failed: {e}")
 
 
 def q(sql: str, params: tuple | list = ()) -> list[dict]:
@@ -226,6 +240,20 @@ def get_settings() -> dict:
     for k in config.LOCKED_POLICIES:
         pol[k] = "approve"
     s["policies"] = pol
+    return _resolve_secrets(s)
+
+
+def _resolve_secrets(s: dict) -> dict:
+    """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing)."""
+    names = [k for k, v in s.items() if isinstance(v, str) and v.startswith("vault:")]
+    if names:
+        from . import vault   # imported here: vault imports db
+        for k in names:
+            try:
+                s[k] = vault.get(s[k][len("vault:"):]) or ""
+            except Exception as e:   # a foreign-machine secret: treat as unset, the Doctor's vault row says why
+                print(f"Vault: {k}: {e}")
+                s[k] = ""
     return s
 
 
@@ -289,7 +317,7 @@ def company_settings(company: dict) -> dict:
         s.update(json.loads(company.get("settings") or "{}"))
     except ValueError:
         pass
-    return s
+    return _resolve_secrets(s)
 
 
 def effective_policy(company: dict, action: str) -> str:

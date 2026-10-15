@@ -102,7 +102,9 @@ class Scheduler(threading.Thread):
 
     def _housekeeping(self, s: dict) -> None:
         """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller."""
-        for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller):
+        from . import connectors   # Phase 1: connector health checks and metric pipes (both cheap when not due)
+        for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller,
+                     connectors.check_if_stale, connectors.poll_if_due):
             try:
                 step()
             except NotImplementedError:

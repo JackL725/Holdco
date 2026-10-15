@@ -8,9 +8,16 @@ belts stay small, five connectors (Stripe, Resend, Playwright MCP, Buffer, Brave
 with a static fallback. The reasons are in [../plan.md](../plan.md) ("Connectors and MCP") and
 [../connectors.md](../connectors.md); the safety rules in [../safety.md](../safety.md). This document is the "how".
 
-Status: planned, not built. Branch `claude/phase-1-connect`, PR based on Phase 0 (see
-[phase-0-stabilize.md](phase-0-stabilize.md); this phase uses its routing scaffold, audit log, Doctor rows,
-watchdog `connector_down` pattern and `notify.send`).
+Status: in progress. Branch `claude/phase-1-connect`, PR based on Phase 0.5 (see
+[phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md), itself based on
+[phase-0-stabilize.md](phase-0-stabilize.md)); this phase uses Phase 0's routing scaffold, audit log, Doctor rows,
+watchdog `connector_down` pattern and `notify.send`, and Phase 0.5's facts block and claims gate.
+
+Changes Phase 0.5 makes to this design: `find_tool` reaches every role through `roles.CONTEXT_EXTRA` instead of every
+preset's list; the Phase 0.5 tools carry risk tags (search, grep, company_status, check_sources read; edit_file,
+record_fact write); built-in tags come from `tools.BUILTIN_RISK`; E2E tests are numbered from `test_26`; the facts
+block (`truth.facts_section`) lists connected services as accounts the company has, and revenue from a connector
+counts as a real signal; secrets in `records/` files are redacted like events and transcripts.
 
 Related: [../architecture.md](../architecture.md), [../operating-model.md](../operating-model.md),
 [../reliability.md](../reliability.md), [../owner-experience.md](../owner-experience.md),

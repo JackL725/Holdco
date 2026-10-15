@@ -37,6 +37,13 @@ def emit(company_id: int | None, kind: str, message: str, agent_id: int | None =
          data: dict | None = None) -> dict:
     """Log an activity-feed event and push it to the dashboard."""
     created = db.now()
+    try:   # Phase 1: no secret value ever reaches the feed or the Thinking tab
+        from . import vault   # imported here: vault imports db, which bus imports
+        message = vault.redact(message)
+        if data:
+            data = json.loads(vault.redact(json.dumps(data)))
+    except Exception:
+        pass
     eid = db.run(
         "INSERT INTO events(company_id, agent_id, kind, message, data, created_at) VALUES(?,?,?,?,?,?)",
         (company_id, agent_id, kind, message, json.dumps(data or {}), created),

@@ -558,6 +558,8 @@ def api_approvals(h, m, body):
     rows = db.q(sql, params)
     for r in rows:
         r["payload"] = db.loads(r["payload"], {})
+        # Phase 1: the risk tag on every card (a connector call carries its own)
+        r["tag"] = r["payload"].get("tag") if r["action"] == "connector_call" else actions.TAG_OF_ACTION.get(r["action"], "")
     return {"approvals": rows, "labels": actions.ACTION_LABELS}
 
 
@@ -688,6 +690,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise HTTPError(404, "Not found")
             if method not in ("GET", "HEAD"):
                 raise HTTPError(405, "Method not allowed")
+            if path == "/oauth/callback" and method == "GET":   # Phase 1: the OAuth sign-in comes back here
+                from . import oauth
+                code, html = oauth.callback_page({k: v[0] for k, v in self.query.items()})
+                return self._send(code, html.encode("utf-8"), "text/html; charset=utf-8")
             if path.startswith("/preview/") or path.startswith("/files/"):
                 return self._company_file(path)
             return self._static(path)

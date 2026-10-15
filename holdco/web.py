@@ -49,6 +49,19 @@ def is_relay(host: str) -> bool:
             or h.startswith(RELAY_PREFIXES))
 
 
+# Test-only: comma-separated host:port pairs (port may be *) that count as public, so fake services on 127.0.0.1
+# can stand in for Stripe and others in the test suite. Empty by default; never set it on a real install.
+ALLOW_LOCAL = [p.strip() for p in os.environ.get("HOLDCO_ALLOW_LOCAL", "").split(",") if p.strip()]
+
+
+def _allowed_local(host: str, port: int | None) -> bool:
+    for pair in ALLOW_LOCAL:
+        h, _, p = pair.partition(":")
+        if h == host and (p in ("", "*") or p == str(port)):
+            return True
+    return False
+
+
 def check_public_url(url: str) -> str:
     """Agents may only reach the public internet, never this PC or your home network, and never through a relay."""
     parsed = urllib.parse.urlparse(url)
@@ -60,6 +73,8 @@ def check_public_url(url: str) -> str:
     if is_relay(host):
         raise WebError(f"{host} is a relay that fetches other sites for you. Relays hide where requests go and break "
                        f"the site's terms, so Holdco blocks them. {RELAY_HINT}")
+    if _allowed_local(host, parsed.port):
+        return url   # test-only exemption (HOLDCO_ALLOW_LOCAL), so the suite's fake services count as public
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:

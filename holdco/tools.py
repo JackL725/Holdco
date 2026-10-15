@@ -42,6 +42,9 @@ class Ctx:
     founding_stage: str = ""                     # research, charter, critic or plan in a founding run
     stage_warned: bool = False                   # finish() said once what the founding stage has not left
     refused_finish: dict | None = None           # the finish call that stage check refused (agents.run)
+    # Phase 1: connector tools find_tool loaded into this session (specs the model sees from its next step on)
+    loaded_tools: list = field(default_factory=list)
+    loaded_by_name: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -50,17 +53,38 @@ class Tool:
     description: str
     parameters: dict
     fn: Callable
+    risk: str = "write"   # Phase 1: one of config.RISK_TAGS
 
 
 REGISTRY: dict[str, Tool] = {}
 
 
-def tool(name: str, description: str, props: dict, required: tuple = ()):
+def tool(name: str, description: str, props: dict, required: tuple = (), risk: str | None = None):
     def deco(fn):
         REGISTRY[name] = Tool(name, description, {"type": "object", "properties": props,
-                                                  "required": list(required)}, fn)
+                                                  "required": list(required)}, fn,
+                              risk or BUILTIN_RISK.get(name, "write"))
         return fn
     return deco
+
+
+# Phase 1: the risk tag of every built-in tool. For built-ins the tag is descriptive (their own approval policies
+# stay); for connector tools the tag decides the policy (connectors.policy_for). Anything not listed is "write".
+BUILTIN_RISK = {
+    # read: runs freely
+    "web_search": "read", "fetch_url": "read", "read_file": "read", "list_files": "read", "recall": "read",
+    "list_tasks": "read", "check_inbox": "read", "audit_page": "read", "check_contrast": "read",
+    "review_text": "read", "browser_check": "read", "find_tool": "read", "search": "read", "grep": "read",
+    "company_status": "read", "check_sources": "read",
+    # contact, publish, spend
+    "send_email": "contact", "social_post": "publish", "deploy_site": "publish", "http_request": "publish",
+    "request_purchase": "spend",
+}
+
+
+def risk_of(name: str) -> str:
+    t = REGISTRY.get(name)
+    return t.risk if t else BUILTIN_RISK.get(name, "write")
 
 
 def S(desc: str, **extra) -> dict:
@@ -108,6 +132,15 @@ def resolve(ctx: Ctx, name: str, args: dict) -> tuple[str, dict]:
 
 
 def execute(ctx: Ctx, name: str, args: dict) -> str:
+    if name in ctx.loaded_by_name:   # Phase 1: a connector tool find_tool loaded into this session
+        spec = ctx.loaded_by_name[name]
+        try:
+            out = str(connectors.call(ctx, name, clean_args(spec, args)))
+        except (ToolError, ValueError) as e:
+            out = f"ERROR: {e}"
+        except Exception as e:   # a connected service must never crash the run
+            out = f"ERROR: {type(e).__name__}: {e}"
+        return out[:MAX_RESULT] + (f"\n[truncated {len(out) - MAX_RESULT} characters]" if len(out) > MAX_RESULT else "")
     name, args = resolve(ctx, name, args)
     t = REGISTRY.get(name)
     if not t or (ctx.allowed and name not in ctx.allowed):
@@ -131,7 +164,13 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
 
 
 def _clean_args(t: Tool, args: dict) -> dict:
-    props = t.parameters["properties"]
+    return clean_args({"parameters": t.parameters}, args)
+
+
+def clean_args(spec: dict, args: dict) -> dict:
+    """Coerce arguments to the types a spec declares and check the required ones (a Tool or a connector spec)."""
+    params = spec.get("parameters") or {}
+    props = params.get("properties") or {}
     clean = {}
     for k, v in (args or {}).items():
         if k not in props:
@@ -152,7 +191,7 @@ def _clean_args(t: Tool, args: dict) -> dict:
         elif typ == "string" and not isinstance(v, str):
             v = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
         clean[k] = v
-    missing = [r for r in t.parameters.get("required", []) if r not in clean]
+    missing = [r for r in params.get("required") or [] if r not in clean]
     if missing:
         raise ToolError(f"missing required argument(s): {', '.join(missing)}")
     return clean
@@ -784,3 +823,6 @@ def role_tools(agent: dict, kind: str) -> list[dict]:
 # `I`, `Ctx` and `ToolError` exist before they run.
 from . import watchdog  # noqa: E402,F401  (note_progress lives with the working-notes logic)
 from . import context, planning, truth  # noqa: E402,F401  (Phase 0.5: search, guards, owner questions)
+from . import connectors, browser  # noqa: E402,F401  (Phase 1: find_tool, connector routing, browser_check)
+for _name, _t in REGISTRY.items():   # tools registered before BUILTIN_RISK existed in a module keep their tag
+    _t.risk = _t.risk if _t.risk != "write" else BUILTIN_RISK.get(_name, "write")
