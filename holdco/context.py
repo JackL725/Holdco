@@ -191,7 +191,9 @@ def _load_text(p: Path, size: int | None = None, keep_bom: bool = False) -> str 
     if b"\x00" in raw[:2000]:
         return None
     text = raw.decode("utf-8", "replace")
-    return text if keep_bom else text.lstrip("\ufeff")
+    if keep_bom:
+        return text   # edit_file: the exact bytes as text, so line endings and the BOM survive an edit
+    return text.replace("\r\n", "\n").lstrip("\ufeff")   # prompts, index, summaries: Windows lines as plain lines
 
 
 def _head_text(p: Path, n: int = 16384) -> str | None:
@@ -203,7 +205,7 @@ def _head_text(p: Path, n: int = 16384) -> str | None:
         return None
     if b"\x00" in raw[:2000]:
         return None
-    return raw.decode("utf-8", "replace").lstrip("\ufeff")
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").lstrip("\ufeff")
 
 
 def _short(s: str, n: int = 80) -> str:
@@ -1501,7 +1503,7 @@ def read_file(ctx: Ctx, path: str, offset: int = 0, start_line: int = 0, end_lin
         more = f"\n[{len(text) - offset - 12000} more characters: read again with offset={offset + 12000}]" \
             if len(text) > offset + 12000 else ""
         return chunk + more
-    text = text.lstrip("\ufeff")
+    text = text.lstrip("\ufeff").replace("\r\n", "\n")   # numbered lines without stray \r on Windows files
     lines = _lines(text)
     total = len(lines)
     if outline:

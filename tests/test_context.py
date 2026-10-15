@@ -607,7 +607,7 @@ class TestListFiles(Base):
     def test_library_listing(self):
         g = context.global_dir()
         g.mkdir(parents=True, exist_ok=True)
-        (g / "about.md").write_text("# Who I am\n", encoding="utf-8")
+        (g / "about.md").write_bytes(b"# Who I am\n")   # bytes: text mode would add \r on Windows
         (g / "scan.pdf").write_bytes(b"%PDF")
         context.reindex_global()
         out = self.tool("list_files", path="global:")
@@ -1066,6 +1066,27 @@ class TestToolsWiring(Base):
         self.assertEqual(tools.resolve(founding, "search", {"q": "roofers"}), ("search", {"query": "roofers"}))
         self.assertEqual(tools.resolve(self.ctx, "search", {"q": "roofers"}), ("search", {"query": "roofers"}))
         self.assertEqual(tools.resolve(self.ctx, "find", {"text": "x"}), ("search", {"query": "x"}))
+
+
+
+class TestWindowsLineEndings(Base):
+    """A context file saved by Notepad ends its lines with \r\n; prompts, reads and search must not carry the \r."""
+
+    def test_crlf_files_read_as_plain_lines(self):
+        g = context.global_dir()
+        g.mkdir(parents=True, exist_ok=True)
+        (g / "crlf.md").write_bytes(b"# About me\r\nI only have weekends.\r\n")
+        db.set_settings({"pinned_context": ["crlf.md"]})
+        try:
+            section = context.pinned_section(self.c)
+            self.assertIn("# About me\nI only have weekends.", section)
+            self.assertNotIn("\r", section)
+            out = self.tool("read_file", path="global:crlf.md")
+            self.assertIn("2: I only have weekends.", out)
+            self.assertNotIn("\r", out)
+        finally:
+            db.set_settings({"pinned_context": []})
+            (g / "crlf.md").unlink()
 
 
 if __name__ == "__main__":

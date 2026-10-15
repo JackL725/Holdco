@@ -510,6 +510,8 @@ class TestConnectors(DoctorBase):
         dumped = json.dumps(list(rows.values()))
         self.assertNotIn("pw-secret-9", dumped)
         self.assertNotIn("SECRET_TOKEN", dumped)
+        # Archived at the end (below) so later test modules' schedulers never poll this unreachable inbox.
+        self.addCleanup(db.update, "companies", c["id"], status="archived")
         bad = StubHTTP({"message": "nope"}, code=401)
         try:
             with patch.object(doctor, "NETLIFY_API", bad.url):

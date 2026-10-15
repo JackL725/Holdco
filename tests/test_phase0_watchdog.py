@@ -921,8 +921,9 @@ class TestFoundingRuns(unittest.TestCase):
         self.assertIn("A charter exists", qs[0]["p"]["question"])
         self.assertIn("it finished only partially", qs[0]["p"]["question"])
         # The question itself went to the phone through gate (with buttons), then the founding notice.
-        self.assertEqual([s[1] for s in self.sent], ["escalation", "important"])
-        self.assertEqual(self.sent[-1], ("<b>FoundCo</b>: founding ended partial; see your inbox.", "important"))
+        mine = [m for m in self.sent if "FoundCo" in m[0]]   # other modules' leftovers may report errors meanwhile
+        self.assertEqual([m[1] for m in mine], ["escalation", "important"])
+        self.assertEqual(mine[-1], ("<b>FoundCo</b>: founding ended partial; see your inbox.", "important"))
 
     def test_update_charter_wins_and_a_clean_founding_reaches_the_phone(self):
         # Phase 0.5: update_charter belongs to the charter stage, which saved this charter to the record; an older
@@ -936,7 +937,8 @@ class TestFoundingRuns(unittest.TestCase):
         c = db.get_company(self.c["id"])
         self.assertEqual((c["status"], c["charter"], c["mission"]), ("active", "# Real charter", "Real one-liner"))
         self.assertEqual(questions(self.c["id"]), [])
-        self.assertEqual(self.sent, [("<b>FoundCo</b> is up and running: 1 task queued.", "important")])
+        mine = [m for m in self.sent if "FoundCo" in m[0]]   # other modules' leftovers may report errors meanwhile
+        self.assertEqual(mine, [("<b>FoundCo</b> is up and running: 1 task queued.", "important")])
 
     def test_phone_problems_never_touch_the_run(self):
         def boom(*a, **kw):
