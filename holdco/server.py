@@ -89,19 +89,8 @@ def api_models(h, m, body):
 @route("POST", "/api/llm/test")
 def api_llm_test(h, m, body):
     s = db.get_settings()
-    model = (body or {}).get("model") or s["default_model"]
-    try:
-        t = llm.chat([{"role": "system", "content": "Reply briefly."},
-                      {"role": "user", "content": "Call the ping tool with message 'ok'."}],
-                     tools=[{"name": "ping", "description": "Reply to a ping",
-                             "parameters": {"type": "object", "properties": {"message": {"type": "string"}},
-                                            "required": ["message"]}}], model=model, settings=s)
-        if t.tool_calls:
-            return {"ok": True, "message": f"{model} is working and can call tools ({t.mode} mode)."}
-        return {"ok": True, "message": f"{model} replied, but didn't call the test tool. Agents may struggle; "
-                                       "a model with stronger tool use (e.g. gpt-oss:20b) is recommended."}
-    except llm.LLMError as e:
-        return {"ok": False, "message": str(e)}
+    ok, message = llm.tool_ping((body or {}).get("model") or s["default_model"], s)
+    return {"ok": ok, "message": message}
 
 
 @route("GET", "/api/presets")

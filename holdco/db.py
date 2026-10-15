@@ -175,6 +175,19 @@ def update(table: str, row_id: int, **fields) -> None:
     run(f"UPDATE {table} SET {cols} WHERE id=?", [*fields.values(), row_id])
 
 
+def backup_to(path) -> None:
+    """Copy the live database to `path` with SQLite's online backup, so the copy is consistent even in WAL mode
+    with writers active (a plain file copy could miss the WAL). Used by backup.run_backup."""
+    if _conn is None:
+        raise RuntimeError("The database is not open.")
+    with _lock:
+        dest = sqlite3.connect(str(path))
+        try:
+            _conn.backup(dest)
+        finally:
+            dest.close()
+
+
 # ---------- settings ----------
 
 def get_settings() -> dict:

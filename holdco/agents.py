@@ -6,7 +6,7 @@ import json
 import threading
 import traceback
 
-from . import bus, config, db, llm, presets, roles, tools, watchdog, workspace
+from . import bus, config, db, doctor, llm, presets, roles, tools, watchdog, workspace
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
@@ -206,13 +206,25 @@ def founding_prompt(company: dict, context: str) -> str:
     named = db.company_settings(company).get("name_locked")
     roles_list = ", ".join(a["role"] for a in db.q("SELECT role FROM agents WHERE company_id=? AND enabled=1",
                                                        (company["id"],)))
+    search_down = False
+    try:   # a health check must never stop a prompt from being built
+        row = doctor.search_status()
+        search_down = bool(row and row.get("status") == "bad")
+    except Exception:
+        pass
+    search_note = (
+        "\nWeb search is down right now. Skip the research step: write the charter from the idea and what you "
+        "already know, mark the research gaps in research/market.md, and ask the owner with report_to_owner to "
+        "tell you about the market. Do not call web_search more than once.\n"
+    ) if search_down else ""
     return (
         "You are founding a brand-new company. The owner's idea:\n"
         f'"""{company.get("idea")}"""\n'
         + (f"\nAbout the owner and their constraints:\n{context}\n" if context else "")
         + (f"\nThe owner already chose the name: {company['name']}. Keep it.\n" if named else "")
         + f"\nYour team's roles: {roles_list}.\n"
-        "\nDo this, in order:\n"
+        + search_note
+        + "\nDo this, in order:\n"
         "1. Research the market with web_search and fetch_url (3-6 searches): who the customers are, what they pay "
         "for today, real competitors and their prices, and where these customers can be reached.\n"
         "2. Save the findings, with source URLs, to research/market.md.\n"

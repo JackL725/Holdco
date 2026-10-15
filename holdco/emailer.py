@@ -60,6 +60,55 @@ def send(company: dict, to: str, subject: str, body: str, in_reply_to: str = "")
     return f"Email sent to {to}."
 
 
+TEST_TIMEOUT = 8   # seconds per socket operation in the login tests (the Doctor caps a whole check at 15 s)
+
+
+def test_smtp(cs: dict) -> str:
+    """Prove the SMTP details work: connect, STARTTLS (or SSL on 465), log in, quit. Nothing is sent.
+    Raises EmailError with the server's reason; the password never appears in it."""
+    if not smtp_configured(cs):
+        raise EmailError("SMTP is not configured (host, user and password are all needed).")
+    host, user = cs["smtp_host"], cs["smtp_user"]
+    port = int(cs.get("smtp_port") or 587)
+    ctx = ssl.create_default_context()
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, context=ctx, timeout=TEST_TIMEOUT) as s:
+                s.login(user, cs["smtp_password"])
+        else:
+            with smtplib.SMTP(host, port, timeout=TEST_TIMEOUT) as s:
+                s.starttls(context=ctx)
+                s.login(user, cs["smtp_password"])
+    except (smtplib.SMTPException, OSError) as e:
+        raise EmailError(f"SMTP login as {user} at {host}:{port} failed: {e}") from None
+    return f"SMTP login ok as {user} at {host}:{port}."
+
+
+def test_imap(cs: dict) -> str:
+    """Prove the IMAP details work: connect over SSL, log in, log out. Raises EmailError on failure."""
+    if not imap_configured(cs):
+        raise EmailError("IMAP is not configured (host, user and password are all needed).")
+    host, user = cs["imap_host"], cs["imap_user"]
+    port = int(cs.get("imap_port") or 993)
+    try:
+        M = imaplib.IMAP4_SSL(host, port, timeout=TEST_TIMEOUT)
+        try:
+            M.login(user, cs["imap_password"])
+        finally:
+            try:
+                M.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
+    except (imaplib.IMAP4.error, OSError) as e:
+        raise EmailError(f"IMAP login as {user} at {host}:{port} failed: {e}") from None
+    return f"IMAP login ok as {user} at {host}:{port}."
+
+
+# Names used by the phase document; same functions.
+check_smtp = test_smtp
+check_imap = test_imap
+
+
 def _body_text(msg) -> str:
     if msg.is_multipart():
         plain = html = None
