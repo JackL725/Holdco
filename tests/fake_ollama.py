@@ -30,6 +30,14 @@ def script(messages: list[dict], tools: list[dict]):
     names = {t["function"]["name"] for t in tools}
     stamp = int(time.time() * 1000) % 100000
     if user.startswith("You are founding"):
+        if "[partial]" in user:
+            # A thin founding, the way the first real run went: the charter lands in a file through write_file,
+            # update_charter is never called, no tasks are created and the CEO finishes with status partial.
+            seq = [tc("write_file", path="docs/charter.md",
+                      content="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n\n## Problem\nOwners guess.\n"),
+                   tc("finish", summary="Drafted the charter in docs/charter.md; stopped before creating tasks.",
+                      status="partial")]
+            return seq[min(step, len(seq) - 1)]
         seq = [tc("web_search", query="dog meal plan subscription market"),
                tc("write_file", path="research/market.md", content="# Market\n\n- FACT: example (source: https://example.com)\n"),
                tc("update_charter", charter="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n",

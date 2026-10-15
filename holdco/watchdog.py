@@ -30,18 +30,30 @@ Patterns, their questions, options and recommended answers:
   ("connector:<company id>:<name>") or the row's company_id.
   "Email (SMTP) for PawPlan has failed on two checks in a row (<detail>). What should we do?"
   Options: Keep going without it, Pause the company. Recommended: Keep going without it.
+  Web search counts as a connector too (row key "search"): when every provider failed on two searches in a row
+  (web.SEARCH_FAIL_STREAK, read on every tick without network) or the Doctor's search row was bad on two
+  consecutive runs, every active company that searched in the last day (or every active company when none did)
+  is asked once per day: "Web search for PawPlan has failed on every provider (<reasons>). What should we do?"
 - stalled (tick): company active, autopilot on, open tasks, no run started in 2 hours, and either the Doctor
   says the model server is bad or the last 3 runs all ended in errors.
   "Agents at PawPlan are stuck: <reason>. What should we do?"
   Options: Pause the company, Keep going. Recommended: Pause the company.
 
-Dedupe: while a pending question with the same pattern (and task, for task patterns) exists for the company,
-nothing new is created; after one was answered the same pattern is not asked again for 6 hours.
+Dedupe: every question carries a dedupe key in its payload ("key": task_failed_twice:<task id>,
+founding_partial:<company id>, connector_down:<row key>, repeated_error:<hash of the message>,
+task_bouncing:<task id>, stalled:<company id>) next to the plain pattern name the dashboard shows as a badge.
+While a pending question with the same key exists for the company nothing new is created; after one was answered
+the same key is not asked again for 6 hours, except that "Retry once more with my note" forgets that window so
+the extra attempt's failure asks again. Model-connection errors (the model server unreachable, dropped, timed
+out or answering HTTP 5xx) never count for repeated_error: that outage is the stalled pattern's job, so one
+outage is one question.
 
 Answers (resolve, called from actions.decide after its own memory note and task reopening):
   Skip this task -> task cancelled; Retry once more with my note -> task todo, attempts and reassigned reset,
   the owner's note appended to the working notes; Pause the company -> company paused; Retry founding ->
-  agents.found; Continue anyway -> company active; Keep going / anything else -> nothing more.
+  agents.found (when the CEO is busy the company stays active and a planning cycle is requested instead);
+  Continue anyway -> company active plus the memory note "Founding accepted as is by the owner"; Keep going /
+  anything else -> nothing more.
 
 Working notes (tasks.notes) record what each attempt tried, what failed and what is left, so a retry continues
 instead of starting over. Entries look like "--- [author] 2026-10-14T10:22:05Z ---" followed by the text; the
@@ -51,11 +63,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 import re
 import threading
 import traceback
 
-from . import bus, db, doctor
+from . import bus, db, doctor, web
 from .tools import Ctx, S, tool  # noqa: F401  (tool registration)
 
 PATTERNS = ("task_failed_twice", "repeated_error", "task_bouncing", "connector_down", "stalled", "founding_partial")
@@ -76,6 +89,15 @@ CONNECTOR_BAD_STREAK = 2        # consecutive bad Doctor runs before a connector
 STALL_MINUTES = 120             # no run started for this long
 STALL_ERROR_RUNS = 3            # ... and the last N runs all errored
 TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+# The llm.LLMError texts that mean the model server itself was unavailable (not a bad request, not a malformed
+# tool call): nobody's fault, so such a run neither burns a task attempt nor counts as a repeated error.
+_MODEL_DOWN_RE = re.compile(r"can't reach the model server|model server dropped the connection|"
+                            r"model server took longer than|http 5\d\d from model server")
+# Shown with the web-search question: the owner can usually fix a search outage with a key or a server.
+SEARCH_FIX_HINT = ("Add a search key or server in Settings to give the agents another provider: a Brave Search API "
+                   "key (brave_api_key) or the url of a SearXNG instance you run (searxng_url). Until then agents "
+                   "are told to skip research, continue with URLs they already know and note the gap.")
 
 _escalate_lock = threading.Lock()
 _bad_streak: dict[str, int] = {}             # connector row key -> consecutive Doctor runs seen bad
@@ -166,9 +188,16 @@ GUIDANCE = {
 _SEARCH_DOWN = ("web search is unavailable", "search failed", "search providers failed", "search is down")
 
 
+def _failed_entries(task: dict) -> list[dict]:
+    """The auto entries that describe a real failed attempt. A run that ended "stopped" (pause, kill switch, or a
+    model outage that gave the attempt back) is not the agent's failure, so the entry before it drives the guidance."""
+    return [e for e in entries(task.get("notes")) if e["author"] == "auto"
+            and not re.match(r"Attempt \d+ ended: stopped", e["text"] or "")]
+
+
 def classify_failure(task: dict) -> tuple[str, str]:
     """(kind, detail) for the task's last failed attempt, read from its working notes, result and answered questions."""
-    auto = [e for e in entries(task.get("notes")) if e["author"] == "auto"]
+    auto = _failed_entries(task)
     last = auto[-1] if auto else None
     answered = None
     if task.get("id"):
@@ -205,7 +234,7 @@ def retry_guidance(task: dict) -> str:
     why, guidance = GUIDANCE[kind]
     if detail:
         why += f" ({detail[:100]})"
-    auto = [e for e in entries(task.get("notes")) if e["author"] == "auto"]
+    auto = _failed_entries(task)
     m = re.match(r"Attempt (\d+) ended", auto[-1]["text"]) if auto else None
     n = int(m.group(1)) if m else max(1, int(task.get("attempts") or 2) - 1)
     return f"Attempt {n} failed because {why}. Do not repeat that approach: {guidance}"[:600]
@@ -225,30 +254,36 @@ def _ceo(company: dict) -> dict:
 
 
 def escalate(company: dict, pattern: str, question: str, options: list[str], recommended: str,
-             context: str = "", task_id: int | None = None) -> int | None:
-    """Create one question for the owner (deduplicated by pattern). Returns the approval id or None.
+             context: str = "", task_id: int | None = None, key: str | None = None) -> int | None:
+    """Create one question for the owner (deduplicated by key). Returns the approval id or None.
 
-    A pending question with the same pattern (and task) returns its id; one answered within
-    RESOLVED_QUIET_HOURS returns None; otherwise the row goes through actions.gate so the notify hook,
-    the approval event and the memory note on answering all apply.
+    pattern is the plain name the dashboard shows as a badge; key is the dedupe key ("<pattern>:<task id>" for
+    task patterns and "<pattern>:<company id>" otherwise when not given). A pending question with the same key
+    returns its id; one answered within RESOLVED_QUIET_HOURS returns None, unless the owner answered it with
+    "Retry once more with my note" (the extra attempt's failure must ask again); otherwise the row goes through
+    actions.gate so the notify hook, the approval event and the memory note on answering all apply.
     """
     from . import actions  # imported here: actions is loaded before tools finishes importing this module
     cid = company["id"]
+    key = key or (f"{pattern}:{task_id}" if task_id is not None else f"{pattern}:{cid}")
     with _escalate_lock:
         quiet_since = _ago(RESOLVED_QUIET_HOURS * 60)
         rows = db.q("SELECT id, status, task_id, payload, decided_at FROM approvals WHERE company_id=? AND "
                     "action='question' AND payload LIKE ? ORDER BY id DESC LIMIT 50",
-                    (cid, f'%"pattern": "{pattern}"%'))
+                    (cid, f'%"key": "{key}"%'))
         for r in rows:
             p = db.loads(r["payload"], {}) or {}
-            if p.get("pattern") != pattern or (task_id is not None and r["task_id"] != task_id):
+            if p.get("key") != key:
                 continue
             if r["status"] == "pending":
                 return r["id"]
+            if p.get("retried"):
+                continue   # the owner asked for one more attempt, so that attempt's failure is news again
             if (r["decided_at"] or "") >= quiet_since:
                 return None
         payload = {"question": question, "options": list(options), "recommended": recommended,
-                   "context": (context or "")[:2000], "pattern": pattern, "task_id": task_id, "company_id": cid}
+                   "context": (context or "")[:2000], "pattern": pattern, "key": key, "task_id": task_id,
+                   "company_id": cid}
         res = actions.gate(company, _ceo(company), task_id, "question", payload)
     m = re.search(r"#(\d+)", res or "")
     return int(m.group(1)) if m else None
@@ -299,7 +334,8 @@ def task_failed(task: dict, reason: str, run_status: str) -> None:
     question = (f"Task #{t['id']} '{t['title']}' failed {times} (last time: {_failure_words(reason, run_status)}). "
                 f"What should we do?")
     recommended = "Retry once more with my note" if int(t["priority"] or 2) == 1 else "Skip this task"
-    escalate(company, "task_failed_twice", question, TASK_OPTIONS, recommended, _latest_note(t), t["id"])
+    escalate(company, "task_failed_twice", question, TASK_OPTIONS, recommended, _latest_note(t), t["id"],
+             key=f"task_failed_twice:{t['id']}")
 
 
 def founding_ended(company: dict, run_status: str, summary: str) -> None:
@@ -310,7 +346,8 @@ def founding_ended(company: dict, run_status: str, summary: str) -> None:
     question = (f"Founding {company['name']} stopped before it finished ({how}). "
                 f"{'A charter exists.' if has_charter else 'No charter was written.'} What should we do?")
     escalate(company, "founding_partial", question, FOUNDING_OPTIONS,
-             "Continue anyway" if has_charter else "Retry founding", (summary or "")[:CONTEXT_CHARS])
+             "Continue anyway" if has_charter else "Retry founding", (summary or "")[:CONTEXT_CHARS],
+             key=f"founding_partial:{company['id']}")
 
 
 def match_option(answer: str, options: list[str]) -> str | None:
@@ -363,6 +400,10 @@ def _apply(approval: dict, answer: str) -> None:
         note = note or rest or "Retry once more (the owner's decision)."
         db.update("tasks", task["id"], status="todo", attempts=0, reassigned=0, updated_at=ts)
         add_note(task["id"], note, "owner")
+        # Forget the 6 h quiet window for this question: if the extra attempt fails too, the owner must hear it.
+        p["retried"] = True
+        if approval.get("id"):
+            db.update("approvals", approval["id"], payload=json.dumps(p))
         bus.emit(cid, "task", f"task #{task['id']} gets one more attempt with the owner's note", None,
                  {"task_id": task["id"]})
         bus.notify("tasks", company_id=cid)
@@ -373,9 +414,17 @@ def _apply(approval: dict, answer: str) -> None:
             bus.notify("companies")
     elif option == "Retry founding":
         from . import agents  # imported here: agents imports this module
-        bus.emit(cid, "founding", "retrying the founding on the owner's answer")
-        agents.found(cid)
+        if agents.found(cid):
+            bus.emit(cid, "founding", "retrying the founding on the owner's answer")
+        else:
+            # The CEO is mid-run, so a founding cannot start now. Rather than leave the company stuck in
+            # "founding" with nothing running, keep it active and let the next planning cycle pick the work up.
+            db.update("companies", cid, cycle_requested=1)
+            bus.emit(cid, "info", "The CEO is busy right now, so founding was not restarted; a planning cycle is "
+                     "requested instead.")
     elif option == "Continue anyway":
+        db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
+               (cid, approval.get("agent_id"), "decision", "Founding accepted as is by the owner", 0, ts))
         if company["status"] != "active":
             db.update("companies", cid, status="active", last_cycle_at=ts)
             bus.emit(cid, "founding", "founding accepted as is on the owner's answer")
@@ -399,6 +448,15 @@ def error_hash(message: str) -> str:
     return hashlib.sha1(normalise_error(message).encode("utf-8")).hexdigest()[:8]
 
 
+def is_model_connection_error(text: str | None) -> bool:
+    """True when a run's error means the model server was unavailable (unreachable, dropped the connection, timed
+    out, or answered HTTP 5xx). Ollama's HTTP 500 for a malformed tool call is the model's doing, not an outage."""
+    low = " ".join((text or "").lower().split())
+    if "error parsing tool call" in low:
+        return False
+    return bool(_MODEL_DOWN_RE.search(low))
+
+
 def tick() -> None:
     """Cheap SQL-only pass run by the scheduler every tick. Never raises."""
     try:
@@ -412,7 +470,9 @@ def tick() -> None:
             _check_repeated_errors(c)
             _check_bouncing(c, pending_tasks)
             _check_stalled(c, settings)
-        _check_connectors({c["id"]: c for c in companies})
+        by_id = {c["id"]: c for c in companies}
+        _check_connectors(by_id)
+        _check_search(by_id, settings)
     except Exception:
         traceback.print_exc()
 
@@ -422,14 +482,18 @@ def _check_repeated_errors(c: dict) -> None:
                 "ORDER BY id DESC LIMIT 300", (c["id"], _ago(REPEATED_ERROR_MINUTES)))
     counts: dict[str, list] = {}
     for r in rows:
+        if is_model_connection_error(r["message"]):
+            continue   # a model outage is one problem, reported once by the stalled pattern
         counts.setdefault(normalise_error(r["message"]), []).append(r["message"])
     for key, msgs in counts.items():
         if key and len(msgs) >= REPEATED_ERROR_MIN:
             sample = " ".join((msgs[0] or "").split())
             question = (f"The same error happened {len(msgs)} times in the last hour at {c['name']}: "
                         f"{sample[:200]}. What should we do?")
-            escalate(c, "repeated_error", question, PAUSE_OPTIONS, "Pause the company", sample[:CONTEXT_CHARS])
-            return   # one question per company per tick is plenty
+            # The key carries a hash of the message, so a different error that also repeats gets its own question.
+            if escalate(c, "repeated_error", question, PAUSE_OPTIONS, "Pause the company", sample[:CONTEXT_CHARS],
+                        key=f"repeated_error:{error_hash(sample)}"):
+                return   # one question per company per tick is plenty; a quiet key must not hide the next one
 
 
 def _check_bouncing(c: dict, pending_tasks: set) -> None:
@@ -441,8 +505,11 @@ def _check_bouncing(c: dict, pending_tasks: set) -> None:
         question = (f"Task #{t['id']} '{t['title']}' has been handed between agents {t['reassigned']} times without "
                     f"finishing. What should we do?")
         context = _latest_note(t) or (t["result"] or "")[-CONTEXT_CHARS:]
-        aid = escalate(c, "task_bouncing", question, TASK_OPTIONS, "Retry once more with my note", context, t["id"])
-        if aid and t["status"] in ("todo", "in_progress"):
+        aid = escalate(c, "task_bouncing", question, TASK_OPTIONS, "Retry once more with my note", context, t["id"],
+                       key=f"task_bouncing:{t['id']}")
+        # Only a queued task is parked. One that an agent is working on keeps its status, because
+        # agents._finalize records a run's outcome only while the task is still in_progress.
+        if aid and t["status"] == "todo":
             db.update("tasks", t["id"], status="blocked", updated_at=db.now())
             bus.notify("tasks", company_id=c["id"])
 
@@ -478,7 +545,7 @@ def _check_stalled(c: dict, settings: dict) -> None:
             reason = f"the last {STALL_ERROR_RUNS} runs all ended in errors and nothing has started for 2 hours"
     if reason:
         escalate(c, "stalled", f"Agents at {c['name']} are stuck: {reason}. What should we do?", PAUSE_OPTIONS,
-                 "Pause the company", reason)
+                 "Pause the company", reason, key=f"stalled:{c['id']}")
 
 
 def _check_connectors(companies: dict[int, dict]) -> None:
@@ -494,12 +561,14 @@ def _check_connectors(companies: dict[int, dict]) -> None:
     today = db.now()[:10]
     for r in rows:
         key = str(r.get("key") or "")
-        if not key.startswith(("connector:", "conn:")):
+        if key != "search" and not key.startswith(("connector:", "conn:")):
             continue
         if r.get("status") != "bad":
             _bad_streak.pop(key, None)
             continue
         _bad_streak[key] = _bad_streak.get(key, 0) + 1
+        if key == "search":
+            continue   # the streak is read by _check_search, which asks per company
         if _bad_streak[key] < CONNECTOR_BAD_STREAK or _last_connector_alert.get(key) == today:
             continue
         # Doctor keys are "connector:<name>:<company id>" (global ones have no id); accept "conn:<id>:<name>" too.
@@ -513,5 +582,44 @@ def _check_connectors(companies: dict[int, dict]) -> None:
         detail = " ".join(str(r.get("detail") or "").split())[:200]
         question = (f"{label} for {c['name']} has failed on two checks in a row"
                     f"{' (' + detail + ')' if detail else ''}. What should we do?")
-        escalate(c, "connector_down", question, CONNECTOR_OPTIONS, "Keep going without it", detail)
-        _last_connector_alert[key] = today
+        aid = escalate(c, "connector_down", question, CONNECTOR_OPTIONS, "Keep going without it", detail,
+                       key=f"connector_down:{key}")
+        if aid:   # only a question that exists counts as today's alert
+            _last_connector_alert[key] = today
+
+
+def _search_reasons(settings: dict) -> str:
+    """Each search provider's state in chain order, from web.PROVIDER_STATUS (no network call)."""
+    try:
+        rows = web.search_health(settings)
+    except Exception:
+        rows = []
+    text = "; ".join(f"{r.get('provider')}: {r.get('detail') or r.get('status')}" for r in rows)
+    return " ".join(text.split())[:300] or "no provider could answer"
+
+
+def _check_search(companies: dict[int, dict], settings: dict) -> None:
+    """Web search is a connector too. It counts as down after two searches in a row where every provider failed
+    (web.SEARCH_FAIL_STREAK, kept by the search chain and read here without any network call) or when the Doctor's
+    search row was bad on two consecutive runs. The active companies that searched in the last day are asked (every
+    active company when none did), once per company per day."""
+    streak = int(getattr(web, "SEARCH_FAIL_STREAK", 0) or 0)
+    if streak < CONNECTOR_BAD_STREAK and _bad_streak.get("search", 0) < CONNECTOR_BAD_STREAK:
+        return
+    today = db.now()[:10]
+    searched = {r["company_id"] for r in db.q("SELECT DISTINCT company_id FROM events WHERE kind='tool' AND "
+                                              "message LIKE 'searched the web%' AND created_at>=?",
+                                              (_ago(24 * 60),))}
+    targets = [c for cid, c in companies.items() if cid in searched] or list(companies.values())
+    reasons = None
+    for c in targets:
+        mark = f"search:{c['id']}"
+        if _last_connector_alert.get(mark) == today:
+            continue
+        if reasons is None:
+            reasons = _search_reasons(settings)
+        question = f"Web search for {c['name']} has failed on every provider ({reasons}). What should we do?"
+        aid = escalate(c, "connector_down", question, CONNECTOR_OPTIONS, "Keep going without it",
+                       f"{reasons}\n{SEARCH_FIX_HINT}", key="connector_down:search")
+        if aid:
+            _last_connector_alert[mark] = today

@@ -5,6 +5,7 @@ Every few seconds it: lets each CEO re-plan when a cycle is due, hands queued ta
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import threading
 import time
@@ -15,6 +16,14 @@ from . import agents, backup, bus, db, doctor, emailer, notify, roles, watchdog
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
 INBOX_MINUTES = 5
+MODEL_RECHECK_MINUTES = 5      # while the model server is down, the Doctor is asked to look again this often
+MODEL_WAIT_TEXT = ("Waiting for the model server: it is unreachable, so tasks and planning are on hold. The health "
+                   "checks retry every few minutes.")
+MODEL_BACK_TEXT = "The model server is back. Tasks and planning resume."
+
+
+def _seconds_ago(n: float) -> str:
+    return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Scheduler(threading.Thread):
@@ -23,6 +32,7 @@ class Scheduler(threading.Thread):
         self._stop = threading.Event()
         self._last_inbox: dict[int, float] = {}
         self._last_routines: dict[int, float] = {}
+        self._model_waiting = False    # the outage notice was posted; the "back" notice is still owed
 
     def stop(self) -> None:
         self._stop.set()
@@ -44,6 +54,9 @@ class Scheduler(threading.Thread):
         self._housekeeping(s)
         if s.get("kill_switch"):
             return   # the kill switch stops every dispatch until the owner turns it off
+        if self._model_server_down():
+            return   # a run would only end in a connection error; housekeeping keeps the watchdog and poller going
+        self._resume_founding()
         if not s.get("scheduler_enabled", True):
             return
         capacity = max(1, int(s.get("max_concurrent_runs", 2)))
@@ -84,6 +97,54 @@ class Scheduler(threading.Thread):
                 pass
             except Exception:
                 traceback.print_exc()
+
+    def _model_server_down(self) -> bool:
+        """True while the Doctor's last look found the model server unreachable.
+
+        Dispatching then only burns runs on connection errors, so tasks and cycles wait. The Doctor is asked to
+        look again every few minutes so a recovery is noticed in minutes, not at the next hourly run, and the
+        owner gets one notice per outage plus one when it is back. When a run has just failed to reach the model
+        while the Doctor still says ok, the Doctor is asked to look now.
+        """
+        down = doctor.row_status("model_server") == "bad"
+        if down:
+            doctor.refresh_if_stale(MODEL_RECHECK_MINUTES)
+            if not self._model_waiting:
+                self._model_waiting = True
+                bus.emit(None, "info", MODEL_WAIT_TEXT)
+            return True
+        if self._model_waiting:
+            self._model_waiting = False
+            bus.emit(None, "info", MODEL_BACK_TEXT)
+        if self._recent_connection_failure():
+            doctor.refresh_if_stale(1)
+        return False
+
+    @staticmethod
+    def _recent_connection_failure() -> bool:
+        """Did the newest run end within the last minute because the model server could not be reached?"""
+        row = db.one("SELECT summary FROM runs WHERE id=(SELECT MAX(id) FROM runs) AND status='error' AND "
+                     "finished_at>=?", (_seconds_ago(60),))
+        return bool(row and watchdog.is_model_connection_error(row["summary"]))
+
+    def _resume_founding(self) -> None:
+        """A founding run stopped by the kill switch (or by a model outage) leaves the company in "founding" with
+        nothing running. recover() restarts those only at startup, so this does the same on every tick once the
+        switch is off and the model server answers. A founding that ended in any other error waits for the owner
+        to press Retry founding: restarting it every tick would help nobody."""
+        for c in db.q("SELECT * FROM companies WHERE status='founding' ORDER BY id"):
+            ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
+            if not ceo or agents.is_running(ceo["id"]):
+                continue
+            last = db.one("SELECT status, summary FROM runs WHERE company_id=? AND kind='founding' "
+                          "ORDER BY id DESC LIMIT 1", (c["id"],))
+            if not last:
+                continue   # the first run is about to start (create_company just returned)
+            outage = last["status"] == "error" and watchdog.is_model_connection_error(last["summary"])
+            if last["status"] not in ("stopped", "interrupted") and not outage:
+                continue
+            bus.emit(c["id"], "founding", "resuming the founding that was stopped before it finished")
+            agents.found(c["id"])
 
     def _maybe_cycle(self, c: dict) -> None:
         ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))

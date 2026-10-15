@@ -56,8 +56,9 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    killed = False
     if policy == "auto" and db.get_settings().get("kill_switch"):
-        policy = "approve"   # the kill switch freezes outbound actions: queue them instead of running them
+        policy, killed = "approve", True   # the kill switch freezes outbound actions: queue instead of running
     if policy == "auto":
         try:
             result = execute(company, action, payload)
@@ -93,6 +94,10 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     if action == "question":
         return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
                 f"without it, finish with status 'waiting'.")
+    if killed:
+        # The agent should know this was not the normal policy: nothing outbound runs until the owner resumes.
+        return (f"Kill switch is on: queued for the owner as request #{aid}. Don't resubmit it. Continue with "
+                f"other work; the decision will appear in your notes.")
     return (f"Queued for the owner's approval as request #{aid}. Don't resubmit it. Continue with other work; "
             f"the decision will appear in your notes.")
 
