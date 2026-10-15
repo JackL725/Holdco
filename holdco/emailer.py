@@ -52,6 +52,26 @@ def _resend_instance(company: dict, cs: dict) -> dict | None:
     return inst if usable and inst.get("status") == "ok" else None
 
 
+def outbound(company: dict, cs: dict | None = None) -> dict | None:
+    """How this company's email would go out right now: {"via": "resend" or "smtp", "sender": address}, or None
+    when it cannot send. The facts block, the outreach guards, the routines and the dashboard's email_ready ask
+    this, so they agree with send(): a company whose email_provider allows Resend (auto or resend) and that has an
+    enabled Resend connection whose last check was ok has email even without SMTP details."""
+    cs = cs if cs is not None else db.company_settings(company)
+    try:
+        inst = _resend_instance(company, cs)
+    except EmailError:   # email_provider is resend, but Resend is not connected: nothing can go out
+        return None
+    if inst is not None:
+        if inst.get("status") != "ok":   # resend chosen, but its last check failed: mail would not get out
+            return None
+        from . import conn_resend
+        return {"via": "resend", "sender": conn_resend.from_address(inst)}
+    if smtp_configured(cs):
+        return {"via": "smtp", "sender": str(cs.get("smtp_from") or cs.get("smtp_user") or "")}
+    return None
+
+
 def _idempotency_key(company: dict, to: str, subject: str, body: str) -> str:
     """Resend's Idempotency-Key, so a retried approval cannot send twice. The approval id when this send runs one
     (actions.decide marks the row 'running' before executing it), plus a hash of the content so an edited retry is

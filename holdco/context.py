@@ -2321,11 +2321,10 @@ def _save_pinned(company: dict | None, paths: list[str]) -> None:
     if company is None:
         db.set_settings({"pinned_context": paths})
         return
-    c = db.get_company(company["id"])
-    cs = db.company_settings(c)
-    cs["pinned_context"] = paths
-    db.update("companies", c["id"], settings=json.dumps(cs))
-    bus.notify("company", company_id=c["id"])
+    # Only the stored JSON is changed: company_settings() resolves vault markers, and writing that back would put
+    # the company's secrets in the table in plain text.
+    db.update_company_settings(company["id"], pinned_context=paths)
+    bus.notify("company", company_id=company["id"])
 
 
 def _lib_pin(company: dict | None, body) -> dict:

@@ -1,8 +1,10 @@
 """Connector framework (Phase 1, docs/phases/phase-1-connect.md sections 4 to 6).
 
-Definitions come from the conn_*.py modules (each exports DEFINITION, a dict or None). Instances live in the
-connectors table: one per (key, company) for company-scoped connectors, one with company_id NULL for global ones.
-Secret fields never touch the table: they go to the vault as connector.<instance id>.<field>.
+Definitions come from the conn_*.py modules (each exports DEFINITIONS, a dict of key -> definition, or DEFINITION, a
+dict or None, keyed by the module name without conn_). Instances live in the connectors table: one per (key, company)
+for company-scoped connectors, one with company_id NULL for global ones. Secret fields never touch the table: they go
+to the vault as connector.<instance id>.<field>, except a field with "setting", which is the global setting of that
+name (a secret one is kept in the vault as settings.<name>, like the Settings page keeps it).
 
 This module owns:
 - instance CRUD and the dashboard API (setup cards, save and test, remove, OAuth sign-in start);
@@ -17,7 +19,12 @@ builtin), scope (global | company), setup {where_to_get_key, permissions, fields
 health(inst) -> (status, detail), optional metrics(inst, company) -> [(name, value, note)], tools(inst) for api
 kinds, mcp {command, args, env | url, headers, classify, allow, blocked} for MCP kinds, optional test_mode(inst).
 Optional extras this module also reads: health_timeout (seconds, default 15), oauth (bool, default true for
-mcp-http), tag_for_call(tool, args) -> tag or None and refuse_call(tool, args) -> str or None (checked by call()).
+mcp-http), tag_for_call(tool, args) -> tag or None and refuse_call(tool, args) -> str or None (checked by call()),
+metric_prefix (metric names become "<metric_prefix>.<name>"; default the key), launch(inst) -> (command, args) for a
+stdio server's command line, mcp_url(inst) and mcp_headers(inst) for an HTTP server's address and headers,
+active(inst) -> bool with parent and parent_field (the instance only works while its parent's card has that field
+ticked), enabled_by_default (bool, default true), beta (bool), and on fields: secret, hidden (kept off the card,
+such as api_base), type "bool" (stored as true or false) and setting (see above).
 
 Nothing here ever puts a secret in an event, a prompt, a tool result or a row: values come from the vault only
 inside connector code, and every text that leaves this module passes vault.redact as a backstop.
@@ -185,7 +192,8 @@ def instance(key: str, company: dict | None) -> dict | None:
 
 def visible(company) -> list[dict]:
     """Enabled instances a company can use: its own, plus global ones for keys it has no enabled instance of.
-    Instances of a definition that no longer exists are left out."""
+    Instances of a definition that no longer exists, and those whose definition says they are not active right
+    now (Stripe's MCP part while the Stripe card has use_mcp off), are left out."""
     cid = _cid(company) or -1
     rows = db.q("SELECT * FROM connectors WHERE enabled=1 AND (company_id IS NULL OR company_id=?) ORDER BY id",
                 (cid,))
@@ -195,8 +203,32 @@ def visible(company) -> list[dict]:
         if r["key"] not in DEFINITIONS or r["key"] in seen or (r["company_id"] is None and r["key"] in own):
             continue
         seen.add(r["key"])
-        out.append(_inst(r))
+        inst = _inst(r)
+        if _is_active(DEFINITIONS[r["key"]], inst):
+            out.append(inst)
     return out
+
+
+def _is_active(d: dict | None, inst: dict) -> bool:
+    """The definition's active(inst), when it has one. A rule that fails counts as off: nothing runs on a guess."""
+    fn = (d or {}).get("active")
+    if not callable(fn):
+        return True
+    try:
+        return bool(fn(inst))
+    except Exception as e:
+        print(f"Connector {inst.get('id')}: could not tell whether it is on: {_error_text(e)}")
+        return False
+
+
+def _inactive_text(d: dict | None) -> str:
+    """What the card and the Doctor say about an instance whose parent card has its switch off."""
+    d = d or {}
+    parent = DEFINITIONS.get(str(d.get("parent") or "")) or {}
+    field = next((f for f in _fields(parent) if f.get("key") == d.get("parent_field")), None)
+    if parent and field:
+        return f"Off: turn on \"{field.get('label') or field['key']}\" on the {_label(parent, d['parent'])} card."
+    return "Off: the connector it depends on has it turned off."
 
 
 def _active_rows() -> list[dict]:
@@ -205,9 +237,19 @@ def _active_rows() -> list[dict]:
                 "(c.company_id IS NULL OR co.status!='archived') ORDER BY c.id")
 
 
+def _fields(d: dict | None) -> list[dict]:
+    return [f for f in ((d or {}).get("setup") or {}).get("fields") or [] if isinstance(f, dict) and f.get("key")]
+
+
 def _secret_fields(d: dict | None) -> list[str]:
-    return [str(f["key"]) for f in ((d or {}).get("setup") or {}).get("fields") or []
-            if isinstance(f, dict) and f.get("secret") and f.get("key")]
+    """Secret fields kept in the vault per instance (connector.<id>.<field>). A field backed by a global setting
+    is not one of them: the setting holds it."""
+    return [str(f["key"]) for f in _fields(d) if f.get("secret") and not f.get("setting")]
+
+
+def _setting_fields(d: dict | None) -> dict[str, dict]:
+    """{field key: field} for fields that are really a global setting (Brave's key is settings.brave_api_key)."""
+    return {str(f["key"]): f for f in _fields(d) if f.get("setting")}
 
 
 def _vault_name(inst_id: int, field: str) -> str:
@@ -215,15 +257,22 @@ def _vault_name(inst_id: int, field: str) -> str:
 
 
 def secrets(inst: dict) -> dict:
-    """{field: value} for the definition's secret fields ("" when not set). Only connector code may see these."""
+    """{field: value} for the definition's secret fields ("" when not set). Only connector code may see these.
+    A secret field backed by a global setting is read from the settings (which resolve the vault marker)."""
     from . import vault   # imported here: vault imports db
+    d = DEFINITIONS.get(inst.get("key"))
     out = {}
-    for f in _secret_fields(DEFINITIONS.get(inst.get("key"))):
+    for f in _secret_fields(d):
         try:
             out[f] = vault.get(_vault_name(inst["id"], f)) or ""
         except Exception as e:   # a secret stored on another machine reads as unset; the vault row says why
             print(f"Connector {inst.get('id')}: the secret {f} could not be read: {_error_text(e)}")
             out[f] = ""
+    shared = {k: f for k, f in _setting_fields(d).items() if f.get("secret")}
+    if shared:
+        settings = db.get_settings()
+        for k, f in shared.items():
+            out[k] = str(settings.get(str(f["setting"])) or "")
     return out
 
 
@@ -269,6 +318,15 @@ def _service_names(company) -> list[str]:
         mode = _mode(inst)
         out.append(inst["key"] + (f" ({mode} mode)" if mode else ""))
     return out
+
+
+def _changed(company_id) -> None:
+    """A live refresh hint for open dashboards: a connector's state changed (health, settings, metrics, sign-in).
+    The dashboard reloads open connector cards on events whose type contains "connectors"."""
+    try:
+        bus.notify("connectors", company_id=company_id)
+    except Exception:   # a refresh hint must never break a check or a save
+        pass
 
 
 def mark_stale(inst_id: int) -> None:
@@ -337,9 +395,9 @@ def _fill(v, values: dict):
     return v
 
 
-def _mcp_settings(d: dict, inst: dict) -> dict:
-    """Keyword arguments for mcp.Client from the definition's mcp dict. Each setting may be a value or a
-    callable taking the instance; strings may carry {field} placeholders."""
+def _mcp_resolver(d: dict, inst: dict):
+    """A function that reads one setting of the definition's mcp dict for an instance: a value or a callable
+    taking the instance, with {field} placeholders filled from its config and secrets."""
     spec = d.get("mcp") or {}
     values = {k: v for k, v in inst["config"].items() if isinstance(v, (str, int, float))}
     values.update(secrets(inst))
@@ -349,15 +407,37 @@ def _mcp_settings(d: dict, inst: dict) -> dict:
         if callable(v):
             v = v(inst)
         return _fill(v, values)
+    return res
 
+
+def mcp_url(inst: dict) -> str:
+    """The address of an mcp-http instance's server: the definition's mcp_url(inst) when it has one (Stripe's
+    hidden mcp_url field for tests), else its mcp url setting. OAuth signs in to this address too."""
+    d = DEFINITIONS.get(inst.get("key")) or {}
+    if callable(d.get("mcp_url")):
+        return str(d["mcp_url"](inst) or "")
+    return str(_mcp_resolver(d, inst)("url") or "")
+
+
+def _mcp_settings(d: dict, inst: dict) -> dict:
+    """Keyword arguments for mcp.Client from the definition. The mcp dict gives command, args and env (stdio) or
+    url and headers (http); a definition's launch(inst) -> (command, args), mcp_url(inst) and mcp_headers(inst)
+    take precedence (Playwright's command override, Stripe's Bearer key)."""
+    res = _mcp_resolver(d, inst)
     if d.get("kind") == "mcp-stdio":
-        return {"transport": "stdio", "command": res("command"), "args": list(res("args") or []),
-                "env": res("env") or None}
+        if callable(d.get("launch")):
+            command, args = d["launch"](inst)
+        else:
+            command, args = res("command"), res("args")
+        return {"transport": "stdio", "command": command, "args": list(args or []), "env": res("env") or None}
+    headers = dict(res("headers") or {})
+    if callable(d.get("mcp_headers")):
+        headers.update(d["mcp_headers"](inst) or {})
     auth = None
     if _signed_in(inst):
         from . import oauth   # imported here: oauth talks to the vault and the network
-        auth = oauth.TokenSource(inst["id"])
-    return {"transport": "http", "url": res("url"), "headers": res("headers") or None, "auth": auth}
+        auth = oauth.TokenSource(inst["id"])   # a signed-in token replaces any Authorization header above
+    return {"transport": "http", "url": mcp_url(inst), "headers": headers or None, "auth": auth}
 
 
 def client(inst: dict):
@@ -608,6 +688,8 @@ def call(ctx, name: str, args: dict) -> str:
     inst = get(entry.get("instance_id"))
     if not inst or not inst["enabled"] or inst["key"] != key or inst["company_id"] not in (None, ctx.company["id"]):
         return f"ERROR: {_label(d, key)} is no longer connected for this company."
+    if not _is_active(d, inst):
+        return f"ERROR: {_label(d, key)} is turned off. {_inactive_text(d)}"
     args = dict(args or {})
     try:
         refusal = _hook(d, "refuse_call", tool, args)
@@ -649,6 +731,8 @@ def execute(payload: dict, company: dict | None = None) -> str:
     label = _label(d, inst["key"])
     if not inst["enabled"]:
         raise RuntimeError(f"{label} is turned off.")
+    if not _is_active(d, inst):
+        raise RuntimeError(f"{label} is turned off. {_inactive_text(d)}")
     args = payload.get("args") or {}
     if not isinstance(args, dict):
         raise RuntimeError("The arguments must be an object.")
@@ -735,17 +819,23 @@ def _alert(inst: dict, d: dict | None, detail: str) -> None:
         print(f"Connector alert failed: {_error_text(e)}")
 
 
-def check(inst: dict, alert: bool = False) -> tuple[str, str]:
+def check(inst: dict, alert: bool = False, even_off: bool = False) -> tuple[str, str]:
     """Health-check one instance and store the result. A bad result closes its MCP client; with alert=True (the
-    scheduled checks) it also sends the daily phone alert."""
+    scheduled checks) it also sends the daily phone alert. even_off=True (the card's Test button) checks a
+    turned-off instance too, so the owner can try a card before turning it on (Buffer ships turned off)."""
     d = DEFINITIONS.get(inst["key"])
     if not d:
         status, detail = "bad", GONE_TEXT
-    elif not inst.get("enabled"):
+    elif not inst.get("enabled") and not even_off:
         status, detail = "warn", OFF_TEXT
+    elif not _is_active(d, inst):
+        status, detail = "warn", _inactive_text(d)
     else:
         status, detail = _health(d, inst)
+        if not inst.get("enabled"):
+            detail = f"{detail.rstrip('. ')}. {OFF_TEXT}" if detail else OFF_TEXT
     db.update("connectors", inst["id"], status=status, detail=detail, last_check=db.now())
+    _changed(inst.get("company_id"))
     if status == "bad":
         _forget(inst["id"])
         if alert and d:
@@ -837,6 +927,8 @@ def doctor_rows() -> list[dict]:
         if cid is not None and (cid not in companies or companies[cid]["status"] == "archived"):
             continue
         d = DEFINITIONS.get(r["key"])
+        if d and not _is_active(d, _inst(r)):
+            continue   # switched off on its parent's card, like a turned-off instance: nothing to watch
         where = companies[cid]["name"] if cid is not None else "global"
         if not d:
             status, detail = "warn", GONE_TEXT
@@ -856,21 +948,23 @@ def _sync_doctor(removed: int | None = None) -> None:
     card without waiting for the next hourly run."""
     try:
         from . import doctor
-        doctor._merge(doctor_rows())
-        if removed is not None:
-            with doctor._lock:
-                doctor.LAST[:] = [r for r in doctor.LAST if r.get("key") != f"connector:{removed}"]
+        rows = doctor_rows()
+        doctor._merge(rows)
+        keep = {r["key"] for r in rows}
+        with doctor._lock:   # removed, turned off or switched off on a parent card: its row goes too
+            doctor.LAST[:] = [r for r in doctor.LAST if not re.fullmatch(r"connector:\d+", str(r.get("key")))
+                              or (r.get("key") in keep and r.get("key") != f"connector:{removed}")]
     except Exception as e:
         print(f"Connector rows could not reach the Doctor: {_error_text(e)}")
 
 
 # ---------------------------------------------------------------- metric pipes
 
-def _metric_name(key: str, name) -> str:
-    """Names come without the connector prefix and get "<key>."; a name that already has a namespace
-    (resend's email.sent_7d) keeps it."""
+def _metric_name(key: str, name, prefix: str | None = None) -> str:
+    """Names come without the connector prefix and get "<prefix>." (the definition's metric_prefix, else its
+    key: Resend's sent_7d becomes email.sent_7d); a name that already has a namespace keeps it."""
     name = re.sub(r"[^A-Za-z0-9_.]+", "_", str(name or "").strip()).strip("_.")[:60]
-    return name if "." in name else f"{key}.{name}"
+    return name if "." in name else f"{prefix or key}.{name}"
 
 
 def _companies_for(inst: dict) -> list[dict]:
@@ -894,8 +988,10 @@ def poll_metrics(only: int | None = None) -> list[dict]:
             continue
         d = DEFINITIONS.get(inst["key"]) or {}
         fn = d.get("metrics")
-        if not callable(fn) or (only is None and inst.get("status") == "bad"):
+        if not callable(fn) or (only is None and inst.get("status") == "bad") or not _is_active(d, inst):
             continue
+        prefix = str(d.get("metric_prefix") or inst["key"])
+        before = len(written)
         for company in _companies_for(inst):
             try:
                 values = _timed(fn, METRICS_TIMEOUT, inst, company) or []
@@ -912,10 +1008,12 @@ def poll_metrics(only: int | None = None) -> list[dict]:
                     value = float(value)
                 except (TypeError, ValueError):
                     continue
-                name, note = _metric_name(inst["key"], name), _clean(note, 300)
+                name, note = _metric_name(inst["key"], name, prefix), _clean(note, 300)
                 db.run("INSERT INTO metrics(company_id, agent_id, name, value, note, source, created_at) "
                        "VALUES(?,?,?,?,?,?,?)", (company["id"], None, name, value, note, inst["key"], ts))
                 written.append({"name": name, "value": value, "note": note, "company_id": company["id"]})
+        if len(written) > before:
+            _changed(inst.get("company_id"))
     return written
 
 
@@ -989,30 +1087,45 @@ def save(b: dict) -> tuple[dict, tuple[str, str]]:
     cfg_in = b.get("config") or {}
     if not isinstance(cfg_in, dict):
         raise HTTPError(400, "config must be an object of field values.")
-    fields = {str(f["key"]): f for f in (d.get("setup") or {}).get("fields") or [] if isinstance(f, dict)
-              and f.get("key")}
+    fields = {str(f["key"]): f for f in _fields(d)}
     secret_keys = set(_secret_fields(d))
+    setting_keys = _setting_fields(d)
     cfg = dict(existing["config"]) if existing else {}
     secret_changes: dict[str, str] = {}
+    setting_changes: dict[str, object] = {}
     for k, v in cfg_in.items():
         if k not in fields and k != "api_base":
             continue
+        f = fields.get(k) or {}
         if v is not None and not isinstance(v, (str, bool, int, float)):
-            raise HTTPError(400, f"{label}: {(fields.get(k) or {}).get('label') or k} must be a single value.")
+            raise HTTPError(400, f"{label}: {f.get('label') or k} must be a single value.")
+        if k in setting_keys:   # Brave's key: the global setting, never a copy under this instance
+            if v is None or (f.get("secret") and v == MASK):
+                continue
+            setting_changes[k] = str(v).strip() if isinstance(v, str) else v
+            continue
         if k in secret_keys:
             if v is None or v == MASK:
                 continue
             secret_changes[k] = str(v).strip()
             continue
+        if f.get("type") == "bool":
+            cfg[k] = _truthy(v)
+            continue
         if isinstance(v, str):
             v = v.strip()[:2000]
-        if k == "api_base" and v and not re.match(r"https?://", str(v)):
-            raise HTTPError(400, "api_base must start with http:// or https://")
+        if (k == "api_base" or (f.get("hidden") and k.endswith("url"))) and v and not re.match(r"https?://", str(v)):
+            raise HTTPError(400, f"{k} must start with http:// or https://")
         if v is None or v == "":
             cfg.pop(k, None)
         else:
             cfg[k] = v
-    enabled = _truthy(b["enabled"]) if "enabled" in b else bool(existing["enabled"]) if existing else True
+    if existing is None:   # a new card starts on, unless its definition ships it turned off (Buffer's beta)
+        enabled = _truthy(b["enabled"]) if "enabled" in b else bool(d.get("enabled_by_default", True))
+    else:
+        enabled = _truthy(b["enabled"]) if "enabled" in b else bool(existing["enabled"])
+    if setting_changes:
+        _save_settings(setting_keys, setting_changes)
     created = existing is None
     if created:
         iid = db.run("INSERT INTO connectors(company_id, key, enabled, config, status, detail, created_at) "
@@ -1033,8 +1146,44 @@ def save(b: dict) -> tuple[dict, tuple[str, str]]:
         raise HTTPError(400, f"The vault could not store the secret: {_error_text(e)}") from None
     _forget(iid)   # new settings or a new key: the next call connects afresh (and a disabled one is closed)
     health = check(get(iid))
+    _children_changed(key, cid)
     _sync_doctor()
+    _changed(cid)
     return get(iid), health
+
+
+def _save_settings(setting_keys: dict[str, dict], changes: dict) -> None:
+    """Fields backed by global settings: a secret one goes to the vault the way the Settings page stores it (the
+    settings table keeps the vault:settings.<name> marker; an empty value deletes it), any other one is saved as
+    the setting itself."""
+    from . import server   # imported here: the Settings page's secret routing lives there
+    values: dict = {}
+    try:
+        for k, v in changes.items():
+            name = str(setting_keys[k]["setting"])
+            if setting_keys[k].get("secret") or name in config.SECRET_SETTINGS:
+                stored = server._secret_field(f"settings.{name}", v)
+                if stored is not None:
+                    values[name] = stored
+            else:
+                values[name] = v
+        if values:
+            db.set_settings(values)
+    except ValueError as e:   # validate_settings refused a value; a VaultError is not a ValueError
+        raise HTTPError(400, str(e)) from None
+    except Exception as e:
+        raise HTTPError(400, f"The setting could not be saved: {_error_text(e)}") from None
+    bus.notify("settings")
+
+
+def _children_changed(key: str, company_id) -> None:
+    """A card other cards depend on was saved (Stripe, whose use_mcp switches Stripe's MCP part on and off): their
+    instances in the same place are checked again on the scheduler's next tick, and drop any open client."""
+    for child, cd in DEFINITIONS.items():
+        if cd.get("parent") != key:
+            continue
+        for r in db.q("SELECT id FROM connectors WHERE key=? AND company_id IS ?", (child, company_id)):
+            mark_stale(r["id"])
 
 
 def remove(inst_id: int) -> None:
@@ -1060,6 +1209,7 @@ def remove(inst_id: int) -> None:
         _alerted.pop(iid, None)
         _client_locks.pop(iid, None)
     _sync_doctor(removed=iid)
+    _changed(inst.get("company_id"))
 
 
 def _card_tools(key: str, d: dict) -> list[dict]:
@@ -1077,11 +1227,22 @@ def _card_tools(key: str, d: dict) -> list[dict]:
 
 
 def _card(key: str, d: dict) -> dict:
+    setup = _jsonable(d.get("setup") or {})
+    shown = []
+    for f in setup.get("fields") or []:
+        if isinstance(f, dict):   # flags the dashboard reads: hidden fields (api_base, mcp_url) stay off the card
+            f.update(secret=bool(f.get("secret")), hidden=bool(f.get("hidden")), type=str(f.get("type") or "text"))
+            shown.append(f)
+    setup["fields"] = shown
     return {"key": key, "label": _label(d, key), "category": d.get("category") or "", "kind": d.get("kind") or "",
-            "scope": d.get("scope") or "company", "setup": _jsonable(d.get("setup") or {}),
+            "scope": d.get("scope") or "company", "setup": setup,
             "tools": _card_tools(key, d), "blocked": sorted(_blocked(d)),
             "oauth": bool(d.get("oauth", d.get("kind") == "mcp-http")), "has_metrics": callable(d.get("metrics")),
-            "has_test_mode": callable(d.get("test_mode"))}
+            "has_test_mode": callable(d.get("test_mode")), "beta": bool(d.get("beta")),
+            "note": str((d.get("setup") or {}).get("note") or ""),
+            "enabled_by_default": bool(d.get("enabled_by_default", True)),
+            "parent": d.get("parent") or None, "parent_field": d.get("parent_field") or None,
+            "hidden_fields": [f["key"] for f in shown if f["hidden"]]}
 
 
 def _latest_metrics(inst: dict, company_id: int | None = None) -> list[dict]:
@@ -1096,10 +1257,16 @@ def public(inst: dict, company_id: int | None = None) -> dict:
     """An instance for the dashboard: config with secret fields shown as the mask (or "" when not set)."""
     d = DEFINITIONS.get(inst["key"]) or {}
     secret_keys = _secret_fields(d)
-    cfg = {k: v for k, v in inst["config"].items() if k not in secret_keys}
-    have = secrets(inst) if secret_keys else {}
+    setting_keys = _setting_fields(d)
+    cfg = {k: v for k, v in inst["config"].items() if k not in secret_keys and k not in setting_keys}
+    have = secrets(inst) if secret_keys or setting_keys else {}
     for k in secret_keys:
         cfg[k] = MASK if have.get(k) else ""
+    if setting_keys:
+        settings = db.get_settings()
+        for k, f in setting_keys.items():
+            value = settings.get(str(f["setting"]))
+            cfg[k] = (MASK if value else "") if f.get("secret") else ("" if value is None else value)
     company = db.get_company(inst["company_id"]) if inst.get("company_id") is not None else None
     oauth = bool(d.get("oauth", d.get("kind") == "mcp-http"))
     return {"id": inst["id"], "company_id": inst.get("company_id"),
@@ -1142,7 +1309,7 @@ def api_connector_save(h, m, body):
 @route("POST", r"/api/connectors/(\d+)/test")
 def api_connector_test(h, m, body):
     inst = _inst_or_404(m.group(1))
-    status, detail = check(inst)
+    status, detail = check(inst, even_off=True)   # Test works on a card that is still turned off
     metrics = poll_metrics(only=inst["id"]) if status == "ok" else []
     _sync_doctor()
     return {"health": {"status": status, "detail": detail}, "metrics": metrics}
@@ -1168,7 +1335,9 @@ def api_connector_oauth_start(h, m, body):
 # ---------------------------------------------------------------- definitions
 
 def _load_definitions() -> None:
-    """Collect DEFINITION from each conn_*.py module. Runs last, so a definition module may import this one."""
+    """Collect the definitions of each conn_*.py module: its DEFINITIONS dict (key -> definition; conn_stripe has
+    stripe and stripe_mcp), else its DEFINITION keyed by the module name. Runs last, so a definition module may
+    import this one."""
     for name in MODULES:
         try:
             mod = importlib.import_module(f"{__package__}.{name}")
@@ -1179,14 +1348,47 @@ def _load_definitions() -> None:
         except Exception as e:   # a broken connector must not stop Holdco from starting
             print(f"Connector module {name} could not load: {type(e).__name__}: {e}")
             continue
-        d = getattr(mod, "DEFINITION", None)
-        if not isinstance(d, dict):
-            continue
-        key = str(d.get("key") or name.removeprefix("conn_"))
-        if d.get("kind") not in KINDS or d.get("scope", "company") not in SCOPES:
-            print(f"Connector {key}: kind or scope is not valid; skipped.")
-            continue
-        DEFINITIONS[key] = d
+        many = getattr(mod, "DEFINITIONS", None)
+        if isinstance(many, dict):
+            found = [(str(k), d) for k, d in many.items()]
+        else:
+            d = getattr(mod, "DEFINITION", None)
+            found = [(str((d or {}).get("key") or name.removeprefix("conn_")), d)] if isinstance(d, dict) else []
+        for key, d in found:
+            _add(key, d)
+    _add_test_definition()
+
+
+def _add(key: str, d) -> None:
+    if not isinstance(d, dict):
+        return
+    if d.get("kind") not in KINDS or d.get("scope", "company") not in SCOPES:
+        print(f"Connector {key}: kind or scope is not valid; skipped.")
+        return
+    DEFINITIONS[key] = d
+
+
+def _add_test_definition() -> None:
+    """Test only: HOLDCO_TEST_MCP=<http://127.0.0.1:port/mcp> adds a global mcp-http connector "fakemcp" pointing at
+    the test suite's fake MCP server (tests/fake_mcp_server.py), so the end-to-end test can sign in to it through
+    OAuth. Like HOLDCO_ALLOW_LOCAL it is empty on a real install, and only a local address is accepted."""
+    url = (os.environ.get("HOLDCO_TEST_MCP") or "").strip()
+    if not url:
+        return
+    if not re.match(r"^http://(127\.0\.0\.1|localhost)(:\d+)?/", url + "/"):
+        print("HOLDCO_TEST_MCP must be a local http:// address (it is for the test suite only); ignored.")
+        return
+    _add("fakemcp", {
+        "label": "Test MCP server", "category": "Test", "kind": "mcp-http", "scope": "global", "oauth": True,
+        "setup": {"where_to_get_key": "Nothing: this card exists only while the test suite runs Holdco.",
+                  "permissions": [], "fields": [], "test_mode": "Test only.", "docs_url": "",
+                  "agents_can": ["Echo text and add numbers (test tools)"]},
+        "health": _mcp_health,
+        "mcp": {"url": url, "headers": {},
+                "classify": [("echo", "read"), ("add", "read"), ("image", "read"), ("fail", "read"),
+                             ("slow", "read")],
+                "allow": {"*": ["*"]}, "blocked": []},
+    })
 
 
 _load_definitions()

@@ -343,7 +343,8 @@ def _deploy_netlify(company: dict) -> str:
         site_id = site["id"]
         cs["netlify_site_id"] = site_id
         cs["site_url"] = site.get("ssl_url") or site.get("url", "")
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        # Only these keys: cs holds the resolved Netlify token, which must never go back into the table.
+        db.update_company_settings(company["id"], netlify_site_id=site_id, site_url=cs["site_url"])
     req = urllib.request.Request(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
                                  method="POST", headers={**auth, "Content-Type": "application/zip"})
     try:
@@ -353,8 +354,7 @@ def _deploy_netlify(company: dict) -> str:
         raise RuntimeError(f"Netlify deploy failed: HTTP {e.code} {e.read(300).decode('utf-8', 'replace')}") from None
     url = info.get("ssl_url") or info.get("url") or cs.get("site_url", "")
     if url:
-        cs["site_url"] = url
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        db.update_company_settings(company["id"], site_url=url)
     return f"Website deployed: {url}"
 
 

@@ -295,7 +295,8 @@ def _state(company: dict) -> dict:
     # ---- email: the emails table only has outgoing rows for mail that really left
     out_rows = db.q("SELECT to_addr, created_at FROM emails WHERE company_id=? AND direction='out'", (cid,))
     in_rows = db.q("SELECT from_addr, created_at FROM emails WHERE company_id=? AND direction='in'", (cid,))
-    connected = emailer.smtp_configured(cs)
+    out = emailer.outbound(company, cs)   # SMTP, or Resend (Phase 1) when that is how mail goes out
+    connected = out is not None
     inbox = emailer.imap_configured(cs)
     today = db.now()[:10]   # the daily limit in tools.send_email counts by this (UTC) date too
     sent_today = sum(1 for r in out_rows if (r["created_at"] or "") >= today)
@@ -304,9 +305,10 @@ def _state(company: dict) -> dict:
         limit = int(cs.get("daily_email_limit") or 20)
     except (TypeError, ValueError):
         limit = 20
-    sender = str(cs.get("smtp_from") or cs.get("smtp_user") or "")
+    sender = (out or {}).get("sender") or str(cs.get("smtp_from") or cs.get("smtp_user") or "")
     if connected:
-        line = (f"Email: connected, sending as {sender}. Sent today: {sent_today} of {limit}. Sent in total: "
+        via = " through Resend" if out["via"] == "resend" else ""
+        line = (f"Email: connected, sending as {sender}{via}. Sent today: {sent_today} of {limit}. Sent in total: "
                 f"{len(out_rows)}. Replies received: {len(in_rows)}.")
         if em_pending:
             line += f" {_plural(len(em_pending), 'email')} waiting for the owner's approval."
@@ -2016,8 +2018,7 @@ def _action_problem(ctx: Ctx, kind: str, deliverable: str) -> str | None:
     file_note = (f" A file such as {d} does not count." if d and ("/" in d or "." in d) and " " not in d
                  else " A file does not count.")
     extra = ""
-    if kind == "outreach" and not emailer.smtp_configured(db.company_settings(db.get_company(ctx.company["id"])
-                                                                              or ctx.company)):
+    if kind == "outreach" and emailer.outbound(db.get_company(ctx.company["id"]) or ctx.company) is None:
         extra = (" Email is not connected; this task cannot run yet. Ask the owner for a mailbox once, or finish "
                  "with status 'blocked'.")
     return (f"this is {article} {kind} task: it is done only when the {noun} really happens, and no {noun} has been "
@@ -2329,8 +2330,7 @@ def task_guard(ctx: Ctx, kind: str, title: str) -> str | None:
     allowed: without a webhook an approved post still becomes a link the owner posts by hand."""
     try:
         if kind == "outreach":
-            cs = db.company_settings(db.get_company(ctx.company["id"]) or ctx.company)
-            if not emailer.smtp_configured(cs):
+            if emailer.outbound(db.get_company(ctx.company["id"]) or ctx.company) is None:   # SMTP or Resend
                 return ("ERROR: Email is not connected; this task cannot run yet. Ask the owner for a mailbox once, "
                         "or plan work that does not need email.")
     except Exception as e:
@@ -2628,15 +2628,7 @@ _scan_lock = threading.Lock()
 
 
 def _mark_scanned(cid: int) -> None:
-    c = db.get_company(cid)
-    if not c:
-        return
-    try:
-        s = json.loads(c.get("settings") or "{}")
-    except ValueError:
-        s = {}
-    s["truth_scan_done"] = True
-    db.update("companies", cid, settings=json.dumps(s))
+    db.update_company_settings(cid, truth_scan_done=True)   # the stored JSON only: vault markers stay markers
 
 
 def scan_existing(company: dict) -> list[str]:

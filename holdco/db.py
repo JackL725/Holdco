@@ -243,16 +243,23 @@ def get_settings() -> dict:
     return _resolve_secrets(s)
 
 
+_secret_warned: set[str] = set()   # vault names whose read failure was already printed
+
+
 def _resolve_secrets(s: dict) -> dict:
-    """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing)."""
+    """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing).
+    The result holds real secrets: never write it back to a table (update_company_settings does that safely)."""
     names = [k for k, v in s.items() if isinstance(v, str) and v.startswith("vault:")]
     if names:
         from . import vault   # imported here: vault imports db
         for k in names:
+            name = s[k][len("vault:"):]
             try:
-                s[k] = vault.get(s[k][len("vault:"):]) or ""
+                s[k] = vault.get(name) or ""
             except Exception as e:   # a foreign-machine secret: treat as unset, the Doctor's vault row says why
-                print(f"Vault: {k}: {e}")
+                if name not in _secret_warned:   # once per secret: settings are read many times a minute
+                    _secret_warned.add(name)
+                    print(f"Vault: {k}: {e}")
                 s[k] = ""
     return s
 
@@ -312,12 +319,44 @@ def set_settings(values: dict) -> dict:
 # ---------- companies ----------
 
 def company_settings(company: dict) -> dict:
+    """A company's settings over the defaults, with vault markers resolved to the secrets themselves. For reading
+    only: writing this back would put the secrets in the table in plain text (use update_company_settings)."""
     s = dict(config.DEFAULT_COMPANY_SETTINGS)
     try:
         s.update(json.loads(company.get("settings") or "{}"))
     except ValueError:
         pass
     return _resolve_secrets(s)
+
+
+def update_company_settings(company_id: int, **changes) -> dict:
+    """Merge changes into a company's stored settings JSON and write it back. The stored JSON is loaded as it is
+    (vault markers stay markers, defaults are not added), so no resolved secret is ever written. A secret key among
+    the changes (config.SECRET_COMPANY_SETTINGS) goes to the vault and only its marker is stored; an empty value
+    deletes it. Returns the stored settings."""
+    marker = "vault:"
+    if any(k in config.SECRET_COMPANY_SETTINGS for k in changes):
+        from . import vault   # imported here: vault imports db. Before the lock: vault.migrate locks vault, then db
+        for k in config.SECRET_COMPANY_SETTINGS:
+            v = changes.get(k)
+            if not isinstance(v, str) or v.startswith(marker):
+                continue
+            name = f"company.{company_id}.{k}"
+            if v:
+                vault.put(name, v)
+                changes[k] = marker + name
+            else:
+                vault.delete(name)
+    with _lock:   # read, merge and write in one go, so a change made meanwhile is not lost
+        row = one("SELECT settings FROM companies WHERE id=?", (company_id,))
+        if not row:
+            return {}
+        stored = loads(row.get("settings"), {}) or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored.update(changes)
+        run("UPDATE companies SET settings=? WHERE id=?", (json.dumps(stored), company_id))
+        return stored
 
 
 def effective_policy(company: dict, action: str) -> str:

@@ -39,17 +39,10 @@ def _today() -> str:
 
 
 def update_company_settings(company_id: int, **values) -> dict:
-    """Merge values into a company's stored settings JSON (only the stored keys, never the defaults)."""
+    """Merge values into a company's stored settings JSON (only the stored keys, never the defaults, and vault
+    markers stay markers: see db.update_company_settings)."""
     with _settings_lock:
-        row = db.one("SELECT settings FROM companies WHERE id=?", (company_id,))
-        if not row:
-            return {}
-        stored = db.loads(row.get("settings"), {}) or {}
-        if not isinstance(stored, dict):
-            stored = {}
-        stored.update(values)
-        db.update("companies", company_id, settings=json.dumps(stored))
-        return stored
+        return db.update_company_settings(company_id, **values)
 
 
 def _age(created_at: str | None) -> str:

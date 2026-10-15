@@ -277,10 +277,10 @@ def _config(row: dict) -> dict:
 
 def _server_url(row: dict, cfg: dict) -> str:
     url = str(cfg.get("url") or "").strip()
-    if not url:   # a definition may carry the URL itself (a hosted server everyone shares)
+    if not url:   # the address the connector framework connects to: the definition's mcp_url(inst) or mcp url
         try:
             from . import connectors
-            url = str((((connectors.DEFINITIONS.get(row.get("key")) or {}).get("mcp")) or {}).get("url") or "")
+            url = connectors.mcp_url({**row, "config": cfg})
         except Exception:
             url = ""
     if not url:
@@ -396,6 +396,8 @@ def finish(query: dict) -> dict:
     try:   # the framework drops its cached client and tool list, so the next call signs in with the new token
         from . import connectors
         connectors.mark_stale(cid)
+        company_id = (db.one("SELECT company_id FROM connectors WHERE id=?", (cid,)) or {}).get("company_id")
+        connectors._changed(company_id)   # open dashboards reload the card ("Signed in")
     except Exception:
         pass
     return db.one("SELECT * FROM connectors WHERE id=?", (cid,)) or {"id": cid}

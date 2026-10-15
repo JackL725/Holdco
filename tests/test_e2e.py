@@ -2,35 +2,60 @@
 
 Covers founding from a template, the 24/7 scheduler, approvals, chat, QA review with the deliverable check,
 recurring duties, restart recovery, the prompt-based tool fallback, the OpenAI-compatible backend, pausing,
-security checks and deletion.
+security checks and deletion; Phase 1 adds connectors and the vault, the Stripe gate (a payment link created by an
+agent, opened by browser_check, a test purchase polled in as revenue), Resend and Buffer behind approvals, and an
+OAuth sign-in to an MCP server. The outside services are fakes on 127.0.0.1.
 """
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import sys
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tests.fake_buffer import FakeBuffer  # noqa: E402
+from tests.fake_mcp_server import FakeMCPHttp  # noqa: E402
+from tests.fake_oauth import FakeOAuth  # noqa: E402
 from tests.fake_ollama import FakeModelServer  # noqa: E402
+from tests.fake_resend import FakeResend  # noqa: E402
+from tests.fake_stripe import FakeStripe  # noqa: E402
 from tests.fake_telegram import FakeTelegram  # noqa: E402
 from tests.helpers import HoldcoProcess, free_port, wait_for  # noqa: E402
+
+MASK = "\u2022" * 8
+STRIPE_KEY = "sk_test_e2e" + secrets.token_hex(10)
+RESEND_KEY = "re_e2e" + secrets.token_hex(10)
 
 
 class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FakeModelServer(delay=0.05).start()
-        cls.app = HoldcoProcess().start()
+        # Phase 1: the outside services the connectors talk to, all on 127.0.0.1.
+        cls.stripe = FakeStripe().start()
+        cls.resend = FakeResend(domains=("pawplan.example",)).start()
+        cls.buffer = FakeBuffer().start()
+        cls.oauth = FakeOAuth().start()
+        cls.mcp = FakeMCPHttp(auth_base=cls.oauth.url).start()
+        cls.app = HoldcoProcess(env={
+            "HOLDCO_VAULT_BACKEND": "file",            # never touch the developer's keyring
+            "HOLDCO_ALLOW_LOCAL": "127.0.0.1:*",       # the fakes count as public sites (test only)
+            "HOLDCO_METRICS_POLL_SECONDS": "1", "HOLDCO_CONNECTOR_CHECK_SECONDS": "5",
+            "HOLDCO_TEST_MCP": cls.mcp.mcp_url,        # adds the test-only "fakemcp" connector (test_29)
+        }).start()
         cls.api = cls.app.client
         cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "max_concurrent_runs": 2})
 
     @classmethod
     def tearDownClass(cls):
         cls.app.stop()
-        cls.model.stop()
+        for fake in (cls.model, cls.stripe, cls.resend, cls.buffer, cls.mcp, cls.oauth):
+            fake.stop()
 
     def tearDown(self):
         problems = [line for line in self.app.log().splitlines() if "Traceback" in line]
@@ -478,6 +503,205 @@ class EndToEnd(unittest.TestCase):
         stages = [e["data"].get("stage") for e in reversed(self.api.get(
             f"/api/events?company_id={self.cid}&kinds=founding&limit=300")["events"]) if e["data"].get("stage")]
         self.assertEqual(stages[:4], ["research", "charter", "critic", "plan"])
+
+
+    # ---------------------------------------------------------------- phase 1: connect
+    def connector(self, iid):
+        rows = self.api.get(f"/api/connectors?company_id={self.cid}")["instances"]
+        return next((i for i in rows if i["id"] == iid), None)
+
+    def test_26_connectors_api_and_vault(self):
+        out = self.api.post("/api/connectors", {"key": "stripe", "company_id": self.cid, "enabled": True,
+                                                "config": {"api_key": STRIPE_KEY, "api_base": self.stripe.url}})
+        self.assertEqual(out["health"], {"status": "ok", "detail": "test mode, balance available"})
+        inst = out["instance"]
+        type(self).stripe_id = inst["id"]
+        self.assertEqual((inst["key"], inst["company_id"], inst["mode"], inst["enabled"]),
+                         ("stripe", self.cid, "test", True))
+        listing = self.api.get(f"/api/connectors?company_id={self.cid}")
+        self.assertEqual(self.connector(inst["id"])["config"]["api_key"], MASK)
+        self.assertEqual(listing["statuses"][str(inst["id"])]["status"], "ok")
+        card = listing["definitions"]["stripe"]
+        self.assertTrue(any(f["key"] == "api_base" and f["hidden"] for f in card["setup"]["fields"]))
+        self.assertIn("stripe_mcp", listing["definitions"])
+        self.assertTrue(listing["definitions"]["buffer"]["beta"])
+        self.assertNotIn(STRIPE_KEY, str(listing))
+        # the key is in the vault, and nowhere in the database
+        data = Path(self.app.data_dir)
+        self.assertTrue((data / "vault.json").exists())
+        self.assertNotIn(STRIPE_KEY, (data / "vault.json").read_text(encoding="utf-8"))
+        db = sqlite3.connect(str(data / "holdco.db"))
+        try:
+            for table in ("settings", "companies", "connectors"):
+                for row in db.execute(f"SELECT * FROM {table}").fetchall():
+                    self.assertNotIn(STRIPE_KEY, " ".join(str(x) for x in row), table)
+        finally:
+            db.close()
+        for f in ("holdco.db", "holdco.db-wal"):
+            if (data / f).exists():
+                self.assertNotIn(STRIPE_KEY.encode(), (data / f).read_bytes(), f)
+        rows = {r["key"]: r for r in self.api.get("/api/doctor")["checks"]}
+        self.assertEqual(rows[f"connector:{inst['id']}"]["status"], "ok", rows.get(f"connector:{inst['id']}"))
+        self.assertEqual(rows["vault"]["status"], "ok", rows["vault"])
+
+    def test_27_stripe_gate(self):
+        cid = self.cid
+        self.api.patch(f"/api/companies/{cid}", {"settings": {"policies": {"connector_publish": "auto"}}})
+        try:
+            forge = self.agent(cid, "engineering")
+            t = self.api.post(f"/api/companies/{cid}/tasks", {
+                "title": "Create a payment link for the Starter plan", "agent_id": forge["id"], "priority": 1,
+                "description": "Use the Stripe connector. $19 per month.",
+                "deliverable": "Stripe payment link (URL in the handoff)",
+                "acceptance": "- the link is live in Stripe test mode\n- browser_check on the link returns 200"})["task"]
+            done = wait_for(lambda: next((x for x in self.tasks(cid) if x["id"] == t["id"] and x["status"] == "done"),
+                                         None), 90, what="the payment link task")
+        finally:
+            self.api.patch(f"/api/companies/{cid}", {"settings": {"policies": {}}})
+        link = f"{self.stripe.url}/pay/plink_1"
+        self.assertIn(link, done["result"])
+        # the transcript: find_tool, then the Stripe tool, then browser_check, in that order
+        transcript = self.last_transcript(cid, forge["id"], t["id"])
+        names = [m["name"] for m in transcript if m["role"] == "tool"]
+        self.assertEqual([n for n in names if n in ("find_tool", "stripe__create_payment_link", "browser_check")],
+                         ["find_tool", "stripe__create_payment_link", "browser_check"], names)
+        results = {m["name"]: m["content"] for m in transcript if m["role"] == "tool"}
+        self.assertTrue(results["find_tool"].splitlines()[0].startswith("stripe__create_payment_link [publish]"),
+                        results["find_tool"])
+        self.assertIn("Loaded: stripe__create_payment_link", results["find_tool"])
+        self.assertIn(f"Created payment link {link}", results["stripe__create_payment_link"])
+        check = results["browser_check"]
+        self.assertTrue(check.startswith("Static check only: Playwright is not set up"), check)
+        self.assertIn(f"GET {link} -> 200", check)
+        self.assertIn("Title: Starter plan", check)
+        self.assertIn("form found", check)
+        # Stripe got a product, a monthly price and a link, once each; the link is live
+        self.assertEqual([r["path"] for r in self.stripe.posts()], ["/v1/products", "/v1/prices", "/v1/payment_links"])
+        self.assertEqual(self.stripe.posts("/v1/prices")[0]["body"]["recurring"], {"interval": "month"})
+        self.assertEqual(self.stripe.posts("/v1/prices")[0]["body"]["unit_amount"], "1900")
+        self.assertTrue(self.stripe.links["plink_1"]["active"])
+        # audited like any outbound action, approved by the policy
+        audit = [r for r in self.api.get(f"/api/audit?company_id={cid}")["audit"] if r["action"] == "connector_call"]
+        self.assertTrue(audit, "no connector_call audit row")
+        row = audit[0]
+        self.assertEqual((row["approved_by"], row["payload"]["tag"], row["payload"]["tool"]),
+                         ("policy:auto", "publish", "create_payment_link"))
+        self.assertIn(link, row["result"])
+        # a test purchase shows up as revenue with nobody typing it
+        self.stripe.add_charge(amount=1900, currency="usd", paid=True)
+
+        def revenue():
+            rows = self.api.get(f"/api/companies/{cid}/metrics")["metrics"]
+            hit = next((r for r in rows if r["name"] == "stripe.revenue_usd_30d"), None)
+            return rows if hit and hit["value"] == 19.0 else None
+        rows = wait_for(revenue, 30, what="the polled Stripe revenue")
+        latest = {}
+        for r in rows:   # newest first
+            latest.setdefault(r["name"], r)
+        rev = latest["stripe.revenue_usd_30d"]
+        self.assertEqual((rev["value"], rev["source"], rev["agent_id"]), (19.0, "stripe", None))
+        self.assertEqual(latest["stripe.payments_30d"]["value"], 1.0)
+        self.assertIn("stripe.customers", latest)
+        self.assertEqual(latest["stripe.mrr_usd"]["value"], 0.0)
+        self.assertTrue(all(r["source"] == "stripe" for r in rows if r["name"].startswith("stripe.")))
+        tile = next(m for m in self.api.get(f"/api/companies/{cid}")["metrics"] if m["name"] == "stripe.revenue_usd_30d")
+        self.assertEqual(tile["source"], "stripe")
+        # no agent typed a Stripe number in
+        for run in self.api.get(f"/api/companies/{cid}/runs")["runs"]:
+            for m in self.api.get(f"/api/runs/{run['id']}")["run"]["transcript"]:
+                for c in m.get("tool_calls") or []:
+                    if c.get("name") == "record_metric":
+                        self.assertFalse(str((c.get("arguments") or {}).get("name", "")).startswith("stripe."), c)
+
+    def test_28_resend_and_buffer(self):
+        cid = self.cid
+        out = self.api.post("/api/connectors", {"key": "resend", "company_id": cid, "enabled": True, "config": {
+            "api_key": RESEND_KEY, "from_address": "hello@pawplan.example", "from_name": "PawPlan",
+            "api_base": self.resend.url}})
+        self.assertEqual(out["health"], {"status": "ok", "detail": "pawplan.example verified"})
+        self.assertTrue(self.api.get(f"/api/companies/{cid}")["email_ready"])   # Resend counts without SMTP
+        out = self.api.post("/api/connectors", {"key": "buffer", "company_id": cid, "enabled": True, "config": {
+            "api_key": self.buffer.token, "api_base": self.buffer.url}})
+        self.assertEqual(out["health"]["status"], "ok", out["health"])
+        self.assertTrue(out["instance"]["enabled"])
+
+        def pending(action):
+            rows = [a for a in self.pending(cid) if a["action"] == action]
+            return rows[0] if rows else None
+        email = pending("send_email")
+        if email is None:   # the earlier one was decided: Hunter queues another
+            hunter = self.agent(cid, "sales")
+            self.api.post(f"/api/companies/{cid}/tasks", {"title": "Find 20 more leads", "agent_id": hunter["id"],
+                                                          "priority": 1})
+            email = wait_for(lambda: pending("send_email"), 60, what="Hunter's email request")
+        r = self.api.post(f"/api/approvals/{email['id']}", {"decision": "approve"})["approval"]
+        self.assertEqual(r["status"], "done", r)
+        self.assertIn("through Resend", r["result"])
+        sent = [x for x in self.resend.sent if x["body"]["to"] == email["payload"]["to"]]
+        self.assertEqual(len(sent), 1, self.resend.sent)
+        self.assertEqual(sent[0]["body"]["subject"], email["payload"]["subject"])
+        self.assertTrue(sent[0]["idempotency_key"])
+        self.assertIn("Message-ID", sent[0]["body"]["headers"])
+        rows = [e for e in self.api.get(f"/api/companies/{cid}/emails")["emails"]
+                if e["direction"] == "out" and e["uid"] == sent[0]["id"]]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["message_id"], sent[0]["body"]["headers"]["Message-ID"])
+
+        post = pending("social_post")
+        if post is None:
+            echo = self.agent(cid, "marketing")
+            self.api.post(f"/api/companies/{cid}/tasks", {"title": "Write launch post for Buffer",
+                                                          "agent_id": echo["id"], "priority": 1})
+            post = wait_for(lambda: pending("social_post"), 60, what="Echo's social post request")
+        r = self.api.post(f"/api/approvals/{post['id']}", {"decision": "approve"})["approval"]
+        self.assertEqual(r["status"], "done", r)
+        self.assertIn("Buffer", r["result"])
+        self.assertEqual(len(self.buffer.posts), 1, self.buffer.posts)
+        self.assertEqual(self.buffer.posts[0]["input"]["channelId"], "chan_x")
+        self.assertEqual(self.buffer.posts[0]["input"]["text"], post["payload"]["content"])
+        audit: dict = {}
+        for row in self.api.get(f"/api/audit?company_id={cid}&limit=100")["audit"]:   # newest first
+            audit.setdefault(row["approval_id"], row)
+        self.assertIn("through Resend", audit[email["id"]]["result"])
+        self.assertEqual((audit[email["id"]]["action"], audit[email["id"]]["approved_by"]), ("send_email", "owner"))
+        self.assertEqual((audit[post["id"]]["action"], audit[post["id"]]["approved_by"]), ("social_post", "owner"))
+        self.assertNotIn(RESEND_KEY, str(audit))
+
+    def test_29_mcp_oauth_round_trip(self):
+        self.assertIn("fakemcp", self.api.get("/api/connectors")["definitions"])
+        out = self.api.post("/api/connectors", {"key": "fakemcp", "company_id": None, "enabled": True, "config": {}})
+        iid = out["instance"]["id"]
+        try:
+            self.assertEqual(out["health"]["status"], "bad")   # the server asks for a sign-in first
+            self.assertIn("Sign in", out["health"]["detail"])
+            url = self.api.post(f"/api/connectors/{iid}/oauth/start")["url"]
+            self.assertTrue(url.startswith(self.oauth.url + "/authorize?"), url)
+            # the browser's part: the authorization server redirects to the real dashboard's /oauth/callback
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(url, timeout=30) as r:
+                final, page = r.geturl(), r.read().decode("utf-8")
+            self.assertTrue(final.startswith(f"http://127.0.0.1:{self.app.port}/oauth/callback?"), final)
+            self.assertIn("Connected Test MCP server", page)
+            ready = wait_for(lambda: (lambda i: i if i and i["status"] == "ok" else None)(self.connector(iid)), 30,
+                             what="the signed-in MCP connector to turn ok")
+            self.assertTrue(ready["signed_in"])
+            self.assertEqual(len(self.oauth.tokens), 1)
+            # an agent loads the server's tool with find_tool and calls it with the bearer token
+            scout = self.agent(self.cid, "research")
+            t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Echo through the test MCP server",
+                                                                  "agent_id": scout["id"], "priority": 1})["task"]
+            wait_for(lambda: next((x for x in self.tasks(self.cid) if x["id"] == t["id"] and x["status"] == "done"),
+                                  None), 60, what="the echo task")
+            results = [m for m in self.last_transcript(self.cid, scout["id"], t["id"]) if m["role"] == "tool"]
+            found = next(m["content"] for m in results if m["name"] == "find_tool")
+            self.assertIn("Loaded: fakemcp__echo", found)
+            self.assertEqual(next(m["content"] for m in results if m["name"] == "fakemcp__echo"), "hello from holdco")
+            calls = [c for c in self.mcp.calls if c.method == "tools/call"]
+            self.assertTrue(calls and calls[-1].params["name"] == "echo", calls)
+            self.assertTrue(str(calls[-1].headers.get("authorization", "")).startswith("Bearer fake-at-"))
+        finally:
+            self.api.delete(f"/api/connectors/{iid}")
+        self.assertIsNone(self.connector(iid))
 
 
 if __name__ == "__main__":

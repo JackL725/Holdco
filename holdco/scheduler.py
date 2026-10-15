@@ -191,7 +191,7 @@ class Scheduler(threading.Thread):
             for r in roles.role_info(a).get("routines", []):
                 if r["requires"] == "imap" and not emailer.imap_configured(cs):
                     continue
-                if r["requires"] == "smtp" and not emailer.smtp_configured(cs):
+                if r["requires"] == "smtp" and emailer.outbound(c, cs) is None:   # SMTP, or Resend (Phase 1)
                     continue
                 if age_h < r["first_after_hours"]:
                     continue

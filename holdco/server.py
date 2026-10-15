@@ -207,7 +207,7 @@ def api_company(h, m, body):
                    "ORDER BY name", (c["id"],))
     cs = db.company_settings(c)
     return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": metrics,
-            "email_ready": emailer.smtp_configured(cs), "inbox_ready": emailer.imap_configured(cs),
+            "email_ready": emailer.outbound(c, cs) is not None, "inbox_ready": emailer.imap_configured(cs),
             "has_site": workspace.safe_path(c, "site/index.html").exists(),
             "folder": str(workspace.root(c))}
 
@@ -292,6 +292,17 @@ def api_company_delete(h, m, body):
     if (body or {}).get("confirm") != c["name"]:
         raise HTTPError(400, "Type the company name to confirm.")
     db.update("companies", c["id"], status="archived")
+    # Phase 1: the company's connectors go with it (each removal deletes its vault secrets, its OAuth sign-in and
+    # closes any MCP client), then the company's own secrets (company.<id>.*) leave the vault.
+    from . import connectors   # imported here: connectors loads with tools, after this module's imports
+    for r in db.q("SELECT id FROM connectors WHERE company_id=?", (c["id"],)):
+        connectors.remove(r["id"])
+    try:
+        for name in vault.names():
+            if name.startswith(f"company.{c['id']}."):
+                vault.delete(name)
+    except vault.VaultError as e:   # the company is still deleted; the Doctor's vault row shows what is left
+        print(f"Vault: the secrets of company {c['id']} could not all be deleted: {e}")
     for t in ("agents", "tasks", "memory", "approvals", "events", "messages", "runs", "emails", "metrics"):
         db.run(f"DELETE FROM {t} WHERE company_id=?", (c["id"],))
     db.run("DELETE FROM companies WHERE id=?", (c["id"],))
