@@ -372,6 +372,113 @@ class EndToEnd(unittest.TestCase):
         phone = next(r for r in rows if r["action"] == "social_post" and r["approved_by"] == "owner")
         self.assertIn("content", phone["payload"])
 
+    # ---------------------------------------------------------------- phase 0.5: ground truth and context
+    def test_21_context_library_round_trip(self):
+        cid = self.cid
+        # the owner's global library: every company sees it
+        r = self.api.put("/api/context/file", {"path": "e2e/about-me.md",
+                                               "content": "# About me\n\nI only sell to quetzalcoatl breeders.\n"})
+        self.assertEqual(r["path"], "e2e/about-me.md")
+        pin = self.api.put("/api/context/pinned", {"paths": ["e2e/about-me.md"]})
+        self.assertEqual(pin["pinned"], ["e2e/about-me.md"])
+        listing = self.api.get("/api/context")
+        f = next(x for x in listing["files"] if x["path"] == "e2e/about-me.md")
+        self.assertTrue(f["pinned"] and f["indexed"] and f["text"])
+        self.assertEqual(listing["pinned_chars"], f["size"])
+        self.assertEqual((listing["pinned_cap"], listing["max_bytes"]), (2500, 500000))
+        self.assertIn(".md", listing["formats"])
+        self.assertIn("quetzalcoatl", self.api.get("/api/context/file?path=e2e/about-me.md")["content"])
+        # the company's own library
+        self.api.put(f"/api/companies/{cid}/context/file", {"path": "calls/vet.md",
+                                                            "content": "# Vet call\n\nThe vet likes quetzalcoatl kibble.\n"})
+        self.api.put(f"/api/companies/{cid}/context/pinned", {"paths": ["calls/vet.md"]})
+        mine = self.api.get(f"/api/companies/{cid}/context")
+        self.assertEqual(mine["pinned"], ["calls/vet.md"])
+        self.assertGreater(mine["pinned_chars"], 0)
+        # the dashboard search finds both, with path and line, the matching word marked
+        res = self.api.get(f"/api/companies/{cid}/search?q=quetzalcoatl&scope=context")
+        self.assertEqual(res["scope"], "context")
+        hits = {(h["path"], h["line"]) for h in res["results"]}
+        self.assertEqual(hits, {("global:e2e/about-me.md", 3), ("context:calls/vet.md", 3)})
+        self.assertTrue(all("[quetzalcoatl]" in h["snippet"] for h in res["results"]))
+        everything = self.api.get(f"/api/companies/{cid}/search?q=quetzalcoatl")
+        self.assertEqual({h["source"] for h in everything["results"]}, {"context"})
+        self.api.get(f"/api/companies/{cid}/search?q=x&scope=planets", expect=400)
+        # delete both: gone from the list, the pins and the search
+        self.api.delete("/api/context/file", {"path": "e2e/about-me.md"})
+        self.api.delete(f"/api/companies/{cid}/context/file", {"path": "calls/vet.md"})
+        self.assertFalse(any(x["path"] == "e2e/about-me.md" for x in self.api.get("/api/context")["files"]))
+        self.assertEqual(self.api.get("/api/context")["pinned"], [])
+        self.assertEqual(self.api.get(f"/api/companies/{cid}/context")["pinned"], [])
+        self.assertEqual(self.api.get(f"/api/companies/{cid}/search?q=quetzalcoatl")["results"], [])
+        self.assertTrue(self.api.get("/api/index/status")["fts"])
+
+    def test_22_facts_route(self):
+        f = self.api.get(f"/api/companies/{self.cid}/facts")
+        self.assertTrue(f["text"].startswith("# Facts (from Holdco's records; these override anything in files)"))
+        self.assertFalse(f["website"]["deployed"])                       # no Netlify token: nothing went online
+        self.assertTrue(f["website"]["line"].startswith("Website: local preview only; not deployed."), f["website"])
+        self.assertIn(f["website"]["line"], f["text"])
+        self.assertTrue(f["email"]["line"].startswith("Email: not connected"), f["email"])
+        self.assertTrue(f["money"]["line"].startswith("Money: "))
+        self.assertTrue(f["signals"]["line"])
+        # agents keep working meanwhile, so compare two reads taken back to back until they agree
+        wait_for(lambda: {w["id"] for w in self.api.get(f"/api/companies/{self.cid}/facts")["waiting"]}
+                 == {a["id"] for a in self.pending(self.cid)}, 20, what="the waiting list to match the inbox")
+        self.assertTrue(f["waiting"], "PawPlan has requests waiting for the owner")
+        for w in f["waiting"]:
+            self.assertIn(w["kind"], ("question", "approval"))
+            self.assertTrue(w["label"] and w["age"] and w["created_at"])
+        self.assertIsInstance(f["accounts"], list)
+        self.assertIsInstance(f["down"], list)
+
+    def test_23_planning_route(self):
+        p = self.api.get(f"/api/companies/{self.cid}/planning")["planning"]
+        self.assertEqual(p["company_id"], self.cid)
+        self.assertEqual(p["founding_stage"], "done")
+        self.assertIsInstance(p["cycle_backoff"], int)
+        self.assertGreaterEqual(p["next_due_minutes"], 0)
+        self.assertIsInstance(p["changed"], bool)
+        self.assertEqual(p["budget"]["budget"], 3000000)
+        self.assertGreater(p["budget"]["used"], 0)
+        self.assertFalse(p["budget"]["over"])
+        mine = next(b for b in self.api.get("/api/budget")["budget"] if b["company_id"] == self.cid)
+        self.assertEqual((mine["name"], mine["budget"], mine["over"]), ("PawPlan", 3000000, False))
+        # the owner's settings form: the three new fields round-trip, internal keys stay out of it
+        c = self.api.patch(f"/api/companies/{self.cid}", {"settings": {"archetype": "saas", "daily_token_budget": "2500000",
+                                                                        "postal_address": "1 Main Street, Springfield, IL 62701",
+                                                                        "founding_retry": "charter"}})["company"]
+        self.assertEqual((c["settings"]["archetype"], c["settings"]["daily_token_budget"]), ("saas", 2500000))
+        self.assertNotEqual(c["settings"].get("founding_retry"), "charter")   # internal keys are not the form's
+        self.assertEqual(self.api.get(f"/api/companies/{self.cid}/planning")["planning"]["archetype"], "saas")
+        self.api.patch(f"/api/companies/{self.cid}", {"settings": {"archetype": "", "daily_token_budget": 3000000}})
+        s = self.api.put("/api/settings", {"review_model": "gpt-oss:20b", "embedding_model": ""})["settings"]
+        self.assertEqual(s["review_model"], "gpt-oss:20b")
+        self.api.put("/api/settings", {"review_model": ""})
+
+    def test_24_doctor_phase05_rows(self):
+        rows = {r["key"]: r for r in self.api.post("/api/doctor/run", {})["checks"]}
+        self.assertEqual(rows["search_index"]["status"], "ok", rows["search_index"])
+        self.assertIn("Full-text index:", rows["search_index"]["detail"])
+        self.assertEqual(rows["token_budgets"]["status"], "ok", rows["token_budgets"])
+        self.assertIn("PawPlan", rows["token_budgets"]["detail"])
+        r = self.api.post("/api/index/rebuild", {})
+        self.assertTrue(r["ok"])
+        wait_for(lambda: next(x for x in self.api.get("/api/doctor")["checks"] if x["key"] == "search_index")
+                 ["status"] == "ok", 30, what="the search index row after a rebuild")
+
+    def test_25_staged_founding(self):
+        critique = self.api.get(f"/api/companies/{self.cid}/file?path=docs/critique.md")["content"]
+        self.assertIn("Three strongest reasons this fails", critique)
+        charter = self.api.get(f"/api/companies/{self.cid}")["company"]["charter"]
+        for section in ("## One-liner", "## Competitors", "## Riskiest assumption", "## 30-day plan"):
+            self.assertIn(section, charter)
+        hits = self.api.get(f"/api/companies/{self.cid}/search?q=strongest%20reasons%20fails&scope=files")["results"]
+        self.assertIn("docs/critique.md", [h["path"] for h in hits])
+        stages = [e["data"].get("stage") for e in reversed(self.api.get(
+            f"/api/events?company_id={self.cid}&kinds=founding&limit=300")["events"]) if e["data"].get("stage")]
+        self.assertEqual(stages[:4], ["research", "charter", "critic", "plan"])
+
 
 if __name__ == "__main__":
     unittest.main()

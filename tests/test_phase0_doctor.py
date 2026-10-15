@@ -228,7 +228,8 @@ class TestDoctorModel(DoctorBase):
         for k in ("model_server", "model", "gpu_fit", "search", "disk", "backup", "errors_24h"):
             self.assertIn(k, keys)
         self.assertEqual(keys[:4], ["model_server", "model", "gpu_fit", "search"])
-        self.assertEqual(keys[-3:], ["disk", "backup", "errors_24h"])
+        # Phase 0.5 added the search index and the daily token budgets after the Phase 0 rows.
+        self.assertEqual(keys[-5:], ["disk", "backup", "errors_24h", "search_index", "token_budgets"])
         for r in rows:
             # Phase 0 fix: every row carries its run number; connector rows also carry their company id.
             self.assertEqual(set(r) - {"company_id"}, {"key", "label", "status", "detail", "fix", "checked_at", "run"})
@@ -336,6 +337,81 @@ class TestDoctorRules(DoctorBase):
                ("2000-01-01T00:00:00Z",))
         self.assertEqual(doctor._check_errors()["status"], "ok")
         db.run("DELETE FROM events WHERE kind='error'")
+
+    def test_search_index_row(self):
+        from holdco import context
+        c = make_company("IndexRowCo")
+        context.reindex(c)
+        r = doctor._check_index()
+        self.assertEqual((r["key"], r["label"], r["status"], r["fix"]), ("search_index", "Search index", "ok", None))
+        self.assertIn("Full-text index:", r["detail"])
+        self.assertIn("last indexed", r["detail"])
+        base = {"fts": True, "rows": 12, "global_files": 2, "global_last_indexed": None, "embedding_model": "",
+                "vectors": 0, "companies": [{"id": c["id"], "name": "IndexRowCo", "files_indexed": 0, "rows": 0,
+                                             "last_indexed": None, "last_checked": None}]}
+        with patch.object(context, "index_status", return_value=base):
+            r = doctor._check_index()
+        self.assertEqual(r["status"], "warn")
+        self.assertTrue(r["detail"].startswith("Not indexed yet: IndexRowCo."), r["detail"])
+        self.assertEqual(r["fix"], {"kind": "action", "label": "Index now", "action": "reindex"})
+        with patch.object(context, "index_status", return_value={**base, "fts": False, "companies": []}):
+            r = doctor._check_index()
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("plain-text scan", r["detail"])
+        self.assertEqual(r["fix"]["kind"], "text")
+        model = {**base, "embedding_model": "nomic-embed-text", "vectors": 40,
+                 "companies": [{**base["companies"][0], "rows": 12, "last_indexed": db.now()}]}
+        with patch.object(context, "index_status", return_value=model):
+            r = doctor._check_index()
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("Meaning search with nomic-embed-text: 40 vectors.", r["detail"])
+
+    def test_token_budget_row(self):
+        from holdco import planning
+        rows = [{"company_id": 7, "name": "Calm", "used": 1_200_000, "budget": 3_000_000, "over": False},
+                {"company_id": 8, "name": "Free", "used": 5_000, "budget": 0, "over": False}]
+        with patch.object(planning, "budget_status", return_value=rows):
+            r = doctor._check_budgets()
+        self.assertEqual((r["key"], r["status"], r["fix"]), ("token_budgets", "ok", None))
+        self.assertIn("Calm 1.2M of 3.0M; Free 5,000 (no limit)", r["detail"])
+        rows.append({"company_id": 9, "name": "Busy", "used": 3_400_000, "budget": 3_000_000, "over": True})
+        with patch.object(planning, "budget_status", return_value=rows):
+            r = doctor._check_budgets()
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("Busy (3.4M of 3.0M tokens)", r["detail"])
+        self.assertEqual(r["fix"], {"kind": "link", "label": "Company settings", "href": "#/c/9/settings"})
+        with patch.object(planning, "budget_status", return_value=[]):
+            self.assertEqual(doctor._check_budgets()["status"], "ok")
+        # the real thing: a company whose runs today passed its budget is listed
+        c = make_company("OverBudgetCo", settings={"daily_token_budget": 1000})
+        db.run("INSERT INTO runs(company_id, agent_id, kind, status, tokens, started_at) VALUES(?,?,?,?,?,?)",
+               (c["id"], None, "task", "done", 5000, db.now()))
+        r = doctor._check_budgets()
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("OverBudgetCo (5,000 of 1,000 tokens)", r["detail"])
+        db.update("companies", c["id"], status="archived")   # leave the shared database quiet for other tests
+
+    def test_index_rebuild_route(self):
+        from holdco import context
+        c = make_company("RebuildCo")
+        (workspace.root(c) / "docs" / "rebuild.md").write_text("# Rebuild\n\nzanzibar cobalt\n", encoding="utf-8")
+        doctor.LAST[:] = [doctor._row("search_index", "Search index", "warn", "Not indexed yet: RebuildCo.")]
+        hints: list = []
+        sub = bus.subscribe()
+        try:
+            r = doctor.api_index_rebuild(Stub(), None, {})
+            self.assertTrue(r["ok"])
+            deadline = time.time() + 20
+            while time.time() < deadline and doctor._reindexing.is_set():
+                time.sleep(0.05)
+            self.assertFalse(doctor._reindexing.is_set())
+            while not sub.empty():
+                hints.append(sub.get_nowait().get("type"))
+        finally:
+            bus.unsubscribe(sub)
+        self.assertIn("doctor", hints)
+        self.assertEqual(context.search_rows(c, "zanzibar")[0]["path"], "docs/rebuild.md")
+        self.assertEqual(doctor.row_status("search_index"), "ok")
 
     def test_search_rules_follow_provider_health(self):
         def health(rows):

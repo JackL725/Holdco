@@ -142,7 +142,7 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
 .btn:disabled { opacity: .55; cursor: default; }
 label.field { display: flex; flex-direction: column; gap: 5px; font-weight: 500; font-size: 13px; color: var(--ink-2); }
 label.field .hint { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
-input[type=text], input[type=email], input[type=password], input[type=number], input[type=url], select, textarea {
+input[type=text], input[type=email], input[type=password], input[type=number], input[type=url], input[type=search], select, textarea {
   width: 100%; font: 14px var(--font); color: var(--ink); background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px;
 }
@@ -449,3 +449,51 @@ details[open] > summary h2::after { content: " −"; }
 .preflight { margin-top: 8px; }
 .preflight li { padding: 8px 0; border-top-color: color-mix(in srgb, var(--bad) 25%, transparent); }
 .preflight li:first-child { border-top: 0; }
+
+/* ---------- phase 0.5: context library, search, what agents know ---------- */
+mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radius: 3px; font-weight: 600; }
+.linkish { appearance: none; border: 0; background: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-align: left; }
+.linkish:hover { text-decoration: underline; }
+.warn-text { color: var(--warn); }
+.meter .bar { height: 8px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; margin: 6px 0; }
+.meter .bar span { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.meter.over .bar span { background: var(--warn); }
+.meter-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.dropzone { border: 2px dashed var(--line); border-radius: var(--r); padding: 14px 16px; text-align: center; color: var(--ink-3); font-size: 12.5px; margin-top: 12px; }
+.dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
+.ctx-lib .rows li { align-items: center; }
+.ctx-lib .ctx-pin { flex: none; align-items: center; white-space: nowrap; }
+.ctx-lib .ctx-pin input { margin: 0; }
+.ctx-lib .rows .badge { margin-left: 4px; }
+textarea.ctx-edit { min-height: 55vh; }
+.co-side { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.co-search { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.co-search input[type=search] { width: 250px; padding: 6px 10px; }
+.co-search select { width: auto; padding: 6px 8px; }
+.search-group h3 { margin: 14px 0 2px; font-size: 13.5px; color: var(--ink-2); }
+.search-hits li { padding: 8px 0; }
+.search-hits .snippet { color: var(--ink-2); margin-top: 2px; overflow-wrap: anywhere; }
+.know { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; }
+.know > li { overflow-wrap: anywhere; color: var(--ink-2); }
+.know b { color: var(--ink); font-weight: 600; }
+.know .warn-line, .know .warn-line b { color: var(--warn); }
+.know ul { margin: 4px 0 0; padding-left: 18px; }
+.know .meter .bar { margin: 6px 0 0; }
+details.raw summary { cursor: pointer; margin-top: 12px; }
+details.raw summary::before { content: "▸ "; }
+details.raw[open] summary::before { content: "▾ "; }
+details.raw pre { margin-top: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; max-height: 320px; overflow: auto; }
+.stepper { list-style: none; display: flex; gap: 6px; margin: 10px 0 0; padding: 0; flex-wrap: wrap; }
+.stepper li { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-3); padding: 3px 10px 3px 4px; border-radius: 20px; background: var(--panel); border: 1px solid var(--line); }
+.stepper .n { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--panel-2); font-weight: 600; font-size: 11.5px; }
+.stepper li.done { color: var(--good); }
+.stepper li.done .n { background: var(--good-soft); }
+.stepper li.now { color: var(--ink); border-color: var(--accent); font-weight: 600; }
+.stepper li.now .n { background: var(--accent); color: var(--accent-ink); }
+.feed .msg .badge, .mind .m-sep .badge { vertical-align: 1px; }
+@media (max-width: 760px) {
+  .co-side { align-items: flex-start; width: 100%; }
+  .co-search { justify-content: flex-start; width: 100%; }
+  .co-search input[type=search] { flex: 1; width: auto; min-width: 0; }
+  .ctx-lib .rows li { flex-wrap: wrap; }
+}

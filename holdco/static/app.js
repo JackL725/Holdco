@@ -202,6 +202,7 @@ function renderSide() {
       <a href="#/" class="${at(!p.length)}">Portfolio</a>
       <a href="#/inbox" class="${at(p[0] === 'inbox')}">Inbox ${st.approvals ? `<span class="count">${st.approvals}</span>` : ''}</a>
       <a href="#/library" class="${at(p[0] === 'library')}">Agent library</a>
+      <a href="#/context" class="${at(p[0] === 'context')}">Your context</a>
       <a href="#/doctor" class="${at(p[0] === 'doctor')}">Doctor${healthDot(st.doctor)}</a>
     </nav>
     <div class="side-label">Companies</div>
@@ -262,9 +263,13 @@ function feedItem(ev, showCompany) {
   const co = showCompany ? (S.st?.companies.find((c) => c.id === ev.company_id)) : null;
   let msg = esc(ev.message);
   if (ev.kind === 'file' && ev.data?.path && ev.company_id) {
-    msg = msg.replace(esc(ev.data.path), `<a href="#/c/${ev.company_id}/files/${encodeURIComponent(ev.data.path)}">${esc(ev.data.path)}</a>`);
+    const path = String(ev.data.path);
+    const href = path.startsWith('context/') ? `#/c/${ev.company_id}/context/${encodeURIComponent(path.slice(8))}`
+      : `#/c/${ev.company_id}/files/${encodeURIComponent(path)}`;
+    msg = msg.replace(esc(path), `<a href="${href}">${esc(path)}</a>`);
   }
   if (ev.kind === 'approval') msg += ` <a href="#/inbox">Review</a>`;
+  msg = eventBadge(ev) + msg;
   const icon = a ? avatar(a, '', false) : ev.data?.by === 'owner' ? '<span class="av owner" aria-hidden="true">Y</span>' : '<span class="sys" aria-hidden="true">•</span>';
   return `<li class="k-${esc(ev.kind)}" data-id="${ev.id}">${icon}
     <div class="line"><span class="who">${esc(a ? a.name : (ev.data?.by === 'owner' ? 'You' : 'Holdco'))}</span>
@@ -374,6 +379,7 @@ async function render() {
   else if (p[0] === 'inbox') view = Inbox();
   else if (p[0] === 'settings') view = Settings();
   else if (p[0] === 'library') view = Library();
+  else if (p[0] === 'context') view = YourContext(p[1]);
   else if (p[0] === 'doctor') view = Doctor();
   else if (p[0] === 'c' && p[1]) view = CompanyView(+p[1], p[2] || 'overview', p[3]);
   else { location.hash = '#/'; return; }
@@ -817,8 +823,14 @@ function Doctor() {
       await load();
       timer = setInterval(() => { if (S.view !== view) { clearInterval(timer); return; } load().catch(() => {}); }, 60000);
     },
-    live(ev) { if (ev.type === 'settings') load().catch(() => {}); },
+    live(ev) { if (ev.type === 'settings' || ev.type === 'doctor') load().catch(() => {}); },
     async act(name, t) {
+      if (name === 'fix' && t.dataset.fix === 'reindex') {
+        t.disabled = true;
+        t.innerHTML = '<span class="spinner"></span> Indexing…';
+        try { const r = await api('POST', '/api/index/rebuild', {}); toast(r.message); } catch (e) { fail(e); t.disabled = false; t.textContent = 'Index now'; }
+        return undefined;
+      }
       if (name === 'run') return run(false, t);
       if (name === 'deep') return run(true, t);
       if (name === 'backup' || (name === 'fix' && t.dataset.fix === 'backup')) return backupNow(t);
@@ -896,6 +908,12 @@ function Settings() {
           <label class="field">${esc(label)}${data.locked.includes(k) ? `<div class="box small">Always asks you</div>`
             : sel(`policy_${k}`, pol[k], [['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']])}</label>`).join('')}</div>
       </div>
+      <div class="section"><h2>Context and review</h2><p class="muted">What every company should know about you lives on <a href="#/context">Your context</a>. These models are optional.</p>
+        <div class="form-grid">
+          <label class="field">Review model<span class="hint">Used for the critic pass after the charter and for QA reviews. Pick the strongest model you trust for judgment.</span>${models.length ? modelSel('review_model', s.review_model, models, 'Same as CEO/agent model') : `<input type="text" name="review_model" value="${esc(s.review_model)}" placeholder="Same as CEO/agent model">`}</label>
+          <label class="field">Embedding model<span class="hint">Optional. An Ollama embedding model such as nomic-embed-text makes search find meaning, not just words. Run: ollama pull nomic-embed-text</span><input type="text" name="embedding_model" value="${esc(s.embedding_model)}" placeholder="nomic-embed-text" autocomplete="off"></label>
+        </div>
+      </div>
       <div class="section"><h2>Web search</h2>
         <div class="form-grid">
           <label class="field">Search with${sel('search_provider', s.search_provider, [['duckduckgo', 'DuckDuckGo (no key)'], ['searxng', 'SearXNG (self-hosted)'], ['brave', 'Brave Search API']])}</label>
@@ -923,6 +941,7 @@ function Settings() {
       body.temperature = parseFloat(body.temperature);
       if (!Number.isFinite(body.temperature)) delete body.temperature;
       if (typeof body.telegram_chat_id === 'string') body.telegram_chat_id = body.telegram_chat_id.trim();
+      if (typeof body.embedding_model === 'string') body.embedding_model = body.embedding_model.trim();
       body.scheduler_enabled = !!form.scheduler_enabled.checked;
       body.policies = {};
       Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
@@ -963,33 +982,334 @@ function Settings() {
   };
 }
 
+// ---------------------------------------------------------------- phase 0.5: context library, search, facts
+const ARCHETYPES = [['lead_generation', 'Lead generation'], ['newsletter', 'Newsletter'], ['saas', 'SaaS'], ['services', 'Services'],
+  ['digital_products', 'Digital products'], ['ecommerce', 'E-commerce'], ['local_services', 'Local services']];
+const archetypeLabel = (k) => (ARCHETYPES.find(([v]) => v === k) || [k, k])[1];
+const SEARCH_SCOPES = [['all', 'Everything'], ['files', 'Files'], ['context', 'Your context'], ['memory', 'Memory'], ['tasks', 'Tasks'],
+  ['emails', 'Emails'], ['chat', 'Chat'], ['decisions', 'Decisions'], ['sessions', 'Sessions'], ['facts', 'Facts']];
+const SEARCH_GROUPS = { file: 'Files', context: 'Your context', memory: 'Memory', task: 'Tasks', email: 'Emails', chat: 'Chat with you',
+  approval: 'Decisions', run: 'Past sessions', fact: 'Verified facts' };
+const FOUNDING_STEPS = [['research', 'Research'], ['charter', 'Charter'], ['critic', 'Critic'], ['plan', 'Plan']];
+// Search snippets mark the matching words with [brackets]: escape everything first, then turn the brackets into <mark>.
+const marked = (s) => esc(s).replace(/\[([^[\]]+)\]/g, '<mark>$1</mark>');
+const fmtTokens = (n) => { n = Number(n) || 0; return n >= 1e5 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M` : n.toLocaleString(); };
+const sizeText = (n) => (n < 1000 ? plural(n, 'byte') : fmtBytes(n));
+// "Website: local preview only..." becomes a bold label and the rest, so the card reads like the agents' block.
+const factLine = (line) => {
+  const s = String(line || '');
+  const i = s.indexOf(': ');
+  return i > 0 && i < 40 ? `<b>${esc(s.slice(0, i))}</b> ${esc(s.slice(i + 2))}` : esc(s);
+};
+
+function foundingSteps(stage) {
+  const at = stage === 'done' ? FOUNDING_STEPS.length : Math.max(0, FOUNDING_STEPS.findIndex(([k]) => k === stage));
+  return `<ol class="stepper" aria-label="Founding stages">${FOUNDING_STEPS.map(([, label], n) => `<li class="${n < at ? 'done' : n === at ? 'now' : ''}"${n === at ? ' aria-current="step"' : ''}><span class="n">${n < at ? '✓' : n + 1}</span>${label}</li>`).join('')}</ol>`;
+}
+
+// Claims and planning events in the feeds (Phase 0.5): a small badge says what Holdco stopped.
+const CLAIM_RULES = {
+  claims: 'unsupported claim', log_name: 'event-log file name', records: 'records/ is Holdco\'s', context: 'context/ is yours',
+  future_date: 'future date', action_task: 'action not done yet', sources: 'numbers without a source', placeholders: 'placeholders on the page',
+};
+function eventBadge(ev) {
+  const d = ev.data || {};
+  if (ev.kind === 'claims') {
+    if (d.where === 'truth_scan') return '<span class="badge warn">truth check</span> ';
+    return `<span class="badge bad" title="${esc(d.problem || '')}">blocked a false claim</span> <span class="badge">${esc(CLAIM_RULES[d.rule] || d.rule || 'claims')}</span> `;
+  }
+  if (ev.kind === 'question_deduped') return '<span class="badge good">stopped a repeated question</span> ';
+  if (ev.kind === 'budget') return '<span class="badge warn">token budget</span> ';
+  if (ev.kind === 'founding' && d.stage) {
+    const n = FOUNDING_STEPS.findIndex(([k]) => k === d.stage);
+    return n >= 0 ? `<span class="badge accent">stage ${n + 1} of 4: ${esc(FOUNDING_STEPS[n][1].toLowerCase())}</span> ` : '';
+  }
+  return '';
+}
+
+// The owner's context library, shared by the company Context tab and the global "Your context" page.
+// opts: { base: '/api/context' or '/api/companies/<id>/context', company: bool, initial: path to open, home: hash of the page }
+function ContextLibrary(opts) {
+  let el, data = null, global = null;
+  const base = opts.base;
+  const textOk = (name) => !!data && data.formats.some((x) => name.toLowerCase().endsWith(x));
+  const pinnedTotal = () => (data ? data.pinned_chars : 0) + (opts.company && global ? global.pinned_chars : 0);
+  const drawMeter = () => {
+    const cap = data.pinned_cap;
+    const total = pinnedTotal();
+    const over = total > cap;
+    const pct = Math.min(100, Math.round((100 * total) / Math.max(1, cap)));
+    const parts = opts.company
+      ? `${global && global.pinned.length ? `${plural(global.pinned.length, 'file')} from <a href="#/context">your context</a> (${global.pinned_chars.toLocaleString()}) plus ` : ''}${plural(data.pinned.length, 'file')} here (${data.pinned_chars.toLocaleString()})`
+      : `${plural(data.pinned.length, 'file')} (${data.pinned_chars.toLocaleString()})`;
+    $('#ctx-meter', el).innerHTML = `<div class="meter${over ? ' over' : ''}">
+      <div class="meter-head"><b>Always included</b><span class="small muted num">${total.toLocaleString()} of ${cap.toLocaleString()} characters</span></div>
+      <div class="bar" role="meter" aria-valuemin="0" aria-valuemax="${cap}" aria-valuenow="${total}" aria-label="Always-included context size"><span style="width:${pct}%"></span></div>
+      <p class="small ${over ? 'warn-text' : 'faint'}" style="margin:0">${parts}. ${over
+        ? 'Over the limit: agents get the pinned files in order until it is full and are told which were cut, so they read those with read_file. Unpin a file or shorten it.'
+        : opts.company ? 'Pinned files from your context and from this company share one limit in every prompt.' : 'Every company gets these in every prompt, together with its own pinned files, within one limit.'}</p></div>`;
+  };
+  const drawList = () => {
+    const files = data.files;
+    const texts = files.filter((f) => f.text);
+    const indexed = texts.filter((f) => f.indexed).length;
+    $('#ctx-status', el).innerHTML = !data.fts
+      ? '<span class="badge warn">Plain-text search</span> Full-text search is not available in this Python, so agents search these files with a slower plain scan.'
+      : texts.length ? `<span class="badge ${indexed === texts.length ? 'good' : ''}">${indexed} of ${plural(texts.length, 'text file')} searchable</span>` : '';
+    $('#ctx-list', el).innerHTML = files.length ? files.map((f) => {
+      const changed = f.modified ? new Date(f.modified * 1000).toISOString() : '';
+      return `<li data-path="${esc(f.path)}"><div class="grow">
+        <div><button class="linkish" data-act="ctx-open" data-path="${esc(f.path)}"><code>${esc(f.path)}</code></button>
+          ${f.text && data.fts ? (f.indexed ? '<span class="badge good">Searchable</span>' : '<span class="badge">Not indexed yet</span>') : ''}
+          ${f.pinned ? '<span class="badge accent">Always included</span>' : ''}</div>
+        ${f.summary ? `<div class="small muted">${esc(f.summary)}</div>` : ''}
+        <div class="small faint">${sizeText(f.size)}${changed ? `, changed ${when(changed)}` : ''}</div>
+        ${f.note ? `<div class="small warn-text">${esc(f.note)}</div>` : ''}</div>
+        ${f.text ? `<label class="check small ctx-pin"><input type="checkbox" data-pin="${esc(f.path)}" ${f.pinned ? 'checked' : ''}> Always include</label>` : ''}</li>`;
+    }).join('') : `<li class="faint">No files yet. ${opts.company ? 'Add customer interviews, notes, price lists or competitor notes for this company.' : 'Add who you are, your skills, budget, preferences, brand rules and things to avoid.'}</li>`;
+    $('#ctx-folder', el).innerHTML = `Files live in <code class="small" style="overflow-wrap:anywhere">${esc(data.folder)}</code>; you can also copy them there.`;
+  };
+  const draw = () => { drawMeter(); drawList(); };
+  const load = async () => {
+    const [d, g] = await Promise.all([GET(base), opts.company ? GET('/api/context').catch(() => null) : null]);
+    data = d;
+    global = g;
+    if (el) draw();
+  };
+  const loadSoon = debounce(() => load().catch(() => {}), 600);
+  const hashFor = (path) => `${opts.home}/${encodeURIComponent(path)}`;
+  const readText = (file) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(r.error || new Error(`Could not read ${file.name}`));
+    r.readAsText(file);
+  });
+  const addFiles = async (list) => {
+    const files = [...(list || [])];
+    if (!files.length || !data) return;
+    let added = 0;
+    for (const f of files) {
+      if (!textOk(f.name)) { toast(`${f.name}: only text files go in the library (${data.formats.join(', ')}). Convert it to text first.`, true); continue; }
+      if (f.size > data.max_bytes) { toast(`${f.name} is too big: ${Math.round(data.max_bytes / 1000)} KB at most.`, true); continue; }
+      try {
+        await api('PUT', `${base}/file`, { path: f.name, content: await readText(f) });
+        added++;
+      } catch (e) { toast(`${f.name}: ${e.message}`, true); }
+    }
+    if (added) toast(`${plural(added, 'file')} added. Agents can search ${added === 1 ? 'it' : 'them'} now.`);
+    await load();
+  };
+  const setPinned = async (path, on, box) => {
+    const want = on ? [...data.pinned.filter((p) => p !== path), path] : data.pinned.filter((p) => p !== path);
+    try {
+      const r = await api('PUT', `${base}/pinned`, { paths: want });
+      Object.assign(data, { pinned: r.pinned, pinned_chars: r.pinned_chars, pinned_cap: r.pinned_cap });
+      data.files.forEach((f) => { f.pinned = r.pinned.includes(f.path); });
+      draw();
+      toast(on ? `${path} goes into every prompt now.` : `${path} is no longer in every prompt; agents still find it with search.`);
+    } catch (e) { fail(e); if (box) box.checked = !on; }
+  };
+  const open = async (path) => {
+    let f;
+    try { f = await GET(`${base}/file?path=${encodeURIComponent(path)}`); } catch (e) { fail(e); return; }
+    const url = hashFor(path);
+    history.replaceState(null, '', url);
+    modal({
+      title: path,
+      wide: true,
+      body: f.binary
+        ? `<p class="muted">This file is not text (${sizeText(f.size)}), so agents cannot read or search it. Convert it to ${esc(data.formats.join(', '))} and add that instead.</p>`
+        : `<form data-form="ctx-save" id="ctx-save" data-path="${esc(path)}"><textarea name="content" class="code ctx-edit" aria-label="Contents of ${esc(path)}">${esc(f.content)}</textarea></form>
+          <p class="small faint" style="margin:8px 0 0">${sizeText(f.size)}. ${f.pinned ? 'Always included in every prompt.' : 'Agents find it with search.'}</p>`,
+      foot: `<button class="btn danger" data-act="ctx-delete" data-path="${esc(path)}" style="margin-right:auto">Delete</button><button class="btn" data-act="close-modal">Close</button>${f.binary ? '' : '<button class="btn primary" type="submit" form="ctx-save">Save</button>'}`,
+      onClose: () => { if (location.hash === url) history.replaceState(null, '', opts.home); },
+    });
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel ctx-lib" id="ctx-lib">
+        <div class="panel-body">
+          <p style="margin-bottom:4px"><b>Your agents read these. Mark a file 'Always include' to put it in every prompt; everything else they find with search.</b></p>
+          <p class="muted small">${opts.company ? 'Files for this company only: customer interviews, notes, price lists, competitor notes. Agents can read them but never change them.'
+            : 'These apply to every company: who you are, your skills, budget, preferences, brand rules and things to avoid. Agents can read them but never change them.'}</p>
+          <div id="ctx-meter"></div>
+          <div class="actions" style="margin-top:14px"><button class="btn primary" data-act="ctx-new">New file</button>
+            <label class="btn" style="cursor:pointer">Add files<input type="file" multiple hidden data-ctx-upload></label>
+            <span id="ctx-status" class="small muted"></span></div>
+          <div class="dropzone" id="ctx-drop">Drop text files here (.md, .txt, .csv, .json, .html, .xml, .yaml), up to 500 KB each. A file with the same name is replaced.</div>
+        </div>
+        <ul class="rows" id="ctx-list"><li class="faint"><span class="spinner"></span> Loading…</li></ul>
+        <p class="small faint" id="ctx-folder" style="padding:0 18px 14px;margin:0"></p></section>`;
+      const panel = $('#ctx-lib', el);
+      const zone = $('#ctx-drop', el);
+      const over = (on) => zone.classList.toggle('over', on);
+      panel.addEventListener('dragover', (e) => { e.preventDefault(); over(true); });
+      panel.addEventListener('dragleave', (e) => { if (!panel.contains(e.relatedTarget)) over(false); });
+      panel.addEventListener('drop', (e) => { e.preventDefault(); over(false); addFiles(e.dataTransfer && e.dataTransfer.files).catch(fail); });
+      el.addEventListener('change', (e) => {
+        const box = e.target.closest('[data-pin]');
+        if (box) { setPinned(box.dataset.pin, box.checked, box); return; }
+        if (e.target.matches('[data-ctx-upload]')) { addFiles(e.target.files).catch(fail).finally(() => { e.target.value = ''; }); }
+      });
+      await load();
+      const upload = $('[data-ctx-upload]', el);
+      if (upload) upload.accept = data.formats.join(',');
+      if (opts.initial) open(opts.initial);
+    },
+    live(ev) {
+      if (ev.type === 'context') { loadSoon(); return; }
+      if (opts.company && ev.type === 'event' && ev.kind === 'file' && String(ev.data?.path || '').startsWith('context/')) loadSoon();
+    },
+    async act(name, t) {
+      if (name === 'ctx-open') { await open(t.dataset.path); return true; }
+      if (name === 'ctx-new') {
+        modal({
+          title: 'New context file',
+          wide: true,
+          body: `<form class="form-stack" data-form="ctx-new" id="ctx-new">
+            <label class="field">File name<span class="hint">Folders are fine, for example brand/voice.md. Text formats only: ${esc(data.formats.join(', '))}.</span><input type="text" name="path" required maxlength="200" placeholder="${opts.company ? 'interviews/first-calls.md' : 'about-me.md'}"></label>
+            <label class="field">Contents<textarea name="content" class="code" rows="14" placeholder="${opts.company ? 'Notes from calls with customers, prices you have seen, what competitors do.' : 'Who you are, what you are good at, your budget and hours, brand rules, what to avoid.'}"></textarea></label>
+            <label class="check small"><input type="checkbox" name="pin"> Always include it in every prompt</label></form>`,
+          foot: '<button class="btn" data-act="close-modal">Cancel</button><button class="btn primary" type="submit" form="ctx-new">Save file</button>',
+        });
+        return true;
+      }
+      if (name === 'ctx-delete') {
+        const path = t.dataset.path;
+        modal({
+          title: `Delete ${path}?`,
+          body: `<p>It moves to the trash folder in your data directory, and agents stop seeing it at once.${data.pinned.includes(path) ? ' It is also taken out of every prompt.' : ''}</p>`,
+          foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn danger" data-act="ctx-delete-yes" data-path="${esc(path)}">Delete</button>`,
+          onClose: () => { if (location.hash === hashFor(path)) history.replaceState(null, '', opts.home); },
+        });
+        return true;
+      }
+      if (name === 'ctx-delete-yes') {
+        t.disabled = true;
+        try { await api('DELETE', `${base}/file`, { path: t.dataset.path }); closeModal(); toast('Deleted. It is in the trash folder if you need it back.'); await load(); } catch (e) { fail(e); t.disabled = false; }
+        return true;
+      }
+      return false;
+    },
+    async submit(name, form) {
+      if (name === 'ctx-save') {
+        try {
+          await api('PUT', `${base}/file`, { path: form.dataset.path, content: form.content.value });
+          closeModal();
+          toast('Saved. Agents see it in their next session.');
+          await load();
+        } catch (e) { fail(e); }
+        return true;
+      }
+      if (name === 'ctx-new') {
+        let path = form.path.value.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+        if (path && !/\.[^/.]+$/.test(path)) path += '.md';
+        if (!textOk(path)) { toast(`Use a text format: ${data.formats.join(', ')}.`, true); return true; }
+        try {
+          const r = await api('PUT', `${base}/file`, { path, content: form.content.value });
+          if (form.pin.checked) await api('PUT', `${base}/pinned`, { paths: [...data.pinned.filter((p) => p !== r.path), r.path] });
+          closeModal();
+          toast(`Saved ${r.path}.`);
+          await load();
+        } catch (e) { fail(e); }
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+// The global "Your context" page (#/context, #/context/<path> opens a file).
+function YourContext(initial) {
+  const lib = ContextLibrary({ base: '/api/context', company: false, initial, home: '#/context' });
+  return {
+    async mount(holder) {
+      holder.innerHTML = `<div class="page-head"><div><h1>Your context</h1><p class="sub">What every company's agents should know about you. Each company also has its own Context tab.</p></div></div><div id="ctx-holder"></div>`;
+      await lib.mount($('#ctx-holder', holder));
+    },
+    live: (ev) => lib.live(ev),
+    act: (name, t) => lib.act(name, t),
+    submit: (name, form) => lib.submit(name, form),
+  };
+}
+
+// ---- search: the same search the agents use, from the company header
+function searchHitLink(cid, h) {
+  const go = (href, label) => `<a href="${esc(href)}" data-act="search-go">${label}</a>`;
+  const loc = (p) => `<code>${esc(p)}${h.line ? `:${esc(h.line)}` : ''}</code>`;
+  switch (h.source) {
+    case 'file': return go(`#/c/${cid}/files/${encodeURIComponent(h.path)}`, loc(h.path));
+    case 'context': {
+      const m = /^(global|context):(.*)$/.exec(h.path || '');
+      if (!m) return loc(h.path);
+      return go(m[1] === 'global' ? `#/context/${encodeURIComponent(m[2])}` : `#/c/${cid}/context/${encodeURIComponent(m[2])}`, loc(h.path));
+    }
+    case 'task': return go(`#/c/${cid}/tasks`, esc(h.ref));
+    case 'email': return go(`#/c/${cid}/email`, esc(h.ref));
+    case 'memory': return go(`#/c/${cid}/memory`, esc(h.ref));
+    case 'chat': return go(`#/c/${cid}/chat`, esc(h.ref));
+    case 'approval': return go('#/inbox', esc(h.ref));
+    case 'run': return `<button class="linkish" data-act="search-run" data-id="${esc(h.id)}">${esc(h.ref)}</button>`;
+    default: return esc(h.ref || h.path);
+  }
+}
+
+async function companySearch(cid, q, scope) {
+  if (!q.trim()) return;
+  const r = await GET(`/api/companies/${cid}/search?q=${encodeURIComponent(q)}&scope=${encodeURIComponent(scope || 'all')}&limit=20`);
+  const order = [];
+  r.results.forEach((h) => { if (!order.includes(h.source)) order.push(h.source); });
+  const where = scope && scope !== 'all' ? ` in ${(SEARCH_SCOPES.find(([k]) => k === scope) || [scope, scope])[1].toLowerCase()}` : '';
+  modal({
+    title: `Search: ${q}`,
+    wide: true,
+    body: `<p class="muted small" style="margin:0 0 6px">${r.results.length ? `${plural(r.results.length, 'result')}${where}, best first. This is the same search your agents use.` : `Nothing found${where}. Try fewer or other words, or another place to search.`}
+      ${r.fts ? '' : ' <span class="badge warn">Plain-text search</span>'}</p>
+      ${order.map((src) => `<section class="search-group"><h3>${esc(SEARCH_GROUPS[src] || src)}</h3><ul class="rows search-hits">${r.results.filter((h) => h.source === src).map((h) => `
+        <li><div class="grow"><div>${searchHitLink(cid, h)}${h.heading ? ` <span class="muted small">${esc(h.heading)}</span>` : ''}</div>
+          <div class="small snippet">${marked(h.snippet)}</div></div></li>`).join('')}</ul></section>`).join('')}`,
+  });
+}
+
 // ---------------------------------------------------------------- company
-const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
+const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['context', 'Context'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
 
 function CompanyView(cid, tab, arg) {
   let el, d, tabView;
-  const head = () => {
+  // The header is redrawn in parts (title, buttons, tabs) so the search box keeps what the owner is typing.
+  const title = () => {
     const c = d.company;
     const status = { active: ['good', 'Running'], founding: ['accent', 'Founding'], paused: ['warn', 'Paused'], archived: ['', 'Archived'] }[c.status] || ['', c.status];
     const url = c.settings.site_url;
-    return `<div class="co-head"><div><h1>${esc(c.name)}</h1><p class="one">${esc(c.mission || c.idea.split('\n')[0])}</p>
+    return `<h1>${esc(c.name)}</h1><p class="one">${esc(c.mission || c.idea.split('\n')[0])}</p>
         <div class="meta"><span class="badge ${status[0]}">${status[1]}</span><span class="badge">Stage: ${esc(c.stage)}</span>
-        ${url ? `<a class="small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url.replace(/^https?:\/\//, ''))}</a>` : ''}</div></div>
-      <div class="actions">
-        ${d.has_site ? `<a class="btn" href="/preview/${esc(c.slug)}/" target="_blank" rel="noopener">Preview website</a>` : ''}
-        ${c.status === 'active' ? `<button class="btn" data-act="plan">Plan now</button><button class="btn" data-act="status" data-s="paused">Pause</button>` : ''}
-        ${c.status === 'paused' || c.status === 'archived' ? `<button class="btn primary" data-act="status" data-s="active">Resume</button>` : ''}
-      </div></div>
-      <nav class="tabs" aria-label="Company">${TABS.map(([k, l]) => `<a href="#/c/${cid}/${k}" class="${k === tab ? 'on' : ''}">${l}${k === 'overview' && d.stats.approvals ? ` <span class="count">${d.stats.approvals}</span>` : ''}</a>`).join('')}</nav>`;
+        ${url ? `<a class="small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url.replace(/^https?:\/\//, ''))}</a>` : ''}</div>`;
   };
+  const buttons = () => {
+    const c = d.company;
+    return `${d.has_site ? `<a class="btn" href="/preview/${esc(c.slug)}/" target="_blank" rel="noopener">Preview website</a>` : ''}
+        ${c.status === 'active' ? `<button class="btn" data-act="plan">Plan now</button><button class="btn" data-act="status" data-s="paused">Pause</button>` : ''}
+        ${c.status === 'paused' || c.status === 'archived' ? `<button class="btn primary" data-act="status" data-s="active">Resume</button>` : ''}`;
+  };
+  const tabs = () => TABS.map(([k, l]) => `<a href="#/c/${cid}/${k}" class="${k === tab ? 'on' : ''}">${l}${k === 'overview' && d.stats.approvals ? ` <span class="count">${d.stats.approvals}</span>` : ''}</a>`).join('');
+  const head = () => `<div class="co-head"><div id="co-title">${title()}</div>
+      <div class="co-side"><form class="co-search" data-form="co-search" role="search">
+          <input type="search" name="q" placeholder="Search files, context, tasks, email…" aria-label="Search everything this company knows" maxlength="200">
+          <select name="scope" aria-label="Where to search">${SEARCH_SCOPES.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}</select>
+          <button class="btn" type="submit">Search</button></form>
+        <div class="actions" id="co-actions">${buttons()}</div></div></div>
+      <nav class="tabs" aria-label="Company" id="co-tabs">${tabs()}</nav>`;
   const reload = async () => {
     d = await GET(`/api/companies/${cid}`);
     d.agentsById = Object.fromEntries(d.agents.map((a) => [a.id, a]));
   };
   const redrawHead = async () => {
     await reload();
-    const h = $('#co-head', el);
-    if (h) h.innerHTML = head();
+    if (!$('#co-title', el)) return;
+    $('#co-title', el).innerHTML = title();
+    $('#co-actions', el).innerHTML = buttons();
+    $('#co-tabs', el).innerHTML = tabs();
   };
   const refreshHeadSoon = debounce(() => redrawHead().then(() => tabView?.onCompany?.()).catch(() => {}), 700);
 
@@ -998,7 +1318,7 @@ function CompanyView(cid, tab, arg) {
       el = holder;
       await reload();
       el.innerHTML = `<div id="co-head">${head()}</div><div id="tab"></div>`;
-      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
+      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, context: TabContext, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
       tabView = factory(cid, () => d, arg, async () => { await redrawHead(); tabView?.onCompany?.(); });
       await tabView.mount($('#tab', el));
     },
@@ -1016,24 +1336,40 @@ function CompanyView(cid, tab, arg) {
         try { const r = await api('POST', `/api/companies/${cid}/cycle`); toast(r.message); } catch (err) { fail(err); }
         return;
       }
+      if (name === 'search-go') {   // a search hit: close the results and go there (the same place only closes them)
+        const href = t.getAttribute('href');
+        closeModal();
+        if (location.hash !== href) location.hash = href;
+        return;
+      }
+      if (name === 'search-run') { showTranscript(+t.dataset.id).catch(fail); return; }
       if (tabView?.act) return tabView.act(name, t, e);
     },
-    submit(name, form, e) { return tabView?.submit?.(name, form, e); },
+    submit(name, form, e) {
+      if (name === 'co-search') {
+        const btn = $('button[type=submit]', form);
+        btn.disabled = true;
+        companySearch(cid, form.q.value, form.scope.value).catch(fail).finally(() => { btn.disabled = false; });
+        return undefined;
+      }
+      return tabView?.submit?.(name, form, e);
+    },
   };
 }
 
 // ---- overview
 function TabOverview(cid, data) {
-  let el;
+  let el, facts = null, plan = null;
   const side = () => {
     const d = data();
     const c = d.company;
     const ceo = d.agents.find((a) => a.role === 'ceo');
     let banner = '';
     if (c.status === 'founding') {
+      const steps = plan && plan.founding_stage ? foundingSteps(plan.founding_stage) : '';
       banner = ceo && ceo.status === 'working'
-        ? `<div class="banner"><span class="spinner"></span><div class="grow"><b>${esc(ceo.name)} is founding the company.</b> Researching the market, writing a charter and setting up the first tasks. Follow along in the feed.</div></div>`
-        : `<div class="banner bad"><div class="grow"><b>Founding stopped before it finished.</b> Usually the model server wasn't reachable. Check Settings, then try again.</div><button class="btn" data-act="refound">Retry founding</button></div>`;
+        ? `<div class="banner"><span class="spinner"></span><div class="grow"><b>${esc(ceo.name)} is founding the company.</b> Researching the market, writing a charter, a skeptical review and the first tasks, each as a short session. Follow along in the feed.${steps}</div></div>`
+        : `<div class="banner bad"><div class="grow"><b>Founding stopped before it finished.</b> Usually the model server wasn't reachable. Check Settings, then try again.${steps}</div><button class="btn" data-act="refound">Retry founding</button></div>`;
     } else if (c.status === 'paused') {
       banner = `<div class="banner warn"><div class="grow"><b>Paused.</b> Agents finish their current step and then wait. Chat still works.</div><button class="btn primary" data-act="status" data-s="active">Resume</button></div>`;
     }
@@ -1049,18 +1385,78 @@ function TabOverview(cid, data) {
       ${d.metrics.map((m) => `<div class="kpi" title="${esc(m.note)}"><div class="v">${esc(Number(m.value).toLocaleString())}</div><div class="k">${esc(m.name.replace(/_/g, ' '))}</div></div>`).join('')}`;
     $('#ov-folder', el).innerHTML = `<p class="small muted" style="margin:0 0 6px">Everything the team makes is a normal file on your PC:</p><code class="small" style="overflow-wrap:anywhere">${esc(d.folder)}</code>`;
   };
+  // "What your agents know": the same facts block every agent gets in its prompt (GET /facts).
+  const drawFacts = () => {
+    const box = $('#ov-know', el);
+    if (!box || !facts) return;
+    const f = facts;
+    const waiting = f.waiting.length
+      ? `<li><b>Waiting on you</b> ${plural(f.waiting.length, 'item')}:<ul>${f.waiting.map((w) => `<li><a href="#/inbox">#${esc(w.id)}</a> ${esc(w.label)}: ${esc(w.summary)} <span class="faint small">${esc(w.age)}${w.asked_by ? `, from ${esc(w.asked_by)}` : ''}</span></li>`).join('')}</ul></li>`
+      : '<li><b>Waiting on you</b> nothing.</li>';
+    const accounts = f.accounts.length ? f.accounts.map((a) => esc(a.label)).join(', ') : 'none besides the local website';
+    const down = f.down.length
+      ? `<li class="warn-line"><b>Down right now</b> ${f.down.map((x) => `${esc(x.label)} (${esc(x.detail)})`).join('; ')}</li>`
+      : '<li class="faint"><b>Down right now</b> nothing Holdco knows of.</li>';
+    box.innerHTML = `<ul class="know">
+        <li>${factLine(f.website.line)}</li><li>${factLine(f.email.line)}</li><li>${factLine(f.social.line)}</li>
+        <li>${factLine(f.money.line)}</li>${waiting}<li><b>Accounts</b> ${accounts}</li>${down}<li>${factLine(f.signals.line)}</li></ul>
+      <details class="raw"><summary class="small muted">Exactly what the agents read</summary><pre class="small">${esc(f.text)}</pre></details>`;
+  };
+  // Planning effort (GET /planning): the next look, what waits on the owner, the daily token budget.
+  const drawPlan = () => {
+    const box = $('#ov-plan', el);
+    if (!box || !plan) return;
+    const c = data().company;
+    const b = plan.budget || {};
+    const lines = [];
+    let alert = '';
+    if (b.over) alert += `<div class="banner warn"><div class="grow"><b>Paused for today: daily token budget used.</b> ${fmtTokens(b.used)} of ${fmtTokens(b.budget)} tokens. Background work waits until midnight; chat and tasks you create still run.</div><a class="btn" href="#/c/${cid}/settings">Change the budget</a></div>`;
+    $('#ov-plan-banner', el).innerHTML = alert;
+    if (c.status === 'founding') {
+      lines.push(`<li><b>Founding</b> ${plan.founding_stage === 'done' ? 'finished' : `stage ${Math.max(1, FOUNDING_STEPS.findIndex(([k]) => k === plan.founding_stage) + 1)} of 4`}${foundingSteps(plan.founding_stage)}</li>`);
+    } else if (c.status === 'active') {
+      const mins = Math.ceil(plan.next_due_minutes || 0);
+      const w = plan.waiting;
+      let next = b.over ? 'paused for today: daily token budget used'
+        : w ? `waiting on you: ${w.what}${w.oldest_age ? `; the oldest has waited ${w.oldest_age}` : ''}. Planning is paused until something changes`
+          : mins <= 0 ? 'due now' : `next planning in ${plural(mins, 'minute')}`;
+      if (!b.over && !w && plan.cycle_backoff) next += ` (the interval doubled ${plural(plan.cycle_backoff, 'time')} because nothing changed)`;
+      if (!b.over && !w && plan.changed) next += '. Something changed since the last plan';
+      lines.push(`<li><b>Planning</b> ${esc(next)}.${w && !b.over ? ' <a class="small" href="#/inbox">Open Inbox</a>' : ''}</li>`);
+    } else {
+      lines.push(`<li><b>Planning</b> stopped while the company is ${esc(c.status)}.</li>`);
+    }
+    const pct = b.budget ? Math.min(100, Math.round((100 * b.used) / b.budget)) : 0;
+    lines.push(`<li><b>Tokens today</b> ${fmtTokens(b.used)}${b.budget ? ` of ${fmtTokens(b.budget)}` : ' (no daily limit)'}${b.budget ? `<div class="meter${b.over ? ' over' : ''}"><div class="bar"><span style="width:${pct}%"></span></div></div>` : ''}</li>`);
+    lines.push(`<li><b>Playbook</b> ${plan.archetype ? esc(archetypeLabel(plan.archetype)) : 'none matched yet'} <a class="small" href="#/c/${cid}/settings">Change</a></li>`);
+    box.innerHTML = `<ul class="know">${lines.join('')}</ul>`;
+    side();
+  };
+  const loadKnow = async () => {
+    const [f, pl] = await Promise.all([GET(`/api/companies/${cid}/facts`).catch(() => null), GET(`/api/companies/${cid}/planning`).catch(() => null)]);
+    if (!el) return;
+    if (f) { facts = f; drawFacts(); }
+    if (pl) { plan = pl.planning; drawPlan(); }
+  };
+  const loadKnowSoon = debounce(() => loadKnow().catch(() => {}), 1500);
   return {
     async mount(holder) {
       el = holder;
-      el.innerHTML = `<div id="ov-banner"></div><div class="cols">
+      el.innerHTML = `<div id="ov-banner"></div><div id="ov-plan-banner"></div><div class="cols">
         <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="ov-feed"></div></section>
-        <div class="stack"><section class="panel"><div class="panel-head"><h2>Team</h2><a class="small" href="#/c/${cid}/team">Manage</a></div><ul class="team-list" id="ov-team" style="padding-top:6px"></ul></section>
+        <div class="stack"><section class="panel"><div class="panel-head"><h2>What your agents know</h2><span class="small faint">From Holdco's records</span></div><div class="panel-body" id="ov-know"><span class="spinner"></span></div></section>
+          <section class="panel"><div class="panel-head"><h2>Planning</h2></div><div class="panel-body" id="ov-plan"><span class="spinner"></span></div></section>
+          <section class="panel"><div class="panel-head"><h2>Team</h2><a class="small" href="#/c/${cid}/team">Manage</a></div><ul class="team-list" id="ov-team" style="padding-top:6px"></ul></section>
           <section class="panel"><div class="panel-head"><h2>Numbers</h2></div><div class="kpis" id="ov-stats" style="padding-top:14px"></div></section>
           <section class="panel"><div class="panel-body" id="ov-folder"></div></section></div></div>`;
       mountFeed($('#ov-feed', el), cid);
       side();
+      await loadKnow();
     },
-    onCompany: () => side(),
+    live(ev) {
+      if (['approvals', 'company', 'tasks'].includes(ev.type) || (ev.type === 'event' && !['think', 'result'].includes(ev.kind))) loadKnowSoon();
+    },
+    onCompany: () => { side(); drawPlan(); },
     async act(name) {
       if (name === 'refound') {
         try { await api('POST', `/api/companies/${cid}/refound`); toast('Founding restarted.'); } catch (e) { fail(e); }
@@ -1330,7 +1726,7 @@ async function showTranscript(runId) {
 // ---- thinking: a live view of what each agent is reasoning and doing
 function TabMind(cid, data, arg) {
   let el, agentId = +arg || 0, showTools = true, items = [], oldest = 0, more = false;
-  const KINDS = 'think,result,run,done,error';
+  const KINDS = 'think,result,run,done,error,claims,question_deduped';
   const stepHtml = (ev) => {
     const a = S.agents[ev.agent_id];
     const d = ev.data || {};
@@ -1347,7 +1743,7 @@ function TabMind(cid, data, arg) {
       if (!showTools) return '';
       return `<li class="m-tool ${d.failed ? 'bad' : ''}"><details><summary>${d.failed ? '⚠ ' : '↳ '}${esc(d.name)} result <span class="faint small">${esc((d.result || '').replace(/\s+/g, ' ').slice(0, 110))}</span></summary><pre>${esc(d.result || '')}</pre></details></li>`;
     }
-    return `<li class="m-sep k-${esc(ev.kind)}">${who}: ${esc(ev.message)} <span class="faint small">${when(ev.created_at)}</span></li>`;
+    return `<li class="m-sep k-${esc(ev.kind)}">${eventBadge(ev)}${who}: ${esc(ev.message)} <span class="faint small">${when(ev.created_at)}</span></li>`;
   };
   const paint = (keepBottom) => {
     const box = $('#mind-box', el);
@@ -1470,6 +1866,11 @@ function TabFiles(cid, data, initial) {
   };
 }
 
+// ---- context: the company's own library (the owner's files agents read but never change)
+function TabContext(cid, _data, initial) {
+  return ContextLibrary({ base: `/api/companies/${cid}/context`, company: true, initial: initial || null, home: `#/c/${cid}/context` });
+}
+
 // ---- memory
 function TabMemory(cid) {
   let el;
@@ -1568,13 +1969,19 @@ function TabCharter(cid, data) {
 }
 
 // ---- company settings
+// Settings Holdco keeps for itself in the same JSON; the form never sends them (the server would accept founding_stage).
+const INTERNAL_COMPANY_SETTINGS = ['founding_stage', 'founding_retry', 'founding_research_note', 'founding_context', 'last_waiting_notice',
+  'budget_notice', 'truth_scan_done', 'pinned_context'];
+
 function TabSettings(cid, data) {
-  let el, global;
+  let el, global, plan = null;
   const draw = () => {
     const c = data().company;
     const s = c.settings;
     const pol = s.policies || {};
     const val = (k) => esc(s[k] ?? '');
+    const used = plan && plan.budget ? plan.budget.used : null;
+    const detected = !s.archetype && plan && plan.archetype ? ` (now: ${archetypeLabel(plan.archetype)})` : '';
     el.innerHTML = `<form class="panel" data-form="co-settings">
       <div class="section"><h2>Direction</h2>
         <label class="field">Standing orders<span class="hint">Every agent reads these in every session. Brand rules, things to avoid, priorities.</span>
@@ -1583,6 +1990,12 @@ function TabSettings(cid, data) {
           <label class="field">CEO re-plans every (minutes)<input type="number" name="cycle_minutes" min="5" value="${val('cycle_minutes')}"></label>
           <label class="field">Emails per day, max<input type="number" name="daily_email_limit" min="1" value="${val('daily_email_limit')}"></label>
           <label class="field">Company name<input type="text" name="name" value="${esc(c.name)}"></label>
+        </div>
+        <div class="form-grid" style="margin-top:14px">
+          <label class="field">Business type<span class="hint">Picks the playbook agents plan with: how money flows, first experiments, common traps.</span>
+            <select name="archetype"><option value="">Detect automatically${esc(detected)}</option>${ARCHETYPES.map(([k, l]) => `<option value="${k}" ${s.archetype === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+          <label class="field">Daily token budget<span class="hint">Background work stops for the day once this is used; chat and your own tasks still run. 0 = no limit.${used !== null ? ` Used today: ${esc(Number(used).toLocaleString())}.` : ''}</span>
+            <input type="number" name="daily_token_budget" min="0" step="100000" value="${val('daily_token_budget')}"></label>
         </div></div>
       <div class="section"><h2>Approvals for this company</h2><p class="muted">Override your global defaults.</p>
         <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
@@ -1597,6 +2010,8 @@ function TabSettings(cid, data) {
           <label class="field">From address<input type="email" name="smtp_from" value="${val('smtp_from')}"></label>
           <label class="field">From name<input type="text" name="smtp_from_name" value="${val('smtp_from_name')}" placeholder="${esc(c.name)}"></label>
         </div>
+        <label class="field" style="margin-top:14px">Postal address<span class="hint">Commercial email must include a postal address; agents can't email prospects until this is set.</span>
+          <input type="text" name="postal_address" value="${val('postal_address')}" placeholder="1 Main Street, Springfield, IL 62701" autocomplete="street-address"></label>
         <p class="muted" style="margin-top:16px">Receiving (IMAP). New mail becomes a task for the support agent.</p>
         <div class="form-grid">
           <label class="field">IMAP server<input type="text" name="imap_host" value="${val('imap_host')}" placeholder="imap.gmail.com"></label>
@@ -1620,14 +2035,23 @@ function TabSettings(cid, data) {
       <button class="btn danger" data-act="delete">Delete company</button></div></div></section>`;
   };
   return {
-    async mount(holder) { el = holder; global = await GET('/api/settings'); draw(); },
+    async mount(holder) {
+      el = holder;
+      const [g, pl] = await Promise.all([GET('/api/settings'), GET(`/api/companies/${cid}/planning`).catch(() => null)]);
+      global = g;
+      plan = pl && pl.planning;
+      draw();
+    },
     async submit(name, form) {
       const f = Object.fromEntries(new FormData(form));
       const settings = { policies: {} };
       for (const [k, v] of Object.entries(f)) {
         if (k.startsWith('policy_')) settings.policies[k.slice(7)] = v;
-        else if (k !== 'name') settings[k] = v;
+        else if (k !== 'name' && !INTERNAL_COMPANY_SETTINGS.includes(k)) settings[k] = v;
       }
+      const budget = parseInt(settings.daily_token_budget, 10);
+      if (Number.isFinite(budget)) settings.daily_token_budget = Math.max(0, budget); else delete settings.daily_token_budget;   // empty keeps the stored value
+      if (typeof settings.postal_address === 'string') settings.postal_address = settings.postal_address.trim();
       try {
         await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
         toast('Saved.');

@@ -182,6 +182,12 @@ def api_company(h, m, body):
             "folder": str(workspace.root(c))}
 
 
+# Company settings Holdco manages itself (staged founding, notices, the one-time truth check). The dashboard never
+# sends them; refusing them here keeps any other client from moving a founding stage by hand.
+INTERNAL_COMPANY_SETTINGS = {"founding_stage", "founding_retry", "founding_research_note", "founding_context",
+                             "last_waiting_notice", "budget_notice", "truth_scan_done", "name_locked", "template"}
+
+
 @route("PATCH", r"/api/companies/(\d+)")
 def api_company_patch(h, m, body):
     c = _company_or_404(m.group(1))
@@ -201,7 +207,7 @@ def api_company_patch(h, m, body):
     if "settings" in b and isinstance(b["settings"], dict):
         cs = db.company_settings(c)
         for k, v in b["settings"].items():
-            if k not in config.DEFAULT_COMPANY_SETTINGS:
+            if k not in config.DEFAULT_COMPANY_SETTINGS or k in INTERNAL_COMPANY_SETTINGS:
                 continue
             if isinstance(v, str) and v == "••••••••":
                 continue  # unchanged secret
