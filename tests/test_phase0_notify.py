@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-notify-")
 
-from holdco import actions, db, notify, roles, workspace  # noqa: E402
+from holdco import actions, db, notify, roles, server, workspace  # noqa: E402
 from tests.fake_telegram import FakeTelegram  # noqa: E402
 from tests.helpers import free_port, wait_for  # noqa: E402
 
@@ -51,6 +51,7 @@ def approval(aid: int) -> dict:
 
 
 def reset_state():
+    notify.flush()   # a send still on the sender thread must not land in the next test's records
     notify._recent.clear()
     notify._errors.clear()
     notify._failures.update(count=0, last_error="", last_at=None)
@@ -82,6 +83,16 @@ class NotifyCase(unittest.TestCase):
         db.set_settings(self.settings)
         reset_state()
         self.tg.clear()
+
+    def tearDown(self):
+        notify.flush()
+
+    def announce(self, row: dict) -> dict:
+        """approval_requested sends on the sender thread; wait for it so the test can look at the message."""
+        notify.approval_requested(row)
+        self.assertTrue(notify.flush(5), "the sender thread did not finish in time")
+        self.assertTrue(self.tg.sent, "nothing reached the fake Telegram")
+        return self.tg.sent[-1]
 
 
 class TestSend(NotifyCase):
@@ -191,7 +202,7 @@ class TestApprovalMessages(NotifyCase):
                                                           "body": "Hi Jo,\n\nWe built PawPlan & more. " + "x" * 400},
                             role="sales")
         agent = db.get_agent(row["agent_id"])
-        notify.approval_requested(row)
+        self.announce(row)
         self.assertEqual(len(self.tg.sent), 1)
         text = self.tg.sent[0]["text"]
         self.assertIn(f"<b>{agent['name']}</b> at <b>PawPlan</b>", text)
@@ -240,7 +251,7 @@ class TestApprovalMessages(NotifyCase):
         self.assertEqual([b[0]["data"] for b in buttons], [f"q:{row['id']}:0", f"q:{row['id']}:1", f"q:{row['id']}:2"])
         self.assertEqual(buttons[0][0]["text"], notify.CHECK + "Skip this task")
         self.assertEqual(buttons[1][0]["text"], "Retry once more with my note")
-        notify.approval_requested(row)
+        self.announce(row)
         self.assertEqual(len(self.tg.sent[0]["reply_markup"]["inline_keyboard"]), 3)
 
     def test_plain_question_without_options(self):
@@ -257,17 +268,19 @@ class TestApprovalMessages(NotifyCase):
         with contextlib.redirect_stdout(io.StringIO()):
             notify.approval_requested({"action": "send_email"})   # no id: the renderer fails, the hook swallows it
         self.assertEqual(notify._failures["count"], 1)
-        notify.approval_requested({"id": 999999, "action": "send_email", "payload": "{not json"})
+        self.announce({"id": 999999, "action": "send_email", "payload": "{not json"})
         self.assertEqual(len(self.tg.sent), 1)   # no company or agent: still rendered with fallbacks
         self.assertIn("<b>An agent</b> at <b>Holdco</b>", self.tg.sent[0]["text"])
 
     def test_error_rate_limited_per_message_per_hour(self):
         notify.error(self.company, "Webhook returned HTTP 500: boom")
         notify.error(self.company, "Webhook returned HTTP 500: boom")
+        self.assertTrue(notify.flush())   # the hourly rule is decided synchronously; the send is in the background
         self.assertEqual(len(self.tg.sent), 1)
         self.assertIn("<b>Error</b> at <b>PawPlan</b>: Webhook returned HTTP 500: boom", self.tg.sent[0]["text"])
         self.assertEqual(self.tg.ntfy[0]["priority"], "high")
         notify.error(None, "Model server unreachable <timeout>")
+        self.assertTrue(notify.flush())
         self.assertEqual(len(self.tg.sent), 2)
         self.assertIn("<b>Error</b>: Model server unreachable &lt;timeout&gt;", self.tg.sent[1]["text"])
         # An hour later the same error is reported again (send()'s identical-text rule expires with it).
@@ -275,6 +288,7 @@ class TestApprovalMessages(NotifyCase):
         notify._errors[key] = time.time() - notify.ERROR_REPEAT_SECONDS - 1
         notify._recent.clear()
         notify.error(self.company, "Webhook returned HTTP 500: boom")
+        self.assertTrue(notify.flush())
         self.assertEqual(len(self.tg.sent), 3)
 
     def test_normalise_collapses_numbers_and_urls(self):
@@ -287,9 +301,11 @@ class TestApprovalMessages(NotifyCase):
         from holdco import bus
         bus.emit(self.company["id"], "error", "Send email failed: SMTP login refused")
         bus.emit(self.company["id"], "error", "Send email failed: SMTP login refused")
+        self.assertTrue(notify.flush())
         self.assertEqual(len(self.tg.sent), 1)
         self.assertIn("SMTP login refused", self.tg.sent[0]["text"])
         bus.emit(self.company["id"], "info", "not an error")
+        self.assertTrue(notify.flush())
         self.assertEqual(len(self.tg.sent), 1)
 
 
@@ -310,7 +326,7 @@ class TestPoller(NotifyCase):
 
     def test_approve_button_runs_the_request(self):
         row = make_approval(self.company, "social_post", {"platform": "x", "content": "Meet PawPlan"})
-        notify.approval_requested(row)
+        self.announce(row)
         mid = self.tg.sent[-1]["message_id"]
         self.tg.push_callback(f"a:{row['id']}:approve", message_id=mid)
         wait_for(lambda: len(self.tg.edits) >= 2, 10, 0.05, "the message to be edited")
@@ -328,7 +344,7 @@ class TestPoller(NotifyCase):
 
     def test_reject_button(self):
         row = make_approval(self.company, "social_post", {"platform": "x", "content": "Reject me"})
-        notify.approval_requested(row)
+        self.announce(row)
         self.tg.push_callback(f"a:{row['id']}:reject", message_id=self.tg.sent[-1]["message_id"])
         wait_for(lambda: len(self.tg.edits) >= 2, 10, 0.05, "the message to be edited")
         self.assertEqual(approval(row["id"])["status"], "rejected")
@@ -343,7 +359,7 @@ class TestPoller(NotifyCase):
         payload = {"question": "Task failed twice. What now?", "options": options, "recommended": "Skip this task",
                    "pattern": f"task_failed_twice:{tid}", "task_id": tid, "company_id": self.company["id"]}
         row = make_approval(self.company, "question", payload, role="ceo", task_id=tid)
-        notify.approval_requested(row)
+        self.announce(row)
         self.tg.push_callback(f"q:{row['id']}:1", message_id=self.tg.sent[-1]["message_id"])
         wait_for(lambda: len(self.tg.edits) >= 2, 10, 0.05, "the message to be edited")
         r = approval(row["id"])
@@ -356,7 +372,7 @@ class TestPoller(NotifyCase):
 
     def test_callback_from_another_chat_is_ignored(self):
         row = make_approval(self.company, "social_post", {"platform": "x", "content": "Stranger danger"})
-        notify.approval_requested(row)
+        self.announce(row)
         self.tg.push_callback(f"a:{row['id']}:approve", message_id=self.tg.sent[-1]["message_id"], chat_id=99)
         self.tg.push_message("/status")   # processed after the stranger's update, so its reply proves the order
         self.wait_sent("Kill switch")
@@ -495,10 +511,15 @@ class TestHealthAndTestButton(NotifyCase):
         self.assertFalse(r["ok"])
         self.assertEqual(r["chat_ids"], [])
         self.assertIn("Send any message to your bot", r["detail"])
+        # Phase 0 fix: anyone who finds the bot can message it, so the ids are listed, never presented as "yours".
+        self.tg.push_message("hi", chat_id=99)   # a stranger got there first
         self.tg.push_message("hi")
         r = notify.api_notify_test(None, None, {})
-        self.assertEqual(r["chat_ids"], [42])
-        self.assertIn("Your chat id is 42", r["detail"])
+        self.assertEqual(r["chat_ids"], [99, 42])
+        self.assertIn("Chat ids that have messaged the bot: 99, 42", r["detail"])
+        self.assertIn("make sure the one you save is yours", r["detail"])
+        self.assertNotIn("Your chat id is", r["detail"])
+        self.assertEqual(db.get_settings()["telegram_chat_id"], "")   # nothing is saved on the owner's behalf
         db.set_settings({"telegram_bot_token": "", "ntfy_topic": ""})
         r = notify.api_notify_test(None, None, {})
         self.assertFalse(r["ok"])
@@ -511,12 +532,150 @@ class TestHealthAndTestButton(NotifyCase):
     def test_set_kill_switch_helper(self):
         self.assertTrue(notify.set_kill_switch(True))
         self.assertTrue(db.get_settings()["kill_switch"])
+        self.assertTrue(notify.flush())   # the confirmation goes through the sender thread
         self.assertEqual(self.tg.sent[-1]["text"], notify.KILL_ON_TEXT)
         self.assertFalse(notify.set_kill_switch(False))
         self.assertFalse(db.get_settings()["kill_switch"])
+        self.assertTrue(notify.flush())
         self.assertEqual(self.tg.sent[-1]["text"], notify.KILL_OFF_TEXT)
         last = db.one("SELECT data FROM events ORDER BY id DESC LIMIT 1")
         self.assertEqual(json.loads(last["data"]), {"by": "owner"})
+
+
+class TestScrub(NotifyCase):
+    """The bot token never leaves the process in an error text (Phase 0 fix)."""
+
+    def test_scrub_masks_the_token_and_the_bot_url(self):
+        s = {"telegram_bot_token": "123456:ABC-SECRET\n", "telegram_api_base": "https://api.telegram.org"}
+        # http.client quotes the URL with repr(), so the pasted newline shows up as the two characters "\n".
+        out = notify.scrub("URL can't contain control characters. '/bot123456:ABC-SECRET\\n/getMe' "
+                           "(found at least '\\n')", s)
+        self.assertNotIn("ABC-SECRET", out)
+        self.assertIn("'[token]/getMe'", out)
+        self.assertEqual(notify.scrub("unknown url type: 'api.telegram.org/bot123456:ABC-SECRET/sendMessage'", s),
+                         "unknown url type: '[token]/sendMessage'")
+        self.assertEqual(notify.scrub("https://api.telegram.org/bot123456:ABC-SECRET", s), "[token]")
+        self.assertEqual(notify.scrub("token 123456:ABC-SECRET\n was rejected", s), "token [token] was rejected")
+        self.assertEqual(notify.scrub("Telegram getMe: HTTP 401 Unauthorized", s),
+                         "Telegram getMe: HTTP 401 Unauthorized")
+        self.assertEqual(notify.scrub("http://127.0.0.1:9/botXYZ/getMe", {}), "[token]/getMe")   # URL shape alone
+        self.assertEqual(notify.scrub(None, {}), "")
+        self.assertEqual(notify.scrub("plain " + self.tg.token), "plain [token]")   # settings read from the database
+        self.assertIs(notify._scrub, notify.scrub)
+
+    def test_malformed_api_base_or_token_never_leaks(self):
+        secret = "123456:ABC-SECRET"
+        # No scheme on the api base: urllib's ValueError quotes the whole URL, token included.
+        db.set_settings({"telegram_api_base": "api.telegram.org", "telegram_bot_token": secret, "ntfy_topic": ""})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(notify.send("Hello", kind="important"))
+            ok, why = notify.check_telegram()
+            status, detail = notify.health()
+            r = notify.api_notify_test(None, None, {})
+            db.set_settings({"telegram_chat_id": ""})
+            r2 = notify.api_notify_test(None, None, {})
+        self.assertFalse(ok)
+        self.assertEqual(status, "bad")
+        self.assertFalse(r["ok"])
+        self.assertIn("Could not send", r["detail"])
+        self.assertEqual(r2["chat_ids"], [])   # no 500 either: discover_chat_ids swallows the bad URL
+        for text in (out.getvalue(), notify._failures["last_error"], why, detail, json.dumps(r), json.dumps(r2)):
+            self.assertNotIn("ABC-SECRET", text)
+        self.assertIn("[token]", why)
+        # A token pasted with a trailing newline: http.client refuses the URL and quotes it in the message.
+        db.set_settings({"telegram_api_base": self.tg.url, "telegram_bot_token": secret + "\n",
+                         "telegram_chat_id": str(self.tg.chat_id)})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(notify.send("Hello", kind="important"))
+            ok, why = notify.check_telegram()
+        self.assertFalse(ok)
+        for text in (out.getvalue(), notify._failures["last_error"], why):
+            self.assertNotIn("ABC-SECRET", text)
+            self.assertIn("[token]", text)
+
+
+class TestHooksNeverBlock(NotifyCase):
+    """The hooks hand their sends to the sender thread: the caller is back long before the phone answers."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.company = make_company("SlowCo", ("ceo", "marketing"))
+
+    def setUp(self):
+        super().setUp()
+        self.tg.delay = 1.0   # the fake answers sendMessage after a second, like a bad phone network
+
+    def tearDown(self):
+        super().tearDown()
+        self.tg.delay = 0.0
+
+    def test_approval_and_error_hooks_return_at_once(self):
+        row = make_approval(self.company, "social_post", {"platform": "x", "content": "Slow phone"})
+        t0 = time.monotonic()
+        notify.approval_requested(row)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertEqual(self.tg.sent, [])
+        wait_for(lambda: len(self.tg.sent) == 1, 2, 0.02, "the request to reach the phone")
+        self.assertIn("Slow phone", self.tg.sent[0]["text"])
+        t0 = time.monotonic()
+        notify.error(self.company, "Deploy failed: HTTP 500")
+        notify.error(self.company, "Deploy failed: HTTP 500")   # the hourly rule is decided here, synchronously
+        self.assertLess(time.monotonic() - t0, 0.5)
+        wait_for(lambda: len(self.tg.sent) == 2, 2, 0.02, "the error to reach the phone")
+        self.assertTrue(notify.flush())
+        self.assertEqual(len(self.tg.sent), 2)
+        self.assertEqual(len(self.tg.ntfy), 2)
+
+    def test_gate_returns_before_the_phone_is_reached(self):
+        agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='marketing'", (self.company["id"],))
+        t0 = time.monotonic()
+        out = actions.gate(self.company, agent, None, "social_post", {"platform": "x", "content": "Gate speed"})
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertIn("Queued for the owner's approval", out)
+        self.assertEqual(self.tg.sent, [])
+        m = wait_for(lambda: next((m for m in self.tg.sent if "Gate speed" in m["text"]), None), 2, 0.02,
+                     "the request to reach the phone")
+        self.assertEqual(m["reply_markup"]["inline_keyboard"][0][0]["text"], "Approve")
+
+
+class TestKillSwitch(NotifyCase):
+    """The confirmation skips the identical-text rule, and the dashboard route shares the helper (Phase 0 fix)."""
+
+    def test_confirmed_every_time_even_within_the_hour(self):
+        self.assertTrue(notify.set_kill_switch(True))
+        self.assertFalse(notify.set_kill_switch(False))
+        self.assertTrue(notify.set_kill_switch(True))   # ON again minutes later: still confirmed
+        self.assertTrue(notify.flush())
+        self.assertEqual([m["text"] for m in self.tg.sent],
+                         [notify.KILL_ON_TEXT, notify.KILL_OFF_TEXT, notify.KILL_ON_TEXT])
+        self.assertEqual([n["body"] for n in self.tg.ntfy],
+                         [notify.KILL_ON_TEXT, notify.KILL_OFF_TEXT, notify.KILL_ON_TEXT])
+        self.assertTrue(db.get_settings()["kill_switch"])
+
+    def test_api_kill_uses_the_helper(self):
+        self.tg.delay = 0.5
+        try:
+            t0 = time.monotonic()
+            out = server.api_kill(None, None, {"on": True})
+            self.assertLess(time.monotonic() - t0, 0.3)   # the button answers before Telegram does
+            self.assertEqual(out, {"kill_switch": True})
+            self.assertEqual(server.api_kill(None, None, {"on": True}), {"kill_switch": True})
+            self.assertTrue(notify.flush())
+        finally:
+            self.tg.delay = 0.0
+        self.assertEqual([m["text"] for m in self.tg.sent], [notify.KILL_ON_TEXT, notify.KILL_ON_TEXT])
+        ev = db.one("SELECT * FROM events WHERE kind='info' ORDER BY id DESC LIMIT 1")
+        self.assertIn("Kill switch ON", ev["message"])
+        self.assertEqual(json.loads(ev["data"])["by"], "owner")
+        self.assertEqual(server.api_kill(None, None, {"on": False}), {"kill_switch": False})
+        self.assertTrue(notify.flush())
+        self.assertEqual(self.tg.sent[-1]["text"], notify.KILL_OFF_TEXT)
+        self.assertFalse(db.get_settings()["kill_switch"])
+        from holdco import routing
+        self.assertTrue(any(mth == "POST" and rx.match("/api/kill") for mth, rx, _ in routing.ROUTES))
 
 
 if __name__ == "__main__":

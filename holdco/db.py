@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import sqlite3
 import threading
 from typing import Any
@@ -206,7 +207,50 @@ def get_settings() -> dict:
     return s
 
 
+NOTIFY_LEVELS = ("important", "all")
+# Whole-number settings and the range they are clamped into (None = no upper bound). Out-of-range values are
+# pulled back silently because the form cannot produce anything harmful here, only something useless.
+SETTING_RANGES = {
+    "max_task_attempts": (1, 5),
+    "backup_keep": (1, 90),
+    "num_ctx": (2048, None),
+    "max_concurrent_runs": (1, 8),
+}
+_CHAT_ID_RE = re.compile(r"^-?\d+$")   # a Telegram chat id is a number; groups and channels are negative
+
+
+def validate_settings(values: dict) -> dict:
+    """Normalise the settings being saved and refuse the ones that would fail quietly later.
+
+    Numbers in SETTING_RANGES are clamped. A Telegram chat id is stripped and must be digits (with an optional
+    leading minus); notify_level must be "important" or "all". Those two raise ValueError, which the API turns
+    into a 400, because a wrong chat id makes every send fail with "chat not found" and an unknown level
+    would silently drop escalations.
+    """
+    out = {}
+    for k, v in values.items():
+        if k in SETTING_RANGES:
+            try:
+                n = v if isinstance(v, int) else int(float(str(v).strip()))
+            except (TypeError, ValueError):
+                raise ValueError(f"{k} must be a whole number") from None
+            low, high = SETTING_RANGES[k]
+            v = max(low, n if high is None else min(n, high))
+        elif k == "notify_level":
+            v = str(v or "").strip().lower()
+            if v not in NOTIFY_LEVELS:
+                raise ValueError("notify_level must be 'important' or 'all'")
+        elif k == "telegram_chat_id":
+            v = str(v or "").strip()
+            if v and not _CHAT_ID_RE.match(v):
+                raise ValueError("The Telegram chat id is a number (for example 123456789, or -100123456789 "
+                                 "for a group). Message your bot, press Send test message, and copy it from there.")
+        out[k] = v
+    return out
+
+
 def set_settings(values: dict) -> dict:
+    values = validate_settings(values)
     allowed = set(config.DEFAULT_SETTINGS) | {"policies"}
     for k, v in values.items():
         if k in allowed:

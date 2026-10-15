@@ -12,6 +12,7 @@ a test queue updates (button presses, text commands) for the next getUpdates cal
 Records: sent (sendMessage bodies with the message_id assigned), edits (editMessageReplyMarkup and
 editMessageText bodies, with "method"), answered (answerCallbackQuery bodies), ntfy ({"topic", "body", "title",
 "priority"}), requests (every Bot API call: {"method", "body"}). `edited` and `push_text` are aliases.
+Set `delay` (seconds) to make sendMessage answer slowly, for tests that prove the hooks never wait on the phone.
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ class FakeTelegram:
         self.answered: list[dict] = []
         self.ntfy: list[dict] = []
         self.requests: list[dict] = []
+        self.delay = 0.0   # seconds sendMessage sleeps before answering (a slow phone network, for the hook tests)
         self._updates: list[dict] = []
         self._cv = threading.Condition()
         self._next_update = 1000
@@ -96,6 +98,8 @@ class FakeTelegram:
                 if method == "getUpdates":
                     return self._json(200, {"ok": True, "result": outer._poll(body)})
                 if method == "sendMessage":
+                    if outer.delay:
+                        time.sleep(outer.delay)
                     if not str(body.get("text") or "").strip():
                         return self._json(400, {"ok": False, "error_code": 400,
                                                 "description": "Bad Request: message text is empty"})

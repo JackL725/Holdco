@@ -1,14 +1,17 @@
 """Nightly backups of the data folder (Phase 0). Keeps the newest `backup_keep` zip files.
 
 A backup is one zip: holdco.db (copied with sqlite3's online backup API, so it is consistent even while agents
-write), companies/ (without run logs, trash and build junk) and the vault files when they exist. Restore is
-manual: stop Holdco, unzip the archive over the data folder, start Holdco again.
+write), companies/ (without run logs, trash and build junk) and the vault files when they exist. Only regular
+files go in: a symlink an agent made could point anywhere on the PC (a private key, say) and a pipe or device
+would make the backup thread wait forever, so those are skipped and counted in the "Backup written" event.
+Restore is manual: stop Holdco, unzip the archive over the data folder, start Holdco again.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -69,15 +72,45 @@ def last_backup() -> dict | None:
     return rows[0] if rows else None
 
 
-def _company_files():
-    """(absolute path, zip name) for every file worth keeping under companies/."""
+def _is_regular_file(p: Path) -> bool:
+    """True for a plain file. lstat looks at the entry itself, so a symlink is never followed."""
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
+def _is_link(p: Path) -> bool:
+    """A symlink, or a junction on Windows (which os.walk would otherwise descend into)."""
+    try:
+        return p.is_symlink() or bool(getattr(p, "is_junction", lambda: False)())
+    except OSError:
+        return False
+
+
+def _company_files(skipped: list | None = None):
+    """(absolute path, zip name) for every regular file worth keeping under companies/. Symlinks (to files or
+    folders) and special files are left out and appended to `skipped` when a list is given."""
     root = config.COMPANIES_DIR
     if not root.exists():
         return
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        keep = []
+        for d in sorted(dirnames):
+            if d in SKIP_DIRS:
+                continue
+            if _is_link(Path(dirpath) / d):
+                if skipped is not None:
+                    skipped.append(Path(dirpath) / d)
+                continue
+            keep.append(d)
+        dirnames[:] = keep
         for name in sorted(filenames):
             p = Path(dirpath) / name
+            if not _is_regular_file(p):
+                if skipped is not None:
+                    skipped.append(p)
+                continue
             yield p, "companies/" + p.relative_to(root).as_posix()
 
 
@@ -112,6 +145,7 @@ def prune(keep: int | None = None) -> list[Path]:
 
 def run_backup() -> Path:
     """Write data/backups/holdco-YYYYMMDD-HHMMSS.zip (consistent DB copy + company folders) and prune old ones."""
+    skipped: list = []
     with _run_lock:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -122,19 +156,21 @@ def run_backup() -> Path:
             db.backup_to(tmp_db)
             with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
                 z.write(tmp_db, "holdco.db")
-                for p, arc in _company_files():
+                for p, arc in _company_files(skipped):
                     try:
                         z.write(p, arc)
                     except OSError:
                         pass   # a file an agent is replacing right now: the next backup gets it
                 for name in EXTRA_FILES:
                     p = config.DATA_DIR / name
-                    if p.is_file():
+                    if _is_regular_file(p):
                         z.write(p, name)
         part.replace(final)
         prune()
     size = final.stat().st_size
-    bus.emit(None, "info", f"Backup written: {final.name} ({size / 1e6:.1f} MB)", None, {"path": str(final)})
+    note = f"; skipped {len(skipped)} link{'s' if len(skipped) != 1 else ''} or special file(s)" if skipped else ""
+    bus.emit(None, "info", f"Backup written: {final.name} ({size / 1e6:.1f} MB{note})", None,
+             {"path": str(final), "skipped": len(skipped)})
     return final
 
 

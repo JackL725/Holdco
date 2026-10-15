@@ -1,11 +1,22 @@
 """Doctor: health checks for everything Holdco depends on (Phase 0).
 
-Each check returns a row {key, label, status: ok|warn|bad, detail, fix, checked_at}. The scheduler refreshes
-the rows hourly, the Doctor page shows them, and founding runs the preflight subset first.
+Each check returns a row {key, label, status: ok|warn|bad, detail, fix, checked_at, run}. The scheduler
+refreshes the rows hourly, the Doctor page shows them, and founding runs the preflight subset first.
+
+Run numbers: every full run() takes the next integer and stamps it into each of its rows as "run" (summary()
+repeats it). preflight() refreshes only the model rows and the search row; _merge() slots those into the cache
+under the cache's current run number and leaves the other rows, including their checked_at, untouched. So a
+consumer that remembers the last "run" it counted (the watchdog's connector streaks) sees a new number only
+for a new full run, never for a founding preflight. Rows built outside a full run carry run 0.
+
+Connector rows are keyed "connector:<name>:<company id>" for a company's connectors and "connector:telegram"
+or "connector:ntfy" for the global ones; every connector row also carries "company_id" (None for the global
+ones), so nobody has to parse the key.
 
 The checks run in parallel daemon threads with a cap each, so one slow mail server never stalls the page or
 the scheduler. run() never raises: a check that blows up becomes a "bad" row with the error in its detail.
-Nothing here is shown to agents and no secret (token, password) is ever written into a row.
+Nothing here is shown to agents and no secret (token, password) is ever written into a row: error texts that
+could quote a request URL go through notify.scrub, which masks the Telegram bot token.
 """
 from __future__ import annotations
 
@@ -20,12 +31,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import backup, config, db, emailer, llm, web
+from . import backup, config, db, emailer, llm, notify, web
 from .routing import route
 
 LAST: list[dict] = []          # most recent rows, newest run
 _lock = threading.Lock()
 _refreshing = False            # a background refresh is in flight (refresh_if_stale never starts two)
+_run_seq = 0                   # number of the newest full run(); its rows carry it as "run"
+# Windows only: without this flag nvidia-smi flashes a console window every hour when Holdco was started
+# hidden by the autostart. Zero everywhere else, which subprocess accepts.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Internal tunables (module constants; the owner never needs to edit them).
 CHECK_TIMEOUT = 15             # seconds a normal check may take before its row says "timed out"
@@ -51,7 +66,7 @@ _last_login: dict[str, tuple[float, dict]] = {}   # connector key -> (time of th
 
 def _row(key: str, label: str, status: str, detail: str, fix: dict | None = None) -> dict:
     return {"key": key, "label": label, "status": status, "detail": (detail or "")[:400], "fix": fix,
-            "checked_at": db.now()}
+            "checked_at": db.now(), "run": 0}
 
 
 def _link(label: str, href: str) -> dict:
@@ -82,10 +97,12 @@ def _ago(hours: float) -> str:
 
 class _Job:
     """One check: `fn` returns a row or a list of rows; `metas` names the rows it is responsible for, so a
-    crash or a timeout can still produce a row per key."""
+    crash or a timeout can still produce a row per key. `company_id` is the company a connector job belongs
+    to (None for a global connector); it is stamped into every connector row the job produces."""
 
-    def __init__(self, metas: list[tuple[str, str, dict | None]], fn, timeout: float = CHECK_TIMEOUT):
-        self.metas, self.fn, self.timeout = metas, fn, timeout
+    def __init__(self, metas: list[tuple[str, str, dict | None]], fn, timeout: float = CHECK_TIMEOUT,
+                 company_id: int | None = None):
+        self.metas, self.fn, self.timeout, self.company_id = metas, fn, timeout, company_id
 
 
 def _run_jobs(jobs: list[_Job]) -> list[dict]:
@@ -96,7 +113,9 @@ def _run_jobs(jobs: list[_Job]) -> list[dict]:
             out = job.fn()
             results[i] = out if isinstance(out, list) else [out]
         except Exception as e:  # a failing check is a bad row, never a crash
-            results[i] = [_row(k, label, "bad", f"Check failed: {e}", fix) for k, label, fix in job.metas]
+            # The error text may quote a request URL, so it is scrubbed before it becomes a row.
+            detail = notify.scrub(f"Check failed: {e}")
+            results[i] = [_row(k, label, "bad", detail, fix) for k, label, fix in job.metas]
 
     threads = [threading.Thread(target=work, args=(i, j), daemon=True, name=f"doctor-{j.metas[0][0]}")
                for i, j in enumerate(jobs)]
@@ -109,6 +128,9 @@ def _run_jobs(jobs: list[_Job]) -> list[dict]:
         got = results[i]
         if got is None:
             got = [_row(k, label, "bad", f"Timed out after {job.timeout:.0f} s", fix) for k, label, fix in job.metas]
+        for r in got:
+            if str(r.get("key") or "").startswith("connector:"):
+                r["company_id"] = job.company_id   # also on crash and timeout rows, so every connector row has it
         rows.extend(got)
     return rows
 
@@ -156,7 +178,7 @@ def _gpu_memory_note() -> str:
         return ""
     try:
         out = subprocess.run([exe, "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5)
+                             capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
         line = (out.stdout or "").strip().splitlines()[0]
         used, total = [float(x.strip()) for x in line.split(",")[:2]]
         return f"; GPU memory {used / 1024:.1f} of {total / 1024:.1f} GB in use (nvidia-smi)"
@@ -272,14 +294,18 @@ def _telegram_row(s: dict) -> dict:
     token = s.get("telegram_bot_token") or ""
     chat = str(s.get("telegram_chat_id") or "").strip()
     base = (s.get("telegram_api_base") or "https://api.telegram.org").rstrip("/")
+    # The request is built inside the try: a malformed api base or a token pasted with a newline makes urllib
+    # raise with the whole URL, token included, in the message. Every such text is scrubbed before it is a row.
     try:
-        with urllib.request.urlopen(f"{base}/bot{token}/getMe", timeout=NET_TIMEOUT) as resp:
+        req = urllib.request.Request(f"{base}/bot{token}/getMe", headers={"User-Agent": "Holdco"})
+        with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as e:
         why = "rejected the bot token" if e.code in (401, 404) else "answered"
         return _row(key, label, "bad", f"Telegram {why} (HTTP {e.code}).", fix)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return _row(key, label, "bad", f"Could not reach Telegram: {getattr(e, 'reason', e)}", fix)
+    except Exception as e:   # URLError, OSError, http.client.InvalidURL, ValueError: none of them is safe to show raw
+        return _row(key, label, "bad",
+                    notify.scrub(f"Could not reach Telegram: {getattr(e, 'reason', None) or e}", s), fix)
     if not isinstance(data, dict) or not data.get("ok"):
         return _row(key, label, "bad", "Telegram rejected the bot token.", fix)
     name = (data.get("result") or {}).get("username") or "bot"
@@ -307,7 +333,8 @@ def _webhook_row(key: str, label: str, fix: dict, url: str) -> dict:
 
 
 def _connector_jobs(s: dict, recheck: bool) -> list[_Job]:
-    """One job per configured connector per company (archived companies skipped), plus the global ones."""
+    """One job per configured connector per company (archived companies skipped), plus the global ones.
+    Each job carries its company id, which _run_jobs stamps into the rows as "company_id"."""
     jobs: list[_Job] = []
     for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
         cs = db.company_settings(c)
@@ -316,19 +343,19 @@ def _connector_jobs(s: dict, recheck: bool) -> list[_Job]:
         if emailer.smtp_configured(cs):
             key, label = f"connector:smtp:{cid}", f"Email sending ({cname})"
             jobs.append(_Job([(key, label, fix)], lambda k=key, lb=label, f=fix, cs=cs: _login_row(
-                k, lb, f, lambda: emailer.test_smtp(cs), recheck)))
+                k, lb, f, lambda: emailer.test_smtp(cs), recheck), company_id=cid))
         if emailer.imap_configured(cs):
             key, label = f"connector:imap:{cid}", f"Email receiving ({cname})"
             jobs.append(_Job([(key, label, fix)], lambda k=key, lb=label, f=fix, cs=cs: _login_row(
-                k, lb, f, lambda: emailer.test_imap(cs), recheck)))
+                k, lb, f, lambda: emailer.test_imap(cs), recheck), company_id=cid))
         if cs.get("netlify_token"):
             key, label = f"connector:netlify:{cid}", f"Website deploys ({cname})"
             jobs.append(_Job([(key, label, fix)], lambda k=key, lb=label, f=fix, t=str(cs["netlify_token"]):
-                             _netlify_row(k, lb, f, t)))
+                             _netlify_row(k, lb, f, t), company_id=cid))
         if cs.get("webhook_url"):
             key, label = f"connector:webhook:{cid}", f"Posting webhook ({cname})"
             jobs.append(_Job([(key, label, fix)], lambda k=key, lb=label, f=fix, u=str(cs["webhook_url"]):
-                             _webhook_row(k, lb, f, u)))
+                             _webhook_row(k, lb, f, u), company_id=cid))
     if s.get("telegram_bot_token"):
         jobs.append(_Job([("connector:telegram", "Telegram bot", None)], lambda: _telegram_row(s)))
     if s.get("ntfy_topic"):
@@ -384,7 +411,9 @@ def _check_errors() -> dict:
 
 def run(deep: bool = False, force: bool = False) -> list[dict]:
     """Run every check and cache the rows. deep=True also runs slow checks (model tool-call ping, live search).
-    force=True (a manual "Run checks") retests every connector login even when the backoff would skip it."""
+    force=True (a manual "Run checks") retests every connector login even when the backoff would skip it.
+    The rows get the next run number (see the module docstring)."""
+    global _run_seq
     try:
         s = db.get_settings()
         long = DEEP_TIMEOUT if deep else CHECK_TIMEOUT
@@ -403,19 +432,28 @@ def run(deep: bool = False, force: bool = False) -> list[dict]:
         rows = _run_jobs(jobs)
     except Exception as e:  # the Doctor must never take the scheduler or the page down with it
         traceback.print_exc()
-        rows = [_row("doctor", "Doctor", "bad", f"The health checks could not run: {e}")]
+        rows = [_row("doctor", "Doctor", "bad", notify.scrub(f"The health checks could not run: {e}"))]
     with _lock:
+        _run_seq += 1
+        for r in rows:
+            r["run"] = _run_seq
         LAST[:] = rows
     return rows
 
 
 def _merge(rows: list[dict]) -> None:
     """Refresh the cached copy of these rows so the sidebar dot agrees with what founding just saw.
-    An empty cache stays empty so the scheduler still runs the full set soon."""
+
+    Only the given keys are replaced: every other cached row keeps its checked_at, and the merged rows take the
+    cache's run number, so a consumer that counts Doctor runs by "run" does not mistake a preflight for a new
+    run. An empty cache stays empty so the scheduler still runs the full set soon."""
     with _lock:
         if not LAST:
             return
+        current = LAST[0].get("run", 0)
         by_key = {r["key"]: r for r in rows}
+        for r in by_key.values():
+            r["run"] = current
         for i, r in enumerate(LAST):
             if r["key"] in by_key:
                 LAST[i] = by_key.pop(r["key"])
@@ -445,9 +483,18 @@ def preflight() -> dict:
 
 
 def summary(rows: list[dict] | None = None) -> dict:
+    """Counts per status plus the first row's checked_at and the run number the rows belong to (0 = none yet)."""
     rows = LAST if rows is None else rows
     return {"ok": sum(r["status"] == "ok" for r in rows), "warn": sum(r["status"] == "warn" for r in rows),
-            "bad": sum(r["status"] == "bad" for r in rows), "checked_at": rows[0]["checked_at"] if rows else None}
+            "bad": sum(r["status"] == "bad" for r in rows), "checked_at": rows[0]["checked_at"] if rows else None,
+            "run": rows[0].get("run", 0) if rows else 0}
+
+
+def _cache_age_minutes() -> float:
+    """Age of the oldest cached row. A preflight merge refreshes a few rows only; the rest must still be redone
+    on time, so the hourly refresh looks at the oldest row rather than the first one."""
+    ages = [db.minutes_since(r.get("checked_at")) for r in LAST if isinstance(r, dict)]
+    return max(ages, default=1e9)
 
 
 def search_status() -> dict | None:
@@ -475,7 +522,7 @@ def refresh_if_stale(max_age_minutes: float = 60) -> None:
     with _lock:
         if _refreshing:
             return
-        if LAST and db.minutes_since(LAST[0].get("checked_at")) < max_age_minutes:
+        if LAST and _cache_age_minutes() < max_age_minutes:
             return
         _refreshing = True
 

@@ -2,13 +2,18 @@
 
 Long polling (getUpdates) means nothing on this PC is exposed to the internet. Everything here is best effort:
 a phone that cannot be reached must never block an agent, so send() prints the problem and returns False
-instead of raising. The bot token is never printed; errors are scrubbed before they are logged.
+instead of raising, and the hooks (approval_requested, error, set_kill_switch) hand their HTTP sends to one
+background sender thread and return at once; flush() waits for that thread (tests and shutdown).
+
+The bot token is never printed: scrub() replaces the token, and any bot URL that carries it, with "[token]"
+in every error text before it reaches the console, an event, a Doctor row or an API reply.
 """
 from __future__ import annotations
 
 import hashlib
 import html
 import json
+import queue
 import re
 import threading
 import time
@@ -29,6 +34,7 @@ HTTP_TIMEOUT = 20              # seconds for an ordinary Bot API or ntfy call
 MAX_TEXT = 4000                # Telegram caps a message at 4096 characters
 IMPORTANT_KINDS = ("important", "request", "escalation", "error", "brief")   # what notify_level "important" sends
 CHECK = "✓ "              # prefix on the recommended option's button
+TOKEN_MASK = "[token]"    # what scrub() puts where the bot token (or its URL) was
 HELP_TEXT = "Commands: /status, /stop, /resume. Answer requests with the buttons."
 TEST_TEXT = "Holdco test: notifications work."
 KILL_ON_TEXT = "Kill switch ON. Agents stopped, outbound actions frozen. Send /resume to turn it off."
@@ -44,6 +50,12 @@ METHODS = {
     "edit_text": "editMessageText",
 }
 
+# Any Bot API URL, with or without its host: the token sits right after "/bot" and ends at the next slash.
+# This is the backstop for a token we cannot match literally (urllib quotes a bad URL with repr(), so a
+# newline pasted into the token shows up as the two characters "\n"; and some error paths run before the
+# settings can be read).
+_BOT_URL_RE = re.compile(r"(?:https?://)?[\w.\-]*(?::\d+)?/bot[^/\s'\"<>]+")
+
 # In-memory state. Lost on restart, which is fine: it only throttles repeats and keeps the poller handle.
 _recent: dict[str, float] = {}       # sha1(text) -> epoch of the last send
 _errors: dict[str, float] = {}       # normalised error message -> epoch of the last notification
@@ -54,6 +66,10 @@ _poller_lock = threading.Lock()
 POLLER: "Poller | None" = None
 # Local fakes in tests must never go through a corporate proxy; real Telegram and ntfy use the system proxy.
 _proxyless = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# The sender thread: hooks queue (callable, args, kwargs) here and return; one thread keeps the order.
+_queue: queue.Queue = queue.Queue()
+_worker: "threading.Thread | None" = None
+_worker_lock = threading.Lock()
 
 
 class NotifyError(Exception):
@@ -81,24 +97,46 @@ def _plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text or ""))
 
 
-def _scrub(text, s: dict | None = None) -> str:
-    """Remove the bot token from anything that might be printed or shown."""
-    text = str(text)
-    token = (s or {}).get("telegram_bot_token") or ""
-    if token:
-        text = text.replace(token, "<token>")
-    return text
+def scrub(text, s: dict | None = None) -> str:
+    """Replace the bot token, and the whole bot URL that carries it, with "[token]" in any text.
+
+    Apply it to every error that may quote the request URL (urllib's URL errors, HTTP errors, the ValueError
+    for a malformed api base) before the text reaches a Doctor row, an API reply, an event or the console.
+    `s` is the settings dict when the caller has one; otherwise they are read from the database. Never raises:
+    with no settings at hand the URL pattern alone still hides whatever follows "/bot".
+    """
+    text = "" if text is None else str(text)
+    if s is None:
+        try:
+            s = db.get_settings()
+        except Exception:
+            s = {}
+    token = str(s.get("telegram_bot_token") or "")
+    if token.strip():
+        # Literal, stripped and repr-escaped forms: a token saved with a stray newline appears as "\n" inside
+        # the repr-quoted URL of urllib's error, where a plain replace() of the raw token would miss it.
+        forms = {token, token.strip(), repr(token)[1:-1], repr(token.strip())[1:-1]}
+        for form in sorted(forms, key=len, reverse=True):
+            if form:
+                text = text.replace(form, TOKEN_MASK)
+    return _BOT_URL_RE.sub(TOKEN_MASK, text)
+
+
+_scrub = scrub   # the old private name, kept for anything that imported it
 
 
 def _key(text: str) -> str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
 
 
-def _record_failure(detail: str) -> None:
+def _record_failure(detail: str, s: dict | None = None) -> None:
+    """Remember the last problem for the Doctor and print it. Everything passes through scrub() here, so no
+    caller can leak the token to the console by mistake."""
+    detail = scrub(detail, s)[:300]
     _failures["count"] += 1
-    _failures["last_error"] = detail[:300]
+    _failures["last_error"] = detail
     _failures["last_at"] = time.time()
-    print(f"notify: {detail[:300]}")
+    print(f"notify: {detail}")
 
 
 def _wanted(kind: str, s: dict) -> bool:
@@ -122,17 +160,59 @@ def _open(req: urllib.request.Request, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+# ---------------- the sender thread ----------------
+
+def _enqueue(fn, *args, **kwargs) -> None:
+    """Run fn(*args, **kwargs) on the sender thread and return at once.
+
+    The hooks use this so an agent, the scheduler or a dashboard button never waits on Telegram: with the
+    phone network down an HTTP call can hold the caller for the whole HTTP_TIMEOUT. One thread, not one per
+    message, so confirmations arrive in the order they were raised (a /stop then a /resume stay in order).
+    """
+    global _worker
+    with _worker_lock:
+        _queue.put((fn, args, kwargs))
+        if _worker is None or not _worker.is_alive():
+            _worker = threading.Thread(target=_drain, daemon=True, name="notify-sender")
+            _worker.start()
+
+
+def _drain() -> None:
+    while True:
+        fn, args, kwargs = _queue.get()
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:   # send() swallows its own errors; this keeps the thread alive for anything else
+            _record_failure(f"background send failed: {e}")
+        finally:
+            _queue.task_done()
+
+
+def flush(timeout: float = 5.0) -> bool:
+    """Wait until the sender thread has delivered everything queued so far (tests and shutdown).
+    Returns False when the timeout passed first."""
+    deadline = time.monotonic() + timeout
+    while _queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return not _queue.unfinished_tasks
+
+
 # ---------------- channels ----------------
 
 def _telegram(s: dict, method: str, body: dict, timeout: float = HTTP_TIMEOUT):
-    """POST one Bot API call and return its "result". Raises NotifyError (token scrubbed) on any failure."""
+    """POST one Bot API call and return its "result". Raises NotifyError (token scrubbed) on any failure.
+
+    The request is built inside the try on purpose: a malformed api base (no scheme, a stray newline in the
+    token) makes urllib raise a ValueError that quotes the whole URL, token included.
+    """
     token = s.get("telegram_bot_token") or ""
     if not token:
         raise NotifyError("Telegram: no bot token is set")
     base = (s.get("telegram_api_base") or "https://api.telegram.org").rstrip("/")
-    req = urllib.request.Request(f"{base}/bot{token}/{method}", data=json.dumps(body).encode("utf-8"),
-                                 method="POST", headers={"Content-Type": "application/json", "User-Agent": "Holdco"})
     try:
+        req = urllib.request.Request(f"{base}/bot{token}/{method}", data=json.dumps(body).encode("utf-8"),
+                                     method="POST", headers={"Content-Type": "application/json",
+                                                             "User-Agent": "Holdco"})
         with _open(req, timeout) as r:
             raw = r.read(1_000_000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
@@ -141,16 +221,16 @@ def _telegram(s: dict, method: str, body: dict, timeout: float = HTTP_TIMEOUT):
             desc = json.loads(raw).get("description") or raw[:200]
         except (ValueError, AttributeError):
             desc = raw[:200]
-        raise NotifyError(_scrub(f"Telegram {method}: HTTP {e.code} {desc}", s)) from None
-    except Exception as e:   # connection refused, DNS, timeout, reset: all look the same to the owner
-        raise NotifyError(_scrub(f"Telegram {method}: {getattr(e, 'reason', None) or e}", s)) from None
+        raise NotifyError(scrub(f"Telegram {method}: HTTP {e.code} {desc}", s)) from None
+    except Exception as e:   # connection refused, DNS, timeout, reset, a bad URL: all look the same to the owner
+        raise NotifyError(scrub(f"Telegram {method}: {getattr(e, 'reason', None) or e}", s)) from None
     try:
         out = json.loads(raw)
     except ValueError:
         raise NotifyError(f"Telegram {method}: unreadable reply") from None
     if not isinstance(out, dict) or not out.get("ok"):
         desc = out.get("description") if isinstance(out, dict) else ""
-        raise NotifyError(_scrub(f"Telegram {method}: {desc or 'request failed'}", s))
+        raise NotifyError(scrub(f"Telegram {method}: {desc or 'request failed'}", s))
     return out.get("result")
 
 
@@ -203,9 +283,9 @@ def _send_ntfy(s: dict, text: str, kind: str = "info") -> None:
     headers = {"Title": "Holdco", "Content-Type": "text/plain; charset=utf-8", "User-Agent": "Holdco"}
     if kind in ("error", "escalation"):
         headers["Priority"] = "high"
-    req = urllib.request.Request(f"{server}/{urllib.parse.quote(topic)}",
-                                 data=_plain(text)[:MAX_TEXT].encode("utf-8"), method="POST", headers=headers)
     try:
+        req = urllib.request.Request(f"{server}/{urllib.parse.quote(topic)}",
+                                     data=_plain(text)[:MAX_TEXT].encode("utf-8"), method="POST", headers=headers)
         with _open(req, HTTP_TIMEOUT) as r:
             r.read(2000)
     except urllib.error.HTTPError as e:
@@ -221,14 +301,15 @@ def send(text: str, buttons: list[list[dict]] | None = None, kind: str = "info",
 
     kind: important | request | escalation | error | brief are sent at notify_level "important"; "info" only at
     "all". Identical text is not resent within REPEAT_SECONDS unless dedupe=False (confirmations of an action the
-    owner just took, like the kill switch, must always arrive). Never raises.
+    owner just took, like the kill switch, must always arrive). Blocks for the HTTP calls: callers that must not
+    wait (the hooks below) go through _enqueue. Never raises.
     """
     s: dict = {}
     try:
         s = db.get_settings()
         return _send(s, text, buttons, kind, dedupe)
     except Exception as e:   # a phone problem must never reach an agent or the server
-        _record_failure(f"send failed: {_scrub(e, s)}")
+        _record_failure(f"send failed: {e}", s)
         return False
 
 
@@ -247,13 +328,13 @@ def _send(s: dict, text: str, buttons, kind: str, dedupe: bool) -> bool:
             _send_telegram(s, text, buttons)
             ok = True
         except NotifyError as e:
-            _record_failure(str(e))
+            _record_failure(str(e), s)
     if s.get("ntfy_topic"):
         try:
             _send_ntfy(s, text, kind)
             ok = True
         except NotifyError as e:
-            _record_failure(str(e))
+            _record_failure(str(e), s)
     if ok and dedupe:
         with _lock:
             _recent[key] = now
@@ -336,14 +417,21 @@ def build_approval(row: dict) -> tuple[str, list[list[dict]] | None, str]:
 
 
 def approval_requested(approval: dict) -> None:
-    """Hook from actions.gate when a request is queued: message with Approve/Reject or option buttons."""
+    """Hook from actions.gate when a request is queued: message with Approve/Reject or option buttons.
+
+    The message is built here (a few cheap database reads, and a broken row is reported at once); the HTTP
+    sends run on the sender thread, so gate() returns to the agent before the phone is reached.
+    """
     if not approval:
         return
     try:
+        if not configured():
+            return
         text, buttons, kind = build_approval(approval)
-        send(text, buttons, kind)
     except Exception as e:
-        _record_failure(f"could not announce request #{approval.get('id')}: {_scrub(e)}")
+        _record_failure(f"could not announce request #{approval.get('id')}: {e}")
+        return
+    _enqueue(send, text, buttons, kind)
 
 
 def _error_key(message: str) -> str:
@@ -359,7 +447,8 @@ def _error_key(message: str) -> str:
 
 
 def error(company: dict | None, message: str) -> None:
-    """Hook for error events: one message per distinct error per hour. Never raises."""
+    """Hook for error events: one message per distinct error per hour. The once-an-hour decision is made
+    here, synchronously, so it is deterministic; the send itself runs on the sender thread. Never raises."""
     try:
         if not configured():
             return
@@ -375,19 +464,24 @@ def error(company: dict | None, message: str) -> None:
                 for k in [k for k, t in _errors.items() if now - t >= ERROR_REPEAT_SECONDS]:
                     del _errors[k]
         where = f" at <b>{escape(company['name'])}</b>" if company and company.get("name") else ""
-        send(f"<b>Error</b>{where}: {escape(str(message)[:600])}", kind="error")
+        _enqueue(send, f"<b>Error</b>{where}: {escape(str(message)[:600])}", None, "error")
     except Exception as e:
-        _record_failure(f"error hook failed: {_scrub(e)}")
+        _record_failure(f"error hook failed: {e}")
 
 
 def set_kill_switch(on: bool, by: str = "owner") -> bool:
-    """Flip the kill switch exactly the way POST /api/kill does (server.api_kill can call this)."""
+    """Flip the kill switch: save it, emit the event, refresh the dashboard and confirm on the phone.
+
+    Shared by POST /api/kill and the Telegram /stop and /resume commands. The confirmation skips the
+    identical-text rule (dedupe=False), so switching ON twice within an hour is confirmed both times, and it
+    goes through the sender thread so the dashboard button answers before Telegram does.
+    """
     on = bool(on)
     db.set_settings({"kill_switch": on})
     bus.emit(None, "info", "Kill switch ON: all agents stopped and outbound actions frozen." if on
              else "Kill switch off: agents may work again.", None, {"by": by})
     bus.notify("settings")
-    send(KILL_ON_TEXT if on else KILL_OFF_TEXT, kind="important", dedupe=False)
+    _enqueue(send, KILL_ON_TEXT if on else KILL_OFF_TEXT, None, "important", dedupe=False)
     return on
 
 
@@ -483,8 +577,8 @@ class Poller(threading.Thread):
                                     timeout=POLL_TIMEOUT + 15)
                 self.backoff = BACKOFF_MIN
             except Exception as e:
-                self.last_error = _scrub(e, s)
-                _record_failure(f"poller: {self.last_error}")
+                self.last_error = scrub(e, s)
+                _record_failure(f"poller: {self.last_error}", s)
                 wait, self.backoff = self.backoff, min(self.backoff * 2, BACKOFF_MAX)
                 self.stop_event.wait(wait)   # a stop() interrupts the wait at once
                 continue
@@ -493,7 +587,7 @@ class Poller(threading.Thread):
                     self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
                     self._handle(s, u)
                 except Exception as e:
-                    print(f"notify: poller could not handle an update: {_scrub(e, s)}")
+                    print(f"notify: poller could not handle an update: {scrub(e, s)}")
                 self.handled += 1
 
     def _handle(self, s: dict, u: dict) -> None:
@@ -512,7 +606,7 @@ class Poller(threading.Thread):
         try:
             _send_telegram(s, text)
         except NotifyError as e:
-            _record_failure(str(e))
+            _record_failure(str(e), s)
 
     def _callback(self, s: dict, cq: dict) -> None:
         data = str(cq.get("data") or "")
@@ -529,7 +623,7 @@ class Poller(threading.Thread):
             _telegram(s, METHODS["answer_callback"],
                       {"callback_query_id": cq.get("id"), "text": (problem or outcome)[:190]})
         except NotifyError as e:
-            _record_failure(str(e))
+            _record_failure(str(e), s)
         if problem:
             self._reply(s, f"Could not do that: {escape(problem)}")
             return
@@ -544,7 +638,7 @@ class Poller(threading.Thread):
             try:
                 _telegram(s, method, body)
             except NotifyError as e:
-                _record_failure(str(e))
+                _record_failure(str(e), s)
 
     def _command(self, s: dict, text: str) -> None:
         words = text.strip().split()
@@ -584,12 +678,13 @@ def stop_poller(timeout: float = 5.0) -> None:
 # ---------------- health and the test button ----------------
 
 def check_telegram(settings: dict | None = None) -> tuple[bool, str]:
-    """getMe with the configured token: (True, "Telegram bot @name") or (False, why)."""
+    """getMe with the configured token: (True, "Telegram bot @name") or (False, why). The reason never
+    carries the token: _telegram scrubs its own errors and anything else is scrubbed here."""
     s = settings or db.get_settings()
     try:
         me = _telegram(s, METHODS["get_me"], {}, timeout=10) or {}
-    except NotifyError as e:
-        return False, str(e)
+    except Exception as e:
+        return False, scrub(e, s)
     name = me.get("username") or me.get("first_name") or "bot"
     return True, f"Telegram bot @{name}"
 
@@ -616,15 +711,16 @@ def health(settings: dict | None = None) -> tuple[str, str]:
     if status == "ok" and last_at and time.time() - last_at < 3600:
         status = "warn"
         parts.append(f"last failure: {_failures['last_error']}")
-    return status, "; ".join(parts)
+    return status, scrub("; ".join(parts), s)
 
 
 def discover_chat_ids(s: dict | None = None) -> list:
-    """Chat ids that have messaged the bot (one getUpdates), for the owner who has not found theirs yet."""
+    """Chat ids that have messaged the bot (one getUpdates), for the owner who has not found theirs yet.
+    Anyone who finds the bot can message it, so the list is shown, never trusted or saved by itself."""
     s = s or db.get_settings()
     try:
         updates = _telegram(s, METHODS["get_updates"], {"timeout": 0}, timeout=10) or []
-    except NotifyError:
+    except Exception:
         return []
     ids = []
     for u in updates:
@@ -637,16 +733,20 @@ def discover_chat_ids(s: dict | None = None) -> list:
 
 @route("POST", "/api/notify/test")
 def api_notify_test(h, m, body):
-    """Send the test message to every configured channel; with a token but no chat id, report the chat ids seen."""
+    """Send the test message to every configured channel; with a token but no chat id, list the chat ids seen."""
     s = db.get_settings()
     if s.get("telegram_bot_token") and not _chat_id(s):
         ids = discover_chat_ids(s)
-        detail = (f"Your chat id is {ids[0]}. Paste it into the Telegram chat id field, save, then press this again."
-                  if ids else "Send any message to your bot in Telegram, then press this again and copy your chat id.")
+        if ids:
+            detail = (f"Chat ids that have messaged the bot: {', '.join(str(i) for i in ids)}; make sure the one "
+                      "you save is yours. Paste it into the Telegram chat id field, save, then press this again.")
+        else:
+            detail = "Send any message to your bot in Telegram, then press this again and copy your chat id."
         return {"ok": False, "detail": detail, "message": detail, "chat_ids": ids}
     if not configured(s):
         detail = "Nothing to send to yet. Add a Telegram bot token and chat id, or an ntfy topic, then save."
         return {"ok": False, "detail": detail, "message": detail, "chat_ids": []}
     ok = send(TEST_TEXT, [[{"text": "OK", "data": "noop"}]], kind="important", dedupe=False)
     detail = "Sent. Check your phone." if ok else f"Could not send: {_failures.get('last_error') or 'unknown error'}"
+    detail = scrub(detail, s)
     return {"ok": ok, "detail": detail, "message": detail, "chat_ids": []}
