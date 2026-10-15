@@ -8,12 +8,10 @@ that drive them. Everything is standard library, runs on Windows and Linux, and 
 suite. The "why" is in [../plan.md](../plan.md) (Phase 0 and "Making a local model reliable") and in
 [../reliability.md](../reliability.md); this document is the "how".
 
-Status: planned; scaffold committed, behaviour not built. Branch `claude/phase-0-stabilize`, PR to `main`.
-Commit `3043085` ("Phase 0 scaffold") added `holdco/routing.py`, the settings, the `audit` table, the
-`tasks.notes` and `tasks.reassigned` columns, the kill switch, the founding preflight hook, `GET /api/audit`,
-`POST /api/kill`, and skeleton modules `doctor.py`, `watchdog.py`, `notify.py`, `backup.py` whose functions raise
-`NotImplementedError` (every hook tolerates that, so the suite stays green). This document names those hooks
-exactly; the implementer fills them in.
+Status: built. Branch `claude/phase-0-stabilize`, PR to `main`. Everything below is implemented and covered by the
+suite (210 tests, no network or GPU), and a founding on the owner's RTX 5090 with gpt-oss:20b passed the gate:
+the company founded unattended, the search outage alerted once, and a failed task recovered on its second attempt
+from its working notes. Differences from this design that the code settled are noted in the pull request.
 
 Related: [../architecture.md](../architecture.md), [../operating-model.md](../operating-model.md),
 [../safety.md](../safety.md), [../owner-experience.md](../owner-experience.md), [../testing.md](../testing.md),

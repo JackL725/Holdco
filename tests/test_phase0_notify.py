@@ -408,6 +408,16 @@ class TestPoller(NotifyCase):
         self.assertIn("Requests waiting for you: ", m["text"])
         self.assertEqual(m["parse_mode"], "HTML")
 
+    def test_status_keeps_the_summary_with_many_companies(self):
+        extra = [make_company(f"Busy{i}", ("ceo",)) for i in range(notify.STATUS_MAX_COMPANIES + 5)]
+        text = notify.format_status()
+        self.assertTrue(text.startswith("Kill switch: "), text[:80])
+        self.assertIn("Requests waiting for you: ", text.splitlines()[1])
+        self.assertIn("more in the dashboard.", text)
+        self.assertLess(len(text), notify.MAX_TEXT)
+        for c in extra:
+            db.update("companies", c["id"], status="archived")
+
     def test_stop_and_resume_commands(self):
         self.tg.push_message("/stop")
         wait_for(lambda: db.get_settings().get("kill_switch") is True, 10, 0.05, "the kill switch to turn on")

@@ -868,10 +868,15 @@ class TestFoundingRuns(unittest.TestCase):
         self._notify = mock.patch.object(notify, "send", lambda text, buttons=None, kind="info", **kw:
                                          self.sent.append((text, kind)) or True)
         self._notify.start()
+        # Phone hooks only queue messages when a phone is set up, and send them on notify's sender thread.
+        self._configured = mock.patch.object(notify, "configured", lambda *a, **kw: True)
+        self._configured.start()
         self.saved_last = doctor.LAST
         doctor.LAST = []
 
     def tearDown(self):
+        notify.flush()
+        self._configured.stop()
         self._notify.stop()
         db.set_settings({"kill_switch": False})
         doctor.LAST = self.saved_last
@@ -888,6 +893,7 @@ class TestFoundingRuns(unittest.TestCase):
 
         with mock.patch.object(agents.llm, "chat", fake_chat):
             agents.run(self.ceo["id"], "founding")
+        notify.flush()   # phone messages are sent on notify's sender thread
         return db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.ceo["id"],))
 
     def test_charter_file_becomes_the_charter_and_the_question_sees_it(self):
@@ -997,13 +1003,15 @@ class TestFoundingWithTheFakeModel(unittest.TestCase):
     def test_partial_founding_reaches_founding_ended(self):
         sent: list = []
         with mock.patch.object(notify, "send", lambda text, buttons=None, kind="info", **kw:
-                               sent.append((text, kind)) or True):
+                               sent.append((text, kind)) or True), \
+                mock.patch.object(notify, "configured", lambda *a, **kw: True):
             c = agents.create_company("Weekly meal plans for dogs [partial]", name="PawPlan", template="minimal")
             ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
             deadline = time.time() + 30
             while time.time() < deadline and (db.get_company(c["id"])["status"] == "founding"
                                                or agents.is_running(ceo["id"])):
                 time.sleep(0.1)
+            notify.flush()   # phone messages are sent on notify's sender thread
         c = db.get_company(c["id"])
         self.assertEqual(c["status"], "active")
         run = db.one("SELECT * FROM runs WHERE company_id=? AND kind='founding'", (c["id"],))

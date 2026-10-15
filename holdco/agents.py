@@ -544,7 +544,7 @@ def _tell_phone_founding(company: dict, thin: bool) -> None:
         else:
             n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status='todo'", (company["id"],)) or 0
             text = f"<b>{name}</b> is up and running: {n} task{'s' if n != 1 else ''} queued."
-        notify.send(text, kind="important")
+        notify.send_later(text, kind="important")   # queued after any question announced in this run
     except Exception as e:
         print(f"notify failed: {e}")
 

@@ -188,6 +188,12 @@ def _drain() -> None:
             _queue.task_done()
 
 
+def send_later(text: str, buttons: list[list[dict]] | None = None, kind: str = "info", *, dedupe: bool = True) -> None:
+    """Queue a message for the sender thread and return at once. Use this from agent threads and the scheduler;
+    messages queued this way keep their order with request and question announcements."""
+    _enqueue(send, text, buttons, kind, dedupe=dedupe)
+
+
 def flush(timeout: float = 5.0) -> bool:
     """Wait until the sender thread has delivered everything queued so far (tests and shutdown).
     Returns False when the timeout passed first."""
@@ -485,23 +491,25 @@ def set_kill_switch(on: bool, by: str = "owner") -> bool:
     return on
 
 
+STATUS_MAX_COMPANIES = 15   # companies listed by /status; the summary lines always come first
+
+
 def format_status() -> str:
-    """The /status reply: one line per company, pending requests, kill switch, Doctor summary when known."""
+    """The /status reply: the summary first (kill switch, requests waiting, Doctor), then one line per company,
+    busiest first. Telegram caps a message at 4096 characters, so with many companies the list is cut, never
+    the summary."""
     s = db.get_settings()
-    lines, pending_total = [], 0
+    rows, pending_total = [], 0
     for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
         open_n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN "
                            "('todo','in_progress','blocked','waiting')", (c["id"],)) or 0
         working = db.scalar("SELECT COUNT(*) FROM agents WHERE company_id=? AND status='working'", (c["id"],)) or 0
         pend = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (c["id"],)) or 0
         pending_total += pend
-        lines.append(f"<b>{escape(c['name'])}</b> ({escape(c['status'])}): {open_n} open tasks, {working} working, "
-                     f"{pend} request{'s' if pend != 1 else ''} waiting")
-    if not lines:
-        lines.append("No companies yet.")
-    lines.append(f"Requests waiting for you: {pending_total}")
-    lines.append("Kill switch: " + ("ON (send /resume to turn it off)" if s.get("kill_switch") else "off")
-                 + ("" if s.get("scheduler_enabled", True) else "; autopilot is off"))
+        rows.append((pend, working, open_n, c))
+    lines = ["Kill switch: " + ("ON (send /resume to turn it off)" if s.get("kill_switch") else "off")
+             + ("" if s.get("scheduler_enabled", True) else "; autopilot is off"),
+             f"Requests waiting for you: {pending_total}"]
     try:
         from . import doctor
         d = doctor.summary()
@@ -509,6 +517,14 @@ def format_status() -> str:
             lines.append(f"Doctor: {d['ok']} ok, {d['warn']} warn, {d['bad']} bad")
     except Exception:
         pass
+    if not rows:
+        lines.append("No companies yet.")
+    rows.sort(key=lambda r: (-r[0], -r[1], -r[2], r[3]["id"]))
+    for pend, working, open_n, c in rows[:STATUS_MAX_COMPANIES]:
+        lines.append(f"<b>{escape(c['name'])}</b> ({escape(c['status'])}): {open_n} open tasks, {working} working, "
+                     f"{pend} request{'s' if pend != 1 else ''} waiting")
+    if len(rows) > STATUS_MAX_COMPANIES:
+        lines.append(f"...and {len(rows) - STATUS_MAX_COMPANIES} more in the dashboard.")
     return "\n".join(lines)
 
 
