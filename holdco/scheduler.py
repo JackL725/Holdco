@@ -174,10 +174,12 @@ class Scheduler(threading.Thread):
                            (c["id"],)) or 0
         due = since >= float(cs.get("cycle_minutes") or 60)
         idle = open_n == 0 and since >= 10        # team ran out of work
-        requested = bool(c["cycle_requested"]) and since >= 3
-        if planning.should_cycle(c, due, idle, requested) and not planning.over_budget(c):
+        owner_asked = bool(c["cycle_requested"])   # an answer, a settings change, Retry founding with a busy CEO
+        requested = owner_asked and since >= 3
+        # The daily token budget holds background planning only; a cycle the owner asked for still runs.
+        if planning.should_cycle(c, due, idle, requested) and (requested or not planning.over_budget(c)):
             db.update("companies", c["id"], cycle_requested=0, last_cycle_at=db.now())
-            planning.cycle_started(c)
+            planning.cycle_started(c, requested=owner_asked)
             agents.start(ceo["id"], "cycle")
 
     def _routines(self, c: dict) -> None:

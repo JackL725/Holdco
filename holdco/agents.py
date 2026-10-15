@@ -91,6 +91,24 @@ def _shared_rules(kind: str, max_steps: int) -> str:
     return "# Operating rules\n" + "\n".join(f"- {r}" for r in rules)
 
 
+DIRECTIVES_CAP = 1500
+DIRECTIVES_CUT = " (cut; full text in company Settings)"
+
+
+def _directives(cs: dict) -> str:
+    """The owner's standing orders, at most 1,500 characters (design 1.1), cut at a word with a note."""
+    text = str(cs.get("directives") or "").strip()
+    if not text:
+        return "None yet."
+    if len(text) <= DIRECTIVES_CAP:
+        return text
+    room = DIRECTIVES_CAP - len(DIRECTIVES_CUT)
+    cut = text[:room]
+    if " " in cut[room // 2:]:
+        cut = cut[:cut.rfind(" ")]
+    return cut.rstrip(" ,;:.") + DIRECTIVES_CUT
+
+
 def _section(fn, *args) -> str:
     """One provider's prompt section; a failing provider costs its section, never the run."""
     try:
@@ -112,7 +130,7 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: d
         f"You are {agent['name']}, {agent['title']} at {company['name']}, a company run by AI agents on its owner's "
         f"own computer. The owner ({owner}) supervises from a dashboard and approves anything that leaves the "
         f"computer. Today is {today}.",
-        "# Owner's standing orders (always follow these)\n" + (cs.get("directives") or "None yet."),
+        "# Owner's standing orders (always follow these)\n" + _directives(cs),
         presets.render(roles.preset_key(agent), agent.get("focus") or ""),
         _shared_rules(kind, max_steps),
         _section(truth.facts_section, company),
@@ -168,7 +186,8 @@ def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: 
     return "\n".join(out) or "(none)"
 
 
-def cycle_prompt(company: dict) -> str:
+def cycle_prompt(company: dict, requested: bool = False) -> str:
+    """The planning-cycle prompt. requested: the owner asked for this cycle ("Plan now")."""
     cid = company["id"]
     open_n = db.scalar(f"SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN "
                        f"({','.join('?' * len(tools.OPEN_STATUSES))})", (cid, *tools.OPEN_STATUSES)) or 0
@@ -179,7 +198,7 @@ def cycle_prompt(company: dict) -> str:
                    "ORDER BY id DESC LIMIT 5", (cid,))
     dec = "\n".join(f"- {d['status']}: {d['summary']}" + (f" (owner note: {d['feedback']})" if d["feedback"] else "")
                     for d in decided) or "(none)"
-    header = _section(planning.cycle_header, company)
+    header = _section(planning.cycle_header, company, requested)
     return (
         f"Run a planning cycle for {company['name']}.\n\n"
         + (header + "\n\n" if header else "")
@@ -332,8 +351,30 @@ def _args_preview(args: dict) -> dict:
     return {k: (v[:600] + "…" if isinstance(v, str) and len(v) > 600 else v) for k, v in (args or {}).items()}
 
 
-def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", context: str = "") -> None:
-    """Run one work session. kind: task | cycle | founding | chat."""
+def _records_line(company: dict, text: str) -> str:
+    """One short line of what Holdco's records say about the claims in a chat reply, appended when the model
+    could not rewrite them (design 2.4: claims are checked before they reach the owner)."""
+    recs: list[str] = []
+    try:
+        for p in truth.check_claims(company, text):
+            r = " ".join(str(p.get("records") or "").split())
+            if r and r not in recs:
+                recs.append(r)
+    except Exception:
+        traceback.print_exc()
+    if not recs:   # the guard refused for a reason check_claims does not list: show the first facts instead
+        facts = [ln.strip("- ").strip() for ln in (_section(truth.facts_section, company) or "").splitlines()[1:]]
+        recs = [f for f in facts if f][:3]
+    line = "; ".join(recs) or "see the Facts on the company page"
+    if len(line) > 600:
+        line = line[:597].rstrip() + "..."
+    return f"Holdco's records: {line.rstrip('.')}."
+
+
+def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", context: str = "",
+        requested: bool = False) -> None:
+    """Run one work session. kind: task | cycle | founding | chat. requested: the owner asked for this planning
+    cycle ("Plan now"), so its prompt never says that nothing changed."""
     with _running_lock:
         if agent_id in _running:
             return
@@ -391,7 +432,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     if kind == "task":
         user = task_prompt(company, task)
     elif kind == "cycle":
-        user = cycle_prompt(company)
+        user = cycle_prompt(company, requested)
     elif kind == "founding":
         user = founding_prompt(company, context, stage)
     else:
@@ -410,9 +451,14 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     if review and ((kind == "founding" and stage == "critic")
                    or (roles.preset_key(agent) == "qa" and not agent.get("model"))):
         model = review
-    budget = int(int(settings.get("num_ctx", 32768)) * 2.6)  # rough chars-per-token headroom
+    # Rough chars-per-token headroom. The tool specs travel with every request too (about 11,000 characters for a
+    # CEO), so they come off the room the conversation may use.
+    budget = max(8000, int(int(settings.get("num_ctx", 32768)) * 2.6)
+                 - len(json.dumps(tool_specs, ensure_ascii=False, default=str)))
     tokens, steps, nudges, status, error = 0, 0, 0, "done", ""
     seen_calls: dict[str, int] = {}
+    chat_checked = False   # a chat reply that failed the claims check gets one rewrite
+    chat_draft = ""        # ... and is kept, with Holdco's records appended, if the steps run out first
     slot = llm.chat_slot() if kind == "chat" else llm.background_slot()
 
     try:
@@ -430,6 +476,11 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                 if step == max_steps - 2 and kind != "chat":
                     messages.append({"role": "user", "content": "You have 2 tool calls left. Save any unsaved work "
                                      "and call finish now."})
+                elif (kind == "founding" and stage == "research" and step == max_steps // 2
+                      and not planning.research_saved(company)):
+                    # Halfway through research with nothing saved: the first real founding fetched pages until
+                    # its budget ran out and the next stages knew none of it.
+                    messages.append({"role": "user", "content": planning.RESEARCH_CHECKPOINT})
                 _trim(messages, budget)
                 reply = llm.chat(messages, tool_specs, model, settings, think=think, creativity=creativity)
                 tokens += reply.tokens
@@ -441,13 +492,16 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                                      "tool_calls": [{"id": c.id or f"call_{step}_{i}", "name": c.name,
                                                      "arguments": c.arguments} for i, c in enumerate(calls)]})
                     for i, c in enumerate(calls):
-                        # Loop guard: the most common multi-agent failure is repeating the same step.
+                        # Loop guard: the most common multi-agent failure is repeating the same step. finish is
+                        # exempt: each of its checks refuses only once, so calling it again is how an agent says
+                        # "accept it as it is", and the guard would otherwise swallow that answer.
                         fp = c.name + json.dumps(c.arguments, sort_keys=True, default=str)
                         seen_calls[fp] = seen_calls.get(fp, 0) + 1
-                        if seen_calls[fp] == 2 and c.name not in ("check_inbox", "list_tasks"):
+                        repeatable = c.name in ("check_inbox", "list_tasks", "finish")
+                        if seen_calls[fp] == 2 and not repeatable:
                             result = ("You already made this exact call in this session; its result is above. "
                                       "Do something different, or finish.")
-                        elif seen_calls[fp] >= 3 and c.name not in ("check_inbox", "list_tasks"):
+                        elif seen_calls[fp] >= 3 and not repeatable:
                             ctx.finished, ctx.finish_status = True, "partial"
                             ctx.finish_summary = ("Status: partial\nSummary: stopped after repeating the same action "
                                                   f"({c.name}) three times.")
@@ -468,8 +522,25 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                     continue
                 content = (reply.content or "").strip()
                 if kind == "chat":
+                    # Phase 0.5: a chat reply is checked for claims like report_to_owner is. One rewrite; if the
+                    # second reply still claims what the records do not show, it goes out with the records line.
+                    refusal = truth.claims_guard(ctx, content, "chat") if content else None
+                    if refusal and not chat_checked:
+                        chat_checked, chat_draft = True, content
+                        messages.append({"role": "assistant", "content": content, "thinking": reply.thinking})
+                        messages.append({"role": "user", "content": refusal})
+                        continue
+                    if refusal:
+                        content = content + "\n\n" + _records_line(company, content)
                     ctx.reply = content or "(no reply)"
                     break
+                if kind == "founding" and ctx.refused_finish is not None:
+                    # The stage check refused finish and the model answered with no tool call: it has nothing
+                    # more to add. Accept that finish (the check notes what is missing) instead of spending the
+                    # rest of the stage's steps on nudges; founding moves on with what it has.
+                    tools.execute(ctx, "finish", ctx.refused_finish)
+                    if ctx.finished:
+                        break
                 nudges += 1
                 if nudges >= 3 and content:
                     ctx.finished, ctx.finish_status = True, "partial"
@@ -479,7 +550,9 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                 messages.append({"role": "user", "content": "Use your tools to do the work. When you're completely "
                                  "done, call the finish tool with a summary."})
             else:
-                if kind == "chat" and ctx.reply is None:
+                if kind == "chat" and ctx.reply is None and chat_draft:
+                    ctx.reply = chat_draft + "\n\n" + _records_line(company, chat_draft)
+                elif kind == "chat" and ctx.reply is None:
                     ctx.reply = "I ran out of steps before finishing. Ask me again or check the task board."
                 elif not ctx.finished:
                     status = "out_of_steps"

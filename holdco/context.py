@@ -68,16 +68,19 @@ LONG_LINE = 1500
 CORE_CAP, MEMORY_CAP, PINNED_CAP, INDEX_CAP = 1500, 1800, 2500, 1500
 KEY_DOCS = ("docs/charter.md", "research/market.md", "docs/critique.md", "records/STATUS.md", "docs/decisions.md")
 
-ALL_SOURCES = ("file", "context", "memory", "task", "email", "chat", "approval", "run", "fact")
+ALL_SOURCES = ("file", "context", "memory", "task", "email", "chat", "approval", "run", "fact", "page")
 SCOPES = {"all": ALL_SOURCES, "files": ("file",), "context": ("context",), "memory": ("memory",),
           "tasks": ("task",), "emails": ("email",), "chat": ("chat",), "decisions": ("approval",),
-          "sessions": ("run",), "facts": ("fact",)}
+          "sessions": ("run",), "facts": ("fact",), "pages": ("page",)}
 _SCOPE_ALIASES = {"file": "files", "everything": "all", "any": "all", "": "all", "owner": "context",
                   "global": "context", "library": "context", "memories": "memory", "notes": "memory",
                   "task": "tasks", "email": "emails", "inbox": "emails", "mail": "emails", "messages": "chat",
                   "message": "chat", "chats": "chat", "decision": "decisions", "approvals": "decisions",
                   "approval": "decisions", "session": "sessions", "runs": "sessions", "run": "sessions",
-                  "fact": "facts"}
+                  "fact": "facts", "page": "pages", "web": "pages", "webpages": "pages", "fetched": "pages",
+                  "urls": "pages", "url": "pages", "sites": "pages"}
+PAGE_PREFIX = "page:"           # refs and read_file paths of web pages the company fetched (.cache/pages)
+_SHA_RE = re.compile(r"^[0-9a-f]{16,64}$")
 
 OWNER_ONLY = "context/ is the owner's. Save your notes elsewhere, for example docs/."
 
@@ -817,6 +820,110 @@ def _sync_runs(cid: int) -> int:
     return len(todo)
 
 
+# ---------------------------------------------------------------- web pages the company fetched
+
+def _pages_dir(company: dict) -> Path:
+    """Where truth.cache_page keeps the text of each page fetch_url read (kept 7 days)."""
+    return workspace.root(company) / ".cache" / "pages"
+
+
+def _url_key(url: str) -> str:
+    """A URL in the comparable form the page cache uses (truth._url_key), with a plain fallback."""
+    try:
+        from . import truth   # imported here: truth imports tools, which imports this module
+        return truth._url_key(url)
+    except Exception:
+        return (url or "").strip().split("#", 1)[0].lower().rstrip("/")
+
+
+def _page_rows(cid: int) -> list[dict]:
+    """One row per cached page this company fetched: its sha (the cache file name) and the first URL it was
+    fetched under, which stays its ref."""
+    rows = db.q("SELECT sha, url, MIN(id) AS first FROM fetched WHERE company_id=? AND sha IS NOT NULL "
+                "GROUP BY sha ORDER BY first", (cid,))
+    return [r for r in rows if _SHA_RE.match(str(r["sha"] or "")) and r["url"]]
+
+
+def _page_title(text: str, url: str) -> str:
+    """fetch_url's text starts with "Title: ..." for HTML pages; otherwise the URL is the title."""
+    first = (text or "").split("\n", 1)[0].strip()
+    if first.lower().startswith("title:") and first[6:].strip():
+        return _short(first[6:].strip(), 160)
+    return url
+
+
+def _error_page(text: str) -> bool:
+    return bool(re.match(r"^HTTP \d{3} fetching ", text or ""))
+
+
+def _page_chunks(ref: str, url: str, p: Path, size: int) -> tuple[list, str]:
+    text = _load_text(p, size)
+    if text is None or not text.strip() or _error_page(text):
+        return [], ""
+    title = _page_title(text, url)
+    return [(title, h, b, line) for line, h, b in chunk_file("page.txt", text)], title
+
+
+def _sync_pages(cid: int, company: dict) -> int:
+    """Index the pages fetch_url cached for this company (source "page", ref "page:<url>"), so the charter stage
+    finds what research read. A quick mark (newest fetch id and the folder's modification time) skips the work
+    when nothing was fetched or pruned since the last look, so a no-change reindex stays fast."""
+    base = _pages_dir(company)
+    try:
+        dir_mtime = base.stat().st_mtime_ns if base.is_dir() else 0
+    except OSError:
+        dir_mtime = 0
+    newest = db.scalar("SELECT COALESCE(MAX(id), 0) FROM fetched WHERE company_id=?", (cid,)) or 0
+    mark = f"{newest}:{dir_mtime}"
+    if _state(cid, "meta", "pages") == mark:
+        return 0
+    states = _states(cid, "page")
+    todo, seen = [], set()
+    for r in _page_rows(cid) if dir_mtime else []:
+        ref = PAGE_PREFIX + r["url"]
+        p = base / f"{r['sha']}.txt"
+        try:
+            st = p.stat()
+        except OSError:
+            continue   # pruned after 7 days, or never kept (error pages are not cached)
+        seen.add(ref)
+        sig = f"{st.st_size}:{st.st_mtime_ns}"
+        old = states.get(ref)
+        if _sig_of(old) != sig:
+            todo.append((ref, r["url"], p, st.st_size, sig, _parse(old)[1]))
+    gone = [(ref, _parse(st)[1]) for ref, st in states.items() if ref not in seen]
+    if gone:
+        with _Tx() as tx:
+            for ref, ids in gone:
+                _drop(tx, cid, "page", ref, ids)
+    for i in range(0, len(todo), 40):
+        batch = [(ref, sig, *_page_chunks(ref, url, p, size), old) for ref, url, p, size, sig, old in todo[i:i + 40]]
+        with _Tx() as tx:
+            for ref, sig, chunks, title, old in batch:
+                _put(tx, cid, "page", ref, sig, chunks, title, old)
+    _set_meta(cid, "pages", mark)
+    return len(todo) + len(gone)
+
+
+def page_path(company: dict, url: str) -> Path | None:
+    """The cached text of a page this company fetched, found through the fetched table; None when it was never
+    fetched or its copy expired."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    cid = company["id"]
+    row = db.one("SELECT sha FROM fetched WHERE company_id=? AND url=? ORDER BY id DESC LIMIT 1",
+                 (cid, url.split("#", 1)[0]))
+    if not row:
+        key = _url_key(url)
+        row = next((r for r in db.q("SELECT url, sha FROM fetched WHERE company_id=? ORDER BY id DESC LIMIT 5000",
+                                    (cid,)) if _url_key(r["url"]) == key), None)
+    if not row or not _SHA_RE.match(str(row["sha"] or "")):
+        return None
+    p = _pages_dir(company) / f"{row['sha']}.txt"
+    return p if p.is_file() else None
+
+
 def _check_identity(company: dict) -> None:
     """A new company can get the id of a deleted one (SQLite reuses the highest id). Its index must then start
     empty instead of showing the old company's files and notes."""
@@ -856,6 +963,7 @@ def reindex(company: dict) -> None:
             changed += _safe(_sync_append, cid, "email", "emails", _email_doc)
             changed += _safe(_sync_append, cid, "fact", "facts", _fact_doc)
             changed += _safe(_sync_runs, cid)
+            changed += _safe(_sync_pages, cid, company)
             if changed:
                 _safe(_set_meta, cid, "last_indexed", db.now())
                 _embed_dirty.add(cid)
@@ -1165,11 +1273,14 @@ def _result(r: dict, terms: list[str]) -> dict:
         snip = _make_snippet(r.get("body") or "", terms)
     out = {"source": src, "ref": ref, "path": "", "line": None, "heading": "", "snippet": _short(snip, 240),
            "title": r.get("title") or "", "id": None}
-    if src in ("file", "context"):
+    if src in ("file", "context", "page"):
         line = to_int(r.get("line"), 1) or 1
-        if _ext(ref) not in (".html", ".htm"):   # HTML chunks hold page text, not raw lines
+        if src == "page" or _ext(ref) not in (".html", ".htm"):   # HTML chunks hold page text, not raw lines
             line += _line_offset(r.get("body") or "", terms)
-        out.update(path=ref, line=line, heading=_short(r.get("heading") or "", 80))
+        heading = r.get("heading") or ""
+        if src == "page":   # the page's title says more than a heading-less window of its text
+            heading = " | ".join(x for x in ((r.get("title") or ""), heading) if x and x != ref[len(PAGE_PREFIX):])
+        out.update(path=ref, line=line, heading=_short(heading, 80))
     else:
         rid = to_int(ref)
         out.update(id=rid, ref=f"{_LABEL.get(src, src)} #{rid}",
@@ -1249,6 +1360,19 @@ def _like_search(company: dict, terms: list[str], sources: tuple, limit: int) ->
                 row = {"source": src, "ref": prefix + rel, "line": n, "heading": "", "title": prefix + rel,
                        "body": line, "snip": _make_snippet(line, terms)}
                 hits.append((k + in_name, len(hits), _result(row, terms)))
+    if "page" in sources:
+        base = _pages_dir(company)
+        for r in _page_rows(cid) if base.is_dir() else []:
+            text = _load_text(base / f"{r['sha']}.txt")
+            if not text or _error_page(text):
+                continue
+            title = _page_title(text, r["url"])
+            found = sorted(((sum(1 for s in stems if s in line.lower()), n, line)
+                            for n, line in enumerate(_lines(text), 1)), key=lambda f: (-f[0], f[1]))
+            for k, n, line in [f for f in found if f[0]][:2]:
+                row = {"source": "page", "ref": PAGE_PREFIX + r["url"], "line": n, "heading": "", "title": title,
+                       "body": line, "snip": _make_snippet(line, terms)}
+                hits.append((k, len(hits), _result(row, terms)))
     names = _names(cid)
     for src, (table, cols, select, builder) in _LIKE_TABLES.items():
         if src not in sources:
@@ -1297,6 +1421,7 @@ _GROUPS = {
     "chat": ("Chat with the owner", ""),
     "run": ("Past sessions", "summaries of earlier work sessions"),
     "fact": ("Facts", "verified facts; cite one in a file as [fact <number>]"),
+    "page": ("Web pages your team fetched", "open one with read_file page:<url> start_line=<line>"),
 }
 
 
@@ -1324,11 +1449,12 @@ def format_results(query: str, scope: str, rows: list[dict]) -> str:
 
 
 @tool("search", "Search everything the company knows: its files, the owner's context, memory, tasks, emails, chat, "
-      "decisions, past sessions and verified facts. Returns ranked hits with path:line and the matching words in "
-      "[brackets]. Call this first when you need to find something. It does not search the internet: use "
-      "web_search for that.",
+      "decisions, past sessions, verified facts and web pages your team already fetched. Returns ranked hits with "
+      "path:line and the matching words in [brackets]. Call this first when you need to find something. It does "
+      "not search the internet: use web_search for that.",
       {"query": S("Words to look for"),
-       "scope": S("all (default), files, context, memory, tasks, emails, chat, decisions, sessions or facts"),
+       "scope": S("all (default), files, context, memory, tasks, emails, chat, decisions, sessions, facts or "
+                  "pages"),
        "limit": I("How many results, 1-20 (default 8)")}, ("query",))
 def search(ctx: Ctx, query: str, scope: str = "all", limit: int = 8) -> str:
     if not (query or "").strip():
@@ -1348,8 +1474,17 @@ def search(ctx: Ctx, query: str, scope: str = "all", limit: int = 8) -> str:
 def read_file(ctx: Ctx, path: str, offset: int = 0, start_line: int = 0, end_line: int = 0,
               outline: bool = False) -> str:
     """The read_file tool body: numbered lines (200 by default, with a pointer to the next range), an outline of
-    the headings, or the old character offset when one is given. context: and global: read the owner's library."""
-    p, shown, _kind = resolve(ctx.company, path)
+    the headings, or the old character offset when one is given. context: and global: read the owner's library;
+    page:<url> reads the saved text of a web page this company fetched."""
+    if (path or "").strip().lower().startswith(PAGE_PREFIX):
+        url = path.strip()[len(PAGE_PREFIX):].strip()
+        p = page_path(ctx.company, url)
+        if p is None:
+            raise ToolError(f"{url or 'that page'} has not been fetched by this company, or its saved copy expired "
+                            "(pages are kept 7 days). Read it with fetch_url.")
+        shown = PAGE_PREFIX + url
+    else:
+        p, shown, _kind = resolve(ctx.company, path)
     if p.is_dir():
         raise ToolError(f"{path} is a folder. Use list_files {shown or '.'} to see what is inside.")
     if not p.exists() or not p.is_file():
@@ -1597,6 +1732,9 @@ def _call_write_guard(ctx: Ctx, rel: str, text: str):
 def edit_file(ctx: Ctx, path: str, find: str, replace: str, count: int = 1) -> str:
     if (path or "").strip().lower().startswith(("context:", "global:")):
         raise ToolError(OWNER_ONLY)
+    if (path or "").strip().lower().startswith(PAGE_PREFIX):
+        raise ToolError("page: is a saved copy of a web page and cannot be changed. Put your notes in a file such "
+                        "as research/market.md.")
     p = workspace.safe_path(ctx.company, path)
     r = workspace.rel(ctx.company, p)
     if r == "context" or r.startswith("context/"):
@@ -1926,14 +2064,24 @@ def pinned_section(company: dict) -> str:
         room = budget - used - len(ref) - 120
         if room >= 300:   # show the start of the file and say where to continue
             keep, size = [], 0
-            for ln in _lines(text):
+            lines = _lines(text)
+            for ln in lines:
                 if size + len(ln) + 1 > room:
                     break
                 keep.append(ln)
                 size += len(ln) + 1
+            resume = len(keep) + 1
+            if len(keep) < len(lines) and room - size >= 40:
+                # Owners write long paragraphs: a file of one heading and one long line used to show only the
+                # heading. Show as much of the next line as fits, cut at a word, and continue from that line.
+                part = lines[len(keep)][:room - size - 4]
+                if " " in part[len(part) // 2:]:
+                    part = part[:part.rfind(" ")]
+                if part.strip():
+                    keep.append(part.rstrip() + " ...")
             if keep:
                 parts.append(f"## {ref}\n" + "\n".join(keep) +
-                             f"\n[cut for room; read the rest with read_file {ref} start_line={len(keep) + 1}]")
+                             f"\n[cut for room; read the rest with read_file {ref} start_line={resume}]")
                 used = budget
                 continue
         cut.append(ref)
@@ -1975,7 +2123,7 @@ def index_section(company: dict) -> str:
         return ""
     head = "# Context you can open\nRead any of these with read_file <path> (outline=true lists its headings first)."
     tail = ('Find anything else with search("your words"): it covers files, the owner\'s context, memory, tasks, '
-            "emails, chat, decisions, past sessions and facts.")
+            "emails, chat, decisions, past sessions, facts and web pages your team fetched.")
     budget = INDEX_CAP - len(head) - len(tail) - 2
     out, used = [head], 0
     for label, entries in (("The owner's context files (read-only):", lib), ("Key documents:", docs)):

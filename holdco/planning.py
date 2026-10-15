@@ -24,8 +24,9 @@ import re
 import threading
 import time
 import traceback
+import zlib
 
-from . import actions, bus, db, playbooks, workspace
+from . import actions, bus, db, emailer, playbooks, workspace
 from .routing import route, company_or_404
 from .tools import Ctx, REGISTRY
 
@@ -73,13 +74,18 @@ MAX_PENDING_QUESTIONS = 3      # agent questions waiting per company; a fourth i
 MAX_OPTIONS = 6
 CONTEXT_CAP = 1500
 OVERLAP_THRESHOLD = 0.5        # Jaccard similarity of content words that counts as the same question
+GENERIC_OVERLAP = 0.25         # the lower bar for questions that share only a generic topic
 
 # Topic -> (label shown to agents, keywords). One question can carry several topics ("deploy and outreach");
-# any shared topic with a pending question means the owner already has it.
+# a shared topic with a pending question means the owner already has it. Putting the website online, making it
+# public or hosting it all mean deploying; "online" and "public" count only after the site or "put it", so
+# "Which online communities?" is not a deploy question.
 TOPICS: dict[str, tuple[str, re.Pattern]] = {
     "deploy": ("deploy", re.compile(
         r"\b(deploy\w*|publish\w*|netlify|vercel|go(ing)? live|launch(ing)? the (site|website|page|landing page)|"
-        r"put the (site|website) live)\b", re.I)),
+        r"put (the |our )?(site|website|landing page|page)|hosting|host(s|ed)? (the |our )?(site|website|page|"
+        r"landing page|it)|hosted on|go(ing)? online|(put|make|take|bring|get) (it|them) (online|public|live)|"
+        r"(site|website|page)\b[^.?!\n]{0,30}\b(online|public(ly)?))\b", re.I)),
     "email": ("outreach", re.compile(r"\b(e-?mails?|e-?mailing|outreach|mailbox\w*|smtp|imap)\b", re.I)),
     "analytics": ("analytics", re.compile(r"\b(analytics|ga4|measurement id|tracking|google tag)\b", re.I)),
     "domain": ("domain", re.compile(r"\b(domains?|dns)\b", re.I)),
@@ -91,6 +97,10 @@ TOPICS: dict[str, tuple[str, re.Pattern]] = {
     "legal": ("legal", re.compile(r"\b(legal\w*|llc|contracts?|terms( of service)?|privacy policy|gdpr|lawyers?)\b",
                                   re.I)),
 }
+# Topics too broad to mean "the same question" on their own: a mailbox question and a question about the address
+# the landing page shows both mention email; a Netlify account and an analytics account are different accounts.
+# They match only together with a second shared topic or real word overlap (GENERIC_OVERLAP).
+GENERIC_TOPICS = frozenset({"account", "email"})
 # A pending request of these kinds already puts the topic in the owner's inbox.
 APPROVAL_TOPICS = {"deploy_site": "deploy", "send_email": "email", "spend_money": "money"}
 APPROVAL_NOUNS = {"deploy_site": "deploy", "send_email": "email", "spend_money": "purchase"}
@@ -169,32 +179,44 @@ def _pending(company_id: int) -> list[dict]:
     return rows
 
 
+def _same_topic(shared: list[str], mine: set, their_text: str) -> bool:
+    """Do two questions that share these topics ask the same thing? One specific topic (deploy, analytics,
+    domain, money, pricing, legal) is enough; generic ones need a second shared topic or real word overlap."""
+    if not shared:
+        return False
+    if any(t not in GENERIC_TOPICS for t in shared) or len(shared) >= 2:
+        return True
+    return jaccard(mine, content_words(their_text)) >= GENERIC_OVERLAP
+
+
 def find_duplicate(company_id: int, question: str, topics: list[str]) -> dict | None:
     """The pending question or request that already covers this question, as {"id", "reason", "label",
     "text"}, or None. Topics are checked first, then pending requests of the same kind, then word overlap."""
     rows = _pending(company_id)
     questions = [r for r in rows if r["action"] == "question"]
     wanted = set(topics)
+    mine = content_words(question)
     for r in questions:
         p = r["p"]
-        theirs = set(p.get("topics") or detect_topics("\n".join([str(p.get("question") or r["summary"] or "")]
+        their_text = str(p.get("question") or r["summary"] or "")
+        theirs = set(p.get("topics") or detect_topics("\n".join([their_text]
                                                                  + [str(o) for o in p.get("options") or []])))
         shared = [t for t in topics if t in theirs]
-        if shared:
+        if _same_topic(shared, mine, their_text):
             label = topic_label(shared)
             return {"id": r["id"], "reason": "topic", "label": label,
                     "text": f"Already waiting on the owner as #{r['id']} ({label}, asked {_age(r['created_at'])} "
                             f"ago). {DO_NOT_ASK_AGAIN}"}
     for r in rows:
         topic = APPROVAL_TOPICS.get(r["action"])
-        if topic and topic in wanted:
+        their_text = f"{r['summary'] or ''} {r['p'].get('subject') or ''}"
+        if topic and topic in wanted and _same_topic([topic], mine, their_text):
             label = topic_label([topic])
             noun = APPROVAL_NOUNS[r["action"]]
             return {"id": r["id"], "reason": "approval", "label": label,
                     "text": f"Already waiting on the owner as #{r['id']} ({label}, asked {_age(r['created_at'])} "
                             f"ago): your {noun} request #{r['id']} is already in the owner's inbox. "
                             f"{DO_NOT_ASK_AGAIN}"}
-    mine = content_words(question)
     for r in questions:
         if jaccard(mine, content_words(str(r["p"].get("question") or r["summary"] or ""))) >= OVERLAP_THRESHOLD:
             return {"id": r["id"], "reason": "overlap", "label": "a similar question",
@@ -224,6 +246,9 @@ def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "",
         payload["topics"] = topics
     dup = find_duplicate(cid, question, topics)
     if dup:
+        # The run now waits on that pending question or request: finish(status='waiting') accepts it, and the
+        # owner's decision on it reopens the task (actions.decide).
+        ctx.waiting_on = dup["id"]
         _deduped(ctx, question, topics, dup["reason"], dup["id"],
                  f"question not queued: already waiting as #{dup['id']} ({dup['label']})")
         return dup["text"]
@@ -234,7 +259,8 @@ def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "",
                  f"question not queued: {len(mine)} questions are already waiting on the owner")
         return (f"ERROR: {len(mine)} questions from the team are already waiting on the owner ({listed}). Do not "
                 f"queue another: continue with work that does not need an answer, or finish with status "
-                f"'waiting'. When one is answered, fold this into your next question.")
+                f"'blocked' and say what you need from the owner. When one is answered, fold this into your next "
+                f"question.")
     return actions.gate(ctx.company, ctx.agent, ctx.task["id"] if ctx.task else None, "question", payload)
 
 
@@ -261,8 +287,15 @@ REAL_CHANGE_SQL = ("(kind IN ('decision','email','connector','fact','facts') "
                    "OR (kind='file' AND data LIKE '%\"by\": \"owner\"%') "
                    "OR (kind='metric' AND agent_id IS NULL))")
 TASK_STATUSES = ("todo", "in_progress", "waiting", "blocked", "done", "cancelled")
+# How a planning cycle can end without a usable result. Such a cycle is no baseline: the next idle or due
+# trigger plans again (one failed cycle once froze an idle company for good).
+FAILED_CYCLE = ("error", "interrupted", "stopped", "out_of_steps")
+# Company settings that change what the team can do (a mailbox, a Netlify token, the site address, the postal
+# address outreach needs, the owner's standing orders, the business type). A change to any of them is news.
+CAPABILITY_KEYS = ("site_url", "webhook_url", "postal_address", "directives", "archetype")
 
-_cycle_flags: dict[int, tuple[float, bool]] = {}   # company id -> (when, changed) set by cycle_started
+# company id -> (when, changed, owner requested) set by cycle_started and used once by cycle_header
+_cycle_flags: dict[int, tuple[float, bool, bool]] = {}
 
 
 def task_counts(company_id: int) -> dict[str, int]:
@@ -272,16 +305,27 @@ def task_counts(company_id: int) -> dict[str, int]:
     return counts
 
 
+def capability_hash(cs: dict) -> str:
+    """A short hash of the capability settings (secrets only as set or not set), so a settings change counts as
+    a change for planning and the owner's settings form can tell whether anything that matters changed."""
+    cs = cs or {}
+    parts = ["smtp" if emailer.smtp_configured(cs) else "", "imap" if emailer.imap_configured(cs) else "",
+             "netlify" if cs.get("netlify_token") else ""]
+    parts += [str(cs.get(k) or "").strip() for k in CAPABILITY_KEYS]
+    return format(zlib.crc32("\x1f".join(parts).encode("utf-8", "replace")), "08x")
+
+
 def change_stamp(company: dict) -> str:
     """A cheap fingerprint of everything that should make the CEO plan again: the newest meaningful event, the
-    newest owner chat message, the number of pending approvals and the tasks per status."""
+    newest owner chat message, the number of pending approvals, the tasks per status and the capability
+    settings."""
     cid = company["id"]
     ev = db.one(f"SELECT id FROM events WHERE company_id=? AND {REAL_CHANGE_SQL} ORDER BY id DESC LIMIT 1", (cid,))
     msg = db.one("SELECT id FROM messages WHERE company_id=? AND sender='owner' ORDER BY id DESC LIMIT 1", (cid,))
     pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (cid,)) or 0
     counts = task_counts(cid)
     return (f"e{ev['id'] if ev else 0}.m{msg['id'] if msg else 0}.p{pending}.t"
-            + "-".join(str(counts[s]) for s in TASK_STATUSES))
+            + "-".join(str(counts[s]) for s in TASK_STATUSES) + f".c{capability_hash(db.company_settings(company))}")
 
 
 def stamp_record(company: dict) -> dict:
@@ -307,7 +351,9 @@ def _save_record(company_id: int, rec: dict) -> str:
 def _absorb_last_cycle(company: dict) -> dict:
     """Once per finished planning cycle: when nobody but the CEO changed anything meaningful while it ran, its
     own effects (tasks it created or cancelled, the question it asked) become the new baseline, so a cycle never
-    triggers the next one by itself. Returns the company with the record it now has."""
+    triggers the next one by itself. A cycle that failed (error, interrupted, stopped, out of steps) is no
+    baseline: the stored stamp is cleared so the next idle or due trigger plans again. Returns the company with
+    the record it now has."""
     cid = company["id"]
     run = db.one("SELECT id, agent_id, status, started_at FROM runs WHERE company_id=? AND kind='cycle' "
                  "ORDER BY id DESC LIMIT 1", (cid,))
@@ -321,10 +367,24 @@ def _absorb_last_cycle(company: dict) -> dict:
                      f"(kind IN ('fact','facts') AND agent_id IS ?) LIMIT 1", (cid, since, run["agent_id"]))
     owner = db.one("SELECT id FROM messages WHERE company_id=? AND sender='owner' AND created_at>=? LIMIT 1",
                    (cid, since))
-    if not outside and not owner:
+    if run["status"] in FAILED_CYCLE:
+        rec["s"] = ""
+    elif not outside and not owner:
         rec["s"] = change_stamp(company)
     rec["run"] = run["id"]
     return {**company, "last_cycle_stamp": _save_record(cid, rec)}
+
+
+def _work_open(company_id: int) -> bool:
+    """Is any task queued or being worked on?"""
+    return bool(db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN ('todo','in_progress')",
+                          (company_id,)))
+
+
+def _waits_on_owner(company_id: int) -> bool:
+    """Does anything wait on the owner: a pending question or request, or a task waiting for an answer?"""
+    return bool(db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (company_id,))
+                or db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status='waiting'", (company_id,)))
 
 
 def should_cycle(company: dict, due: bool, idle: bool, requested: bool) -> bool:
@@ -335,6 +395,10 @@ def should_cycle(company: dict, due: bool, idle: bool, requested: bool) -> bool:
     stamp is unchanged. Each due interval that passes without a change doubles the next one (cycle_backoff, up
     to eight doublings); any change resets it. While everything open waits on the owner, the owner gets one
     "still waiting on you" line a day instead of a planning cycle every few minutes.
+
+    Safety net: when nothing is open and nothing waits on the owner, the company would otherwise sit idle
+    forever, so the due trigger still plans at cycle_minutes * 2**cycle_backoff. Each such cycle raises the
+    backoff (a cycle that created nothing counts too), so they space out: 1, 2, 4, 8... hours.
     """
     if requested:
         return True
@@ -346,10 +410,14 @@ def should_cycle(company: dict, due: bool, idle: bool, requested: bool) -> bool:
             if backoff:
                 db.update("companies", company["id"], cycle_backoff=0)
             return bool(due or idle)
-        if due and backoff < MAX_BACKOFF:
+        if due:
             minutes = float(db.company_settings(company).get("cycle_minutes") or 60)
             if db.minutes_since(company.get("last_cycle_at")) >= minutes * (2 ** backoff):
-                db.update("companies", company["id"], cycle_backoff=backoff + 1)
+                if not _work_open(company["id"]) and not _waits_on_owner(company["id"]):
+                    db.update("companies", company["id"], cycle_backoff=min(MAX_BACKOFF, backoff + 1))
+                    return True
+                if backoff < MAX_BACKOFF:
+                    db.update("companies", company["id"], cycle_backoff=backoff + 1)
         _maybe_waiting_notice(company)
         return False
     except Exception:   # a broken stamp must not stop the company from planning at all
@@ -364,32 +432,51 @@ def next_due_minutes(company: dict) -> float:
     return max(0.0, interval - db.minutes_since(company.get("last_cycle_at")))
 
 
-def cycle_started(company: dict) -> None:
-    """Scheduler: a planning cycle just started. Record the change stamp (the baseline for the next decision)
-    and reset the backoff."""
+def cycle_started(company: dict, requested: bool = False) -> None:
+    """A planning cycle is starting (the scheduler, or the owner's "Plan now"). Record the change stamp (the
+    baseline for the next decision) and whether anything changed, for this cycle's header. A change or an owner
+    request resets the backoff; a safety-net cycle (nothing changed, see should_cycle) keeps the backoff it
+    raised, so the next one waits twice as long."""
     try:
         cid = company["id"]
         fresh = db.get_company(cid) or company
         rec = stamp_record(fresh)
         stamp = change_stamp(fresh)
-        _cycle_flags[cid] = (time.time(), stamp != rec.get("s"))
+        changed = stamp != rec.get("s")
+        _cycle_flags[cid] = (time.time(), changed, bool(requested))
         new = {"s": stamp}
         if rec.get("run"):
             new["run"] = rec["run"]
         _save_record(cid, new)
-        db.update("companies", cid, cycle_backoff=0)
+        if changed or requested:
+            db.update("companies", cid, cycle_backoff=0)
     except Exception:
         traceback.print_exc()
 
 
 def changed_since_last_cycle(company: dict) -> bool:
     """Did anything meaningful change since the previous planning cycle? Right after cycle_started this is its
-    answer; otherwise (a "Plan now" cycle) the live stamp is compared with the stored one."""
+    answer; otherwise the live stamp is compared with the stored one."""
     flag = _cycle_flags.get(company["id"])
     if flag and time.time() - flag[0] < FLAG_SECONDS:
         return flag[1]
     fresh = db.get_company(company["id"]) or company
     return change_stamp(fresh) != stamp_record(fresh).get("s")
+
+
+def _nothing_changed_line(company: dict, requested: bool) -> bool:
+    """Should this cycle's header say "Nothing has changed"? Decided once, at the start of each cycle: the flag
+    cycle_started left is used up here, so a later cycle never reuses an old answer. Never for a cycle the owner
+    asked for ("Plan now", an answer, a settings change): the owner acting is news."""
+    flag = _cycle_flags.pop(company["id"], None)
+    if flag and time.time() - flag[0] >= FLAG_SECONDS:
+        flag = None
+    if requested or (flag and flag[2]):
+        return False
+    if flag:
+        return not flag[1]
+    fresh = db.get_company(company["id"]) or company
+    return change_stamp(fresh) == stamp_record(fresh).get("s")
 
 
 def waiting_summary(company: dict) -> dict | None:
@@ -525,7 +612,8 @@ CHARTER_SECTIONS: list[tuple[str, re.Pattern]] = [
                                   r"\bmonetiz\w*|\bwho pays\b|\bhow we make money\b")),
     ("Riskiest assumption", re.compile(r"\briskiest\b|\b(key|critical|biggest) assumption|\bassumption to test\b")),
     ("North Star metric", re.compile(r"\bnorth[- ]?star\b")),
-    ("30-day plan", re.compile(r"\b30-? ?days?\b|\bfirst month\b|\bthirty days\b")),
+    ("30-day plan", re.compile(r"\b30-? ?days?\b|\bfirst month\b|\bthirty-? ?days?\b|\bweeks? 1 ?(-|to) ?4\b|"
+                               r"\b(first )?(four|4) weeks\b")),
 ]
 SECTION_MIN_CHARS = 20    # a section with less real text than this counts as empty
 _WHO_PAYS_RE = re.compile(r"\bpa(y|ys|id|ying)\b|charg|subscri|\bfees?\b|commission|revenue|pric|\bper\b|"
@@ -538,6 +626,9 @@ _PLAIN_LABEL_RE = re.compile(r"^\s*(?:[-*+]\s+)?([A-Za-z0-9][\w &'/\-\u2010-\u20
 _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"), "-")
 _CURRENCY_RE = re.compile(r"[$\u20ac\u00a3\u00a5]\s?\d|\d+(?:[.,]\d+)?\s?(?:usd|eur|gbp|cad|aud|dollars?|euros?|"
                           r"pounds?)\b", re.I)
+# A pass threshold written in words: "three out of ten roofers", "half of the visitors", "five percent".
+_WORD_THRESHOLD_RE = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|twenty|half)\s+"
+                                r"(out\s+of|of|in|percent)\b")
 
 
 def _norm_heading(text: str) -> str:
@@ -620,7 +711,7 @@ def _section_problem(name: str, body: str) -> str | None:
         if _list_items(body) < 3:
             return "name at least three, one per bullet or table row, with how we differ"
     elif name == "Riskiest assumption":
-        if not re.search(r"\d", low):
+        if not re.search(r"\d", low) and not _WORD_THRESHOLD_RE.search(low):
             return "needs a pass threshold: a number or percentage"
     elif name == "Business model":
         if not _WHO_PAYS_RE.search(low):
@@ -716,11 +807,12 @@ PLAN_RULES = [
 ]
 
 
-def cycle_header(company: dict) -> str:
+def cycle_header(company: dict, requested: bool = False) -> str:
     """Top of the planning-cycle prompt: whether anything changed, the playbook's next experiments and the
-    planning rules. The facts, changes and waiting items themselves are in the system prompt (truth.py)."""
+    planning rules. The facts, changes and waiting items themselves are in the system prompt (truth.py).
+    requested: the owner asked for this cycle, so it never opens with "Nothing has changed"."""
     parts = []
-    if not changed_since_last_cycle(company):
+    if _nothing_changed_line(company, requested):
         parts.append("Nothing has changed since your last planning cycle.")
     key = playbooks.archetype(company)
     if key:
@@ -742,9 +834,13 @@ STAGE_THINK = {"research": "medium", "charter": "high", "critic": "high", "plan"
 
 def founding_stage(company: dict) -> str:
     """The stage a founding run should do now: research, charter, critic or plan; "done" once founding
-    finished. A company without the setting (created before staged founding) starts at research."""
+    finished. A company without the setting that is still being founded (created before staged founding)
+    starts at research; one without the setting that is not founding was founded before Phase 0.5, so its
+    founding is done and "Retry founding" restarts where it is weakest (retry_stage), not at the beginning."""
     st = str(db.company_settings(company).get("founding_stage") or "").strip().lower()
-    return st if st in FOUNDING_STAGES or st == "done" else "research"
+    if st in FOUNDING_STAGES or st == "done":
+        return st
+    return "research" if (company.get("status") or "founding") == "founding" else "done"
 
 
 def retry_stage(company: dict) -> str:
@@ -792,6 +888,8 @@ def after_stage(company: dict, stage: str, how: str, summary: str = "") -> str:
         # Research may end early (search down, step budget): the charter stage is told, so it notes the gaps
         # instead of filling them with invented numbers.
         note = "" if how == "done" else f"Research ended {RESEARCH_ENDINGS.get(how, how)}: {_summary_line(summary)}"
+        if not note and not _research_file(company)[0]:
+            note = f"Research ended without saving {RESEARCH_PATH}: {_summary_line(summary)}"
         update_company_settings(cid, founding_research_note=note[:500])
     if stage == "charter":
         missing = validate_charter(company.get("charter") or "")
@@ -852,10 +950,10 @@ def _research_text(steps: int, search_down: bool) -> str:
         "already know, write research/market.md from the idea and what you know, mark every gap, and finish with "
         "status 'partial'. The plan stage asks the owner about the market in the welcome brief (report_to_owner).\n"
     ) if search_down else ""
-    fact = ("2. For every price or number you will rely on, open the page with fetch_url and save it with "
-            "record_fact (the claim, the URL and a quote copied exactly from the page).\n"
+    fact = ("3. Record prices and other key numbers with record_fact as you find them (the claim, the URL and a "
+            "quote copied exactly from the page you fetched).\n"
             if _tool_ready("record_fact") else
-            "2. For every price or number you will rely on, open the page with fetch_url so you can cite it.\n")
+            "3. For every price or number you will rely on, open the page with fetch_url so you can cite it.\n")
     return (
         f"\nThis stage: research the market. You have {steps} tool calls: save your findings and finish by call "
         f"{max(2, steps - 2)}.\n" + note
@@ -863,12 +961,91 @@ def _research_text(steps: int, search_down: bool) -> str:
         "1. Research the market with web_search and fetch_url (3 to 6 searches): who the customers are, what they "
         "pay for this today and to whom, at least three real competitors with their prices, and where these "
         "customers can be reached (communities, directories, search terms, events).\n"
+        f"2. Write {RESEARCH_PATH} early, as soon as you have the first findings, and append to it as you go "
+        "(write_file with append=true): a source URL or [fact N] next to every price and number, and a Gaps list "
+        "for what you could not find. Pages you only read are lost when this stage ends; what you save is what "
+        "the next stages know.\n"
         + fact
-        + "3. Save the findings to research/market.md with a source URL or [fact N] next to every price and number, "
-        "and a Gaps list for what you could not find.\n"
-        "4. Call finish. Status 'partial' is fine when the research is incomplete: the next stages work with what "
+        + "4. Call finish. Status 'partial' is fine when the research is incomplete: the next stages work with what "
         "you saved. Do not write the charter or create tasks in this stage."
     )
+
+
+# What each founding stage must leave behind (design 4.1). Founding runs have no task, so tools.finish asks
+# planning for this instead of checking a task deliverable. The first real gpt-oss founding spent its research
+# steps fetching pages, never wrote research/market.md, and still claimed it had.
+RESEARCH_PATH = "research/market.md"
+RESEARCH_MIN_CHARS = 200
+PLAN_MIN_TASKS = 3
+RESEARCH_CHECKPOINT = (f"Save what you found so far to {RESEARCH_PATH} now, each fact with the URL it came from, "
+                       "then continue.")
+
+
+def _research_file(company: dict) -> tuple[bool, int]:
+    """(exists, characters of real text) of research/market.md."""
+    try:
+        p = workspace.safe_path(company, RESEARCH_PATH)
+        if not p.is_file():
+            return False, 0
+        return True, len(p.read_text(encoding="utf-8", errors="replace").strip())
+    except Exception:
+        return False, 0
+
+
+def research_saved(company: dict) -> bool:
+    """Has the research stage saved research/market.md yet? (agents.run's halfway checkpoint)"""
+    return _research_file(company)[0]
+
+
+def fetched_urls(company_id: int, limit: int = 12) -> list[str]:
+    """The pages this company fetched, newest first, for the research stage to write down."""
+    rows = db.q("SELECT url, MAX(id) AS last FROM fetched WHERE company_id=? GROUP BY url ORDER BY last DESC LIMIT ?",
+                (company_id, limit))
+    return [r["url"] for r in rows if r["url"]]
+
+
+def stage_problem(company: dict, stage: str) -> str | None:
+    """What a founding stage has not left behind yet, as the reason tools.finish gives once ("Not finished yet:
+    ..."); None when the stage's deliverable is there. research: research/market.md with real content; critic:
+    docs/critique.md; plan: at least three tasks; charter: a charter in the record that passes validation."""
+    company = db.get_company(company["id"]) or company
+    if stage == "research":
+        exists, size = _research_file(company)
+        if size >= RESEARCH_MIN_CHARS:
+            return None
+        what = (f"{RESEARCH_PATH} has only {size} characters" if exists else f"{RESEARCH_PATH} does not exist")
+        text = (f"{what}. Write what you found there now: each fact with the URL it came from, and a Gaps list for "
+                "what you could not find. Then call finish again.")
+        urls = fetched_urls(company["id"])
+        if urls:
+            text += " Pages this company fetched: " + ", ".join(urls) + "."
+        return text
+    if stage == "critic":
+        try:
+            p = workspace.safe_path(company, CRITIQUE_PATH)
+            ok = p.is_file() and bool(p.read_text(encoding="utf-8", errors="replace").strip())
+        except Exception:
+            ok = False
+        if ok:
+            return None
+        return (f"{CRITIQUE_PATH} does not exist. Write it with write_file: the three strongest reasons this company "
+                "fails, the evidence that would answer each, and what to test first. Then call finish again.")
+    if stage == "plan":
+        n = int(db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status!='cancelled'",
+                          (company["id"],)) or 0)
+        if n >= PLAN_MIN_TASKS:
+            return None
+        return (f"the first week has {n} task{'s' if n != 1 else ''}; it needs at least {PLAN_MIN_TASKS}. Create the "
+                "rest with create_task across the team, each with a deliverable and acceptance criteria, then call "
+                "finish again.")
+    if stage == "charter":
+        missing = validate_charter(company.get("charter") or "")
+        if not missing:
+            return None
+        return ("the company record has no complete charter yet (missing or empty: " + "; ".join(missing)
+                + "). Call update_charter with the full charter, one '## ' heading per section, then call finish "
+                  "again.")
+    return None
 
 
 CHARTER_GUIDE = [

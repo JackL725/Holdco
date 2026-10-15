@@ -193,6 +193,7 @@ def api_company_patch(h, m, body):
     c = _company_or_404(m.group(1))
     b = body or {}
     fields = {}
+    caps_before = planning.capability_hash(db.company_settings(c))
     if "status" in b and b["status"] in ("active", "paused", "archived"):
         fields["status"] = b["status"]
         bus.emit(c["id"], "info", {"active": "resumed the company", "paused": "paused the company",
@@ -223,6 +224,12 @@ def api_company_patch(h, m, body):
                 v = {a: p for a, p in v.items() if p}
             cs[k] = v
         fields["settings"] = json.dumps(cs)
+        # Phase 0.5: a new mailbox, token, site address, postal address, standing orders or business type
+        # changes what the team can do, so the CEO plans with it at the next tick.
+        if planning.capability_hash(cs) != caps_before:
+            fields["cycle_requested"] = 1
+    if "charter" in fields and (fields["charter"] or "") != (c.get("charter") or ""):
+        fields["cycle_requested"] = 1   # the owner rewrote the charter: plan against the new one
     if fields:
         db.update("companies", c["id"], **fields)
     bus.notify("company", company_id=c["id"])
@@ -249,7 +256,13 @@ def api_cycle(h, m, body):
     ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
     if not ceo:
         raise HTTPError(400, "This company has no CEO agent.")
-    if not agents.start(ceo["id"], "cycle"):
+    if agents.is_running(ceo["id"]):
+        db.update("companies", c["id"], cycle_requested=1)   # the scheduler plans as soon as the CEO is free
+        return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
+    # The owner asked: the baseline is recorded and the cycle's header never says "Nothing has changed".
+    planning.cycle_started(c, requested=True)
+    if not agents.start(ceo["id"], "cycle", requested=True):
+        db.update("companies", c["id"], cycle_requested=1)
         return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
     return {"ok": True, "message": f"{ceo['name']} is planning now."}
 
@@ -319,7 +332,7 @@ def api_agent_run(h, m, body):
     if not a:
         raise HTTPError(404, "Agent not found")
     if a["role"] == "ceo" and not (body or {}).get("task_id"):
-        ok = agents.start(a["id"], "cycle")
+        ok = agents.start(a["id"], "cycle", requested=True)   # the owner started it from the Team tab
     else:
         t = db.one("SELECT * FROM tasks WHERE company_id=? AND agent_id=? AND status='todo' ORDER BY priority, id LIMIT 1",
                    (a["company_id"], a["id"]))

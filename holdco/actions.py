@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -165,12 +166,43 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
             watchdog.resolve(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result)
         except NotImplementedError:
             pass
+    _reopen_waiting(company["id"], approval_id, ts)
     _records_changed(company["id"])
     db.update("companies", company["id"], cycle_requested=1)
     kind = "decision" if status != "failed" else "error"
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+_WAITING_ON_RE = re.compile(r"Waiting on the owner: #(\d+)")
+
+
+def _reopen_waiting(company_id: int, approval_id: int, ts: str) -> None:
+    """Phase 0.5: after any owner decision, tasks of the company that wait with no pending approval of their own
+    go back to the queue. A task whose question was refused as a duplicate waits on someone else's question and
+    was never reopened before. One whose last handoff names a question that is still pending ("Waiting on the
+    owner: #N", written by finish) keeps waiting for that one."""
+    try:
+        pending = {r["id"]: r["task_id"] for r in
+                   db.q("SELECT id, task_id FROM approvals WHERE company_id=? AND status IN ('pending','running')",
+                        (company_id,))}
+        own = {tid for tid in pending.values() if tid}
+        reopened = 0
+        for t in db.q("SELECT id, result FROM tasks WHERE company_id=? AND status='waiting'", (company_id,)):
+            if t["id"] in own:
+                continue
+            named = _WAITING_ON_RE.findall(t["result"] or "")
+            if named and int(named[-1]) in pending:
+                continue
+            note = f"[Holdco] The owner answered #{approval_id}; continue."
+            db.update("tasks", t["id"], status="todo", updated_at=ts,
+                      result=((t["result"] or "") + "\n" + note).strip()[-6000:])
+            reopened += 1
+        if reopened:
+            bus.notify("tasks", company_id=company_id)
+    except Exception as e:   # reopening is a convenience; it must never undo the owner's decision
+        print(f"reopening waiting tasks failed: {e}")
 
 
 def _records_changed(company_id: int) -> None:
@@ -186,12 +218,14 @@ def _records_changed(company_id: int) -> None:
 
 def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payload: dict, result: str,
           approval_id: int | None = None) -> int:
-    """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent."""
+    """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent.
+    records/ is refreshed after the row is written, so it includes this action."""
+    aid = db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
+                 "approval_id) VALUES(?,?,?,?,?,?,?,?)",
+                 (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
+                  default=str)[:20000], str(result or "")[:4000], approval_id))
     _records_changed(company_id)
-    return db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
-                  "approval_id) VALUES(?,?,?,?,?,?,?,?)",
-                  (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
-                   default=str)[:20000], str(result or "")[:4000], approval_id))
+    return aid
 
 
 # ---------------- executors ----------------

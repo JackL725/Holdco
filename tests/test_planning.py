@@ -349,6 +349,10 @@ class TestChangeDrivenPlanning(unittest.TestCase):
         self.assertNotEqual(planning.change_stamp(c), stamp)
 
     def test_due_skips_and_backs_off_while_nothing_changes(self):
+        # Everything waits on the owner (a question and a task waiting for it): no cycle, only a longer wait.
+        # (With nothing open and nothing waiting, the safety net plans instead; see tests/test_phase05_flow.py.)
+        add_task(self.c, "Deploy the site", "engineering", status="waiting")
+        actions.gate(self.c, agent(self.c), None, "question", {"question": "May we deploy the site?"})
         c = self.started()
         db.update("companies", c["id"], last_cycle_at=ago(61))
         self.assertFalse(planning.should_cycle(fresh(c), True, False, False))

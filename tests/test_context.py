@@ -750,7 +750,7 @@ class TestPromptSections(Base):
                        "- research/market.md: Phoenix roofing market"):
             self.assertIn(needle, sec)
         self.assertNotIn("photo.jpg", sec)
-        self.assertTrue(sec.endswith("past sessions and facts."))
+        self.assertTrue(sec.endswith("past sessions, facts and web pages your team fetched."))
         self.assertIn('search("your words")', sec)
         for i in range(60):
             (g / f"note-{i:02d}.md").write_text(f"# Note number {i} with a fairly long title for testing\n",

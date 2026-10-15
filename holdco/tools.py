@@ -35,6 +35,13 @@ class Ctx:
     deliverable: str = ""
     written: set = field(default_factory=set)   # files written in this session
     claims_warned: bool = False                  # Phase 0.5: finish() warned once about unsupported claims
+    # Phase 0.5: the pending question or request this run waits on, when ask_owner refused a question as a
+    # duplicate of it (truth.action_state and finish(status='waiting') read it).
+    waiting_on: int | None = None
+    waiting_warned: bool = False                 # finish() said once that nothing waits on the owner
+    founding_stage: str = ""                     # research, charter, critic or plan in a founding run
+    stage_warned: bool = False                   # finish() said once what the founding stage has not left
+    refused_finish: dict | None = None           # the finish call that stage check refused (agents.run)
 
 
 @dataclass
@@ -202,8 +209,9 @@ def list_files(ctx: Ctx, path: str = ".") -> str:
     return context.list_files(ctx, path)
 
 
-@tool("read_file", "Read a text file: the company folder, or the owner's context (context:<path>, global:<path>). "
-      "Reads by line range; outline=true lists the headings with line numbers.",
+@tool("read_file", "Read a text file: the company folder, the owner's context (context:<path>, global:<path>), or "
+      "a web page your team already fetched (page:<url>). Reads by line range; outline=true lists the headings "
+      "with line numbers.",
       {"path": S("Path relative to the company folder, e.g. research/market.md"),
        "start_line": I("First line to read (default 1)"), "end_line": I("Last line to read (default: 200 lines)"),
        "outline": {"type": "boolean", "description": "Only list the headings with their line numbers"},
@@ -252,6 +260,22 @@ def delete_file(ctx: Ctx, path: str) -> str:
     p = workspace.safe_path(ctx.company, path)
     if not p.exists() or p == workspace.root(ctx.company).resolve():
         raise ToolError(f"{path} doesn't exist.")
+    # Phase 0.5: records/ is Holdco's account of what happened and context/ is the owner's library; agents may
+    # not delete them (or their folders) any more than overwrite them. Same refusals as truth.write_guard, on the
+    # resolved path, so "docs/../records" or "Records" cannot get round it.
+    first = workspace.rel(ctx.company, p).lower().split("/", 1)[0].rstrip(". ")
+    if first in ("records", "context"):
+        msg = (getattr(truth, "RECORDS_REFUSAL", "") or "ERROR: records/ is written by Holdco from what really "
+               "happened. Write plans and notes elsewhere.") if first == "records" else \
+            (getattr(truth, "CONTEXT_REFUSAL", "") or "ERROR: context/ is the owner's. Save your notes elsewhere, "
+             "for example docs/.")
+        refused = getattr(truth, "_refused", None)
+        if refused:
+            try:
+                refused(ctx, "delete_file", first, msg, path=workspace.rel(ctx.company, p))
+            except Exception:
+                pass
+        return msg
     dest = workspace.trash(ctx.company, p)
     _log(ctx, "file", f"moved {path} to trash")
     return f"Moved to {dest}."
@@ -661,6 +685,25 @@ def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     return None
 
 
+WAITING_REFUSAL = ("Not finished yet: nothing is waiting on the owner for this task. Ask with ask_owner (one question "
+                   "with options and your recommendation), or finish with status 'blocked' and say what blocks you.")
+WAITING_ON_LABEL = "Waiting on the owner: "
+
+
+def _waiting_for(ctx: Ctx) -> int | None:
+    """The pending approval this task waits on: its own question or request, else the pending one ask_owner
+    folded its duplicate question into (ctx.waiting_on). None when nothing waits on the owner for it."""
+    cid = ctx.company["id"]
+    own = db.one("SELECT id FROM approvals WHERE company_id=? AND task_id=? AND status IN ('pending','running') "
+                 "ORDER BY id DESC LIMIT 1", (cid, ctx.task["id"]))
+    if own:
+        return own["id"]
+    if ctx.waiting_on and db.one("SELECT id FROM approvals WHERE id=? AND company_id=? AND status='pending'",
+                                 (ctx.waiting_on, cid)):
+        return int(ctx.waiting_on)
+    return None
+
+
 @tool("finish", "End your work session with a handoff for the team.",
       {"summary": S("What you did, in up to 5 short bullets"),
        "status": S("done, partial (some progress, more needed), blocked (can't proceed) or waiting (on the owner)"),
@@ -674,6 +717,28 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     if status not in ("done", "partial", "blocked", "waiting"):
         status = "done"
     target = deliverable or (ctx.task or {}).get("deliverable", "")
+    if ctx.kind == "founding" and ctx.founding_stage:
+        # Phase 0.5: founding runs have no task, so each stage's own deliverable is checked instead, whatever the
+        # status. Once: the stage gets one more chance to save it, then its finish is accepted with a note.
+        problem = planning.stage_problem(ctx.company, ctx.founding_stage)
+        if problem and not ctx.stage_warned:
+            ctx.stage_warned = True
+            ctx.refused_finish = {"summary": summary, "status": status, "deliverable": deliverable,
+                                  "evidence": evidence, "open_issues": open_issues, "next_step": next_step}
+            return f"Not finished yet: {problem}"
+        if problem:
+            open_issues = (open_issues + f"\nStage check: {problem.split('. ', 1)[0]}.").strip()
+    waiting_on = None
+    if status == "waiting" and ctx.task:
+        # Phase 0.5: 'waiting' means the owner has something to answer for this task: its own question or
+        # request, or the pending one its duplicate question was folded into. Otherwise it would wait forever.
+        waiting_on = _waiting_for(ctx)
+        if waiting_on is None and not ctx.waiting_warned:
+            ctx.waiting_warned = True
+            return WAITING_REFUSAL
+        if waiting_on is None:
+            status = "blocked"
+            open_issues = (open_issues + "\nNothing was waiting on the owner for this task.").strip()
     if status == "done" and ctx.task:
         problem = _deliverable_ok(ctx, target)
         if problem and not ctx.finish_warned:
@@ -701,6 +766,9 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     for label, val in (("Evidence", evidence), ("Open issues", open_issues), ("Suggested next", next_step)):
         if val and val.strip():
             parts.append(f"{label}: {val.strip()}")
+    if status == "waiting" and waiting_on:
+        # actions.decide reads this line: the task reopens once #N is decided, not on unrelated answers.
+        parts.append(f"{WAITING_ON_LABEL}#{waiting_on}")
     ctx.finished = True
     ctx.finish_status = status
     ctx.finish_summary = "\n".join(parts)
