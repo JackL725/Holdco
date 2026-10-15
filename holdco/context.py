@@ -105,21 +105,7 @@ _tools.ARG_RENAMES.setdefault("read_file", {}).update({
     "end": "end_line", "to_line": "end_line", "line_end": "end_line", "filepath": "path"})
 _tools.ARG_RENAMES.setdefault("list_files", {}).update({"folder": "path", "dir": "path", "directory": "path"})
 
-_resolve_names = _tools.resolve
-
-
-def _resolve_with_old_meaning(ctx: Ctx, name: str, args: dict) -> tuple[str, dict]:
-    """'search' was an alias for web_search before it became a tool of its own (gpt-oss calls its built-in
-    browser search that way). Founding runs do not carry the new search tool, so for an agent without it the
-    old meaning still applies instead of an error. Any other call resolves exactly as before."""
-    if name in _tools.REGISTRY and ctx.allowed and name not in ctx.allowed:
-        old = _tools.ALIASES.get(name)
-        if old and old in ctx.allowed:
-            name = old
-    return _resolve_names(ctx, name, args)
-
-
-_tools.resolve = _resolve_with_old_meaning
+# tools.resolve keeps the old 'search' -> web_search meaning for agents that have web_search but not search.
 
 
 # ---------------------------------------------------------------- paths
@@ -1339,7 +1325,8 @@ def format_results(query: str, scope: str, rows: list[dict]) -> str:
 
 @tool("search", "Search everything the company knows: its files, the owner's context, memory, tasks, emails, chat, "
       "decisions, past sessions and verified facts. Returns ranked hits with path:line and the matching words in "
-      "[brackets]. Call this first when you need to find something.",
+      "[brackets]. Call this first when you need to find something. It does not search the internet: use "
+      "web_search for that.",
       {"query": S("Words to look for"),
        "scope": S("all (default), files, context, memory, tasks, emails, chat, decisions, sessions or facts"),
        "limit": I("How many results, 1-20 (default 8)")}, ("query",))

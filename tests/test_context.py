@@ -1056,10 +1056,14 @@ class TestToolsWiring(Base):
                          "Saved docs/small.md (8000 characters).")
 
     def test_search_keeps_its_old_meaning_for_agents_without_the_tool(self):
-        founding = ctx_for(self.c, "ceo", kind="founding")   # founding belts have web_search but not search
-        self.assertNotIn("search", founding.allowed)
-        self.assertEqual(tools.resolve(founding, "search", {"q": "roofers", "topn": 2}),
+        # Every belt carries search since Phase 0.5, so simulate an agent that has web_search but not search.
+        older = ctx_for(self.c, "ceo", kind="founding")
+        older.allowed = (older.allowed - {"search"}) | {"web_search"}
+        self.assertEqual(tools.resolve(older, "search", {"q": "roofers", "topn": 2}),
                          ("web_search", {"query": "roofers", "max_results": 2}))
+        founding = ctx_for(self.c, "ceo", kind="founding")   # staged founding stages carry the real search tool
+        self.assertIn("search", founding.allowed)
+        self.assertEqual(tools.resolve(founding, "search", {"q": "roofers"}), ("search", {"query": "roofers"}))
         self.assertEqual(tools.resolve(self.ctx, "search", {"q": "roofers"}), ("search", {"query": "roofers"}))
         self.assertEqual(tools.resolve(self.ctx, "find", {"text": "x"}), ("search", {"query": "x"}))
 

@@ -89,6 +89,10 @@ ARG_RENAMES = {"fetch_url": {"id": "url", "link": "url"}, "web_search": {"q": "q
 def resolve(ctx: Ctx, name: str, args: dict) -> tuple[str, dict]:
     if name not in REGISTRY and name in ALIASES:
         name = ALIASES[name]
+    elif name in REGISTRY and ctx.allowed and name not in ctx.allowed and ALIASES.get(name) in ctx.allowed:
+        # A real tool this agent does not have, whose older alias it does have. 'search' meant web_search before
+        # it became Holdco's own search, and gpt-oss still calls its built-in browser search that way.
+        name = ALIASES[name]
     renames = ARG_RENAMES.get(name, {})
     args = {renames.get(k, k): v for k, v in (args or {}).items()}
     if name == "run_code" and "code" in args and "language" not in args:
@@ -370,23 +374,11 @@ def remember(ctx: Ctx, content: str, kind: str = "note", pin: bool = False) -> s
     return f"Saved to memory (#{mid})."
 
 
-@tool("recall", "Search the company's shared memory.", {"query": S("Words to look for")}, ("query",))
+@tool("recall", "Search the company's shared memory (notes, decisions, owner answers).",
+      {"query": S("Words to look for")}, ("query",))
 def recall(ctx: Ctx, query: str) -> str:
-    rows = []
-    if db.HAS_FTS:
-        terms = " OR ".join(f'"{w}"' for w in re.findall(r"\w+", query)[:8])
-        if terms:
-            try:
-                rows = db.q("SELECT m.* FROM memory_fts f JOIN memory m ON m.id=f.rowid WHERE memory_fts MATCH ? "
-                            "AND m.company_id=? ORDER BY rank LIMIT 15", (terms, ctx.company["id"]))
-            except Exception:
-                rows = []
-    if not rows:
-        rows = db.q("SELECT * FROM memory WHERE company_id=? AND content LIKE ? ORDER BY id DESC LIMIT 15",
-                    (ctx.company["id"], f"%{query}%"))
-    if not rows:
-        return "Nothing found."
-    return "\n".join(f"- [{m['kind']}] {m['content']}" for m in rows)
+    # One search for everything since Phase 0.5; recall stays for agents and transcripts that know the old name.
+    return context.search(ctx, query, scope="memory", limit=15)
 
 
 @tool("record_metric", "Record a KPI value (e.g. visitors, signups, revenue_usd, emails_sent, leads).",

@@ -40,6 +40,10 @@ class Scheduler(threading.Thread):
 
     def run(self) -> None:
         recover()
+        # Build the search index for every company in the background, so the dashboard's search and the first
+        # agent runs after an upgrade do not wait for it. Incremental after that, at the start of each run.
+        from . import context
+        threading.Thread(target=context.reindex_all, daemon=True, name="reindex-all").start()
         while not self._stop_event.is_set():
             try:
                 self.tick()
