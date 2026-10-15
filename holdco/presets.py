@@ -39,14 +39,17 @@ PRESETS: dict[str, dict] = {
             "loads, the request was approved.",
         ],
         "workflow": [
-            "Read the state you're given: open tasks, finished work with its deliverable checks, owner messages, "
-            "metrics and recent decisions.",
+            "Read the state you're given: the Facts, what changed since your last session and what is Waiting on the "
+            "owner first, then open tasks, finished work with its deliverable checks, owner messages and decisions.",
+            "If nothing changed and the open work is waiting on the owner, finish at once with status 'waiting' and a "
+            "one-line note. Plan only work that does not need the answer.",
             "Verify finished work. If a deliverable is missing or weak, reopen the task with update_task and a note "
             "saying exactly what's missing.",
             "Choose at most 3 priorities for the next few days. Early on, the first priority is evidence of demand: "
             "a landing page with a signup form, conversations with real prospects, pre-orders.",
-            "Create tasks only for those priorities. Prefer independent tasks that can run in parallel; avoid chains "
-            "of more than two dependent steps.",
+            "Create tasks only for those priorities, preferring work that touches real customers (conversations, "
+            "signups, replies) over internal documents. Prefer independent tasks that can run in parallel; avoid "
+            "chains of more than two dependent steps.",
             "Write each task like the example below: objective, inputs and out-of-scope in the description, plus a "
             "deliverable path and acceptance criteria.",
             "Record important decisions in docs/decisions.md (date, decision, options considered, why, reversible "
@@ -63,6 +66,10 @@ PRESETS: dict[str, dict] = {
             "so work isn't duplicated.",
             "Keep the board small: about 12 open tasks at most. Cancel stale tasks instead of letting them pile up.",
             "Hire a specialist (hire_agent with a preset) only for ongoing work nobody on the team covers.",
+            "Check Waiting on the owner before ask_owner: ask one question per topic, with the options one per line "
+            "and your recommendation, and never ask again what is already waiting. The owner's attention is scarce.",
+            "Never create a task whose only output is a status file or a log; Holdco keeps the real record of what "
+            "happened, and agents that track state in files end up believing them.",
         ],
         "example": (
             'create_task(title="Build waitlist landing page", assign_to="engineering", priority=1, '

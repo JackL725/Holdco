@@ -74,6 +74,7 @@ class Scheduler(threading.Thread):
         open_tasks = db.q(
             "SELECT t.* FROM tasks t JOIN companies c ON c.id=t.company_id "
             "WHERE c.status='active' AND t.status='todo' ORDER BY t.priority, t.id LIMIT 200")
+        over: dict[int, bool] = {}   # the daily budget, looked up once per company per tick
         for t in open_tasks:
             if agents.running_count() >= capacity:
                 return
@@ -86,9 +87,12 @@ class Scheduler(threading.Thread):
                 db.update("tasks", t["id"], agent_id=agent["id"])
             if agents.is_running(agent["id"]):
                 continue
-            company = db.get_company(t["company_id"])
-            if company and planning.over_budget(company):
-                continue   # the company used its daily token budget; owner chat and owner-started runs still work
+            if t["created_by"] != "owner":   # tasks the owner created still run over the budget
+                if t["company_id"] not in over:
+                    company = db.get_company(t["company_id"])
+                    over[t["company_id"]] = bool(company and planning.over_budget(company))
+                if over[t["company_id"]]:
+                    continue   # the company used its daily token budget; owner chat and owner tasks still work
             agents.start(agent["id"], "task", task_id=t["id"])
 
     def _housekeeping(self, s: dict) -> None:
@@ -134,7 +138,10 @@ class Scheduler(threading.Thread):
         """A founding run stopped by the kill switch (or by a model outage) leaves the company in "founding" with
         nothing running. recover() restarts those only at startup, so this does the same on every tick once the
         switch is off and the model server answers. A founding that ended in any other error waits for the owner
-        to press Retry founding: restarting it every tick would help nobody."""
+        to press Retry founding: restarting it every tick would help nobody.
+
+        Founding runs in stages (planning.py): a stage that finished hands over to the next one itself. Should that
+        hand-over not happen (the CEO was busy for a moment), the next stage starts here."""
         for c in db.q("SELECT * FROM companies WHERE status='founding' ORDER BY id"):
             ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
             if not ceo or agents.is_running(ceo["id"]):
@@ -144,10 +151,13 @@ class Scheduler(threading.Thread):
             if not last:
                 continue   # the first run is about to start (create_company just returned)
             outage = last["status"] == "error" and watchdog.is_model_connection_error(last["summary"])
-            if last["status"] not in ("stopped", "interrupted") and not outage:
-                continue
-            bus.emit(c["id"], "founding", "resuming the founding that was stopped before it finished")
-            agents.found(c["id"])
+            if last["status"] in ("stopped", "interrupted") or outage:
+                bus.emit(c["id"], "founding", "resuming the founding that was stopped before it finished")
+                agents.found(c["id"])
+            elif (last["status"] in ("done", "partial", "blocked", "waiting", "out_of_steps")
+                  and planning.founding_stage(c) in planning.FOUNDING_STAGES):
+                if agents.found(c["id"]):
+                    bus.emit(c["id"], "founding", "starting the next founding stage")
 
     def _maybe_cycle(self, c: dict) -> None:
         ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))

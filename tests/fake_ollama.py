@@ -9,6 +9,7 @@ follows a short script of tool calls; the step is the number of assistant turns 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -23,6 +24,103 @@ def tc(_n, **args):
     return {"function": {"name": _n, "arguments": args}}
 
 
+# A charter with every section planning.validate_charter requires (Phase 0.5).
+CHARTER = """# PawPlan
+
+## One-liner
+Weekly meal plans for dogs.
+
+## Customer
+Dog owners who cook for their dogs, or want to, and feel unsure about portions and recipes.
+
+## Problem
+Owners guess portions and recipes, switch foods often and worry about allergies.
+
+## Offer and price
+A personalised weekly meal plan with a shopping list. Price to test: $9 per month.
+
+## How we reach customers
+Dog owner communities and groups, local dog parks, and a waitlist landing page shared where owners gather.
+
+## Competitors
+| Name | What they sell | How we differ |
+|---|---|---|
+| Ollie | fresh dog food delivered | we sell plans, not food |
+| Spot and Tango | fresh dog food subscription | owners cook it themselves |
+| Recipe blogs | free recipes | personal and weekly |
+
+## Business model
+Owners pay a monthly subscription for their plans; the margin per plan is an estimate until the first sales.
+
+## Riskiest assumption
+At least 5% of landing page visitors join the waitlist (pass threshold, an estimate to test).
+
+## North Star metric
+Meal plans that paying owners use each week.
+
+## 30-day plan
+- Week 1: landing page and conversations with dog owners
+- Week 2: a first sample plan
+- Week 3: waitlist push in two owner communities
+- Week 4: compare signups with the threshold
+"""
+
+CRITIQUE = """# Critique
+
+## Three strongest reasons this fails
+1. Owners may not pay for plans while free recipes exist. Evidence: owner conversations and waitlist signups.
+2. Reaching owners may cost more than a plan earns. Evidence: signups from two communities.
+3. Vets may advise against home cooking. Evidence: what vets say in the first conversations.
+
+## What to test first
+The waitlist landing page with the price shown.
+"""
+
+
+def founding_step(user: str, step: int):
+    """Staged founding (Phase 0.5): each stage is its own run, recognised by "Stage: <name>" in the prompt."""
+    stage = (re.search(r"Stage: (\w+)", user[:200]) or [None, "research"])[1]
+    if "[partial]" in user:
+        # A thin founding, the way the first real run went: the charter lands in a file through write_file during
+        # research, update_charter is never called, no tasks are created and every stage finishes partial.
+        seqs = {
+            "research": [tc("write_file", path="docs/charter.md", content=CHARTER),
+                         tc("finish", summary="Drafted the charter in docs/charter.md; stopped before creating tasks.",
+                            status="partial")],
+            "charter": [tc("finish", summary="The charter in docs/charter.md is saved; nothing to add.",
+                           status="partial")],
+            "critic": [tc("finish", summary="No critique written.", status="partial")],
+            "plan": [tc("finish", summary="Stopped before creating tasks.", status="partial")],
+        }
+    else:
+        seqs = {
+            "research": [tc("web_search", query="dog meal plan subscription market"),
+                         tc("write_file", path="research/market.md",
+                            content="# Market\n\n- Dog owners who cook want simple weekly plans "
+                                    "(source: https://www.akc.org/expert-advice/nutrition/)\n\n## Gaps\n- Prices\n"),
+                         tc("finish", summary="Market research saved to research/market.md.")],
+            "charter": [tc("read_file", path="research/market.md"),
+                        tc("update_charter", charter=CHARTER, company_name="PawPlan",
+                           one_liner="Weekly meal plans for dog owners", stage="building"),
+                        tc("finish", summary="Charter saved.")],
+            "critic": [tc("read_file", path="docs/charter.md"),
+                       tc("write_file", path="docs/critique.md", content=CRITIQUE),
+                       tc("finish", summary="Critique saved to docs/critique.md.", deliverable="docs/critique.md")],
+            "plan": [tc("create_task", title="Build landing page", assign_to="engineering", priority=1,
+                        description="Waitlist page", deliverable="site/index.html", acceptance="- labelled form"),
+                     tc("create_task", title="Write launch post", assign_to="marketing",
+                        deliverable="marketing/launch.md"),
+                     tc("create_task", title="Find 20 leads", assign_to="sales", deliverable="sales/leads.md"),
+                     tc("create_task", title="Competitor pricing scan", assign_to="research",
+                        deliverable="research/competitors.md"),
+                     tc("create_task", title="Set up KPI tracking", assign_to="ops"),
+                     tc("report_to_owner", message="**Welcome!** PawPlan is founded. I need a company email account."),
+                     tc("finish", summary="Founded PawPlan: research, charter, critique, 5 tasks.")],
+        }
+    seq = seqs.get(stage) or seqs["research"]
+    return seq[min(step, len(seq) - 1)]
+
+
 def script(messages: list[dict], tools: list[dict]):
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -30,27 +128,7 @@ def script(messages: list[dict], tools: list[dict]):
     names = {t["function"]["name"] for t in tools}
     stamp = int(time.time() * 1000) % 100000
     if user.startswith("You are founding"):
-        if "[partial]" in user:
-            # A thin founding, the way the first real run went: the charter lands in a file through write_file,
-            # update_charter is never called, no tasks are created and the CEO finishes with status partial.
-            seq = [tc("write_file", path="docs/charter.md",
-                      content="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n\n## Problem\nOwners guess.\n"),
-                   tc("finish", summary="Drafted the charter in docs/charter.md; stopped before creating tasks.",
-                      status="partial")]
-            return seq[min(step, len(seq) - 1)]
-        seq = [tc("web_search", query="dog meal plan subscription market"),
-               tc("write_file", path="research/market.md", content="# Market\n\n- FACT: example (source: https://example.com)\n"),
-               tc("update_charter", charter="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n",
-                  company_name="PawPlan", one_liner="Weekly meal plans for dog owners", stage="building"),
-               tc("create_task", title="Build landing page", assign_to="engineering", priority=1,
-                  description="Waitlist page", deliverable="site/index.html", acceptance="- labelled form"),
-               tc("create_task", title="Write launch post", assign_to="marketing", deliverable="marketing/launch.md"),
-               tc("create_task", title="Find 20 leads", assign_to="sales", deliverable="sales/leads.md"),
-               tc("create_task", title="Competitor pricing scan", assign_to="research", deliverable="research/competitors.md"),
-               tc("create_task", title="Set up KPI tracking", assign_to="ops"),
-               tc("report_to_owner", message="**Welcome!** PawPlan is founded. I need a company email account."),
-               tc("finish", summary="Founded PawPlan: research, charter, 5 tasks.")]
-        return seq[min(step, len(seq) - 1)]
+        return founding_step(user, step)
     if user.startswith("Run a planning cycle"):
         seq = [tc("list_tasks"),
                tc("create_task", title=f"Follow up on leads batch {stamp}", assign_to="sales",
