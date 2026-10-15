@@ -13,18 +13,37 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, backup, bus, config, context, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, watchdog, workspace  # noqa: F401
+from . import actions, agents, backup, bus, config, context, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
 _company_or_404 = company_or_404
 
 
+def _masked(settings: dict, secret_keys) -> dict:
+    """Phase 1: a secret that is set reads as the mask, so its value never leaves the PC through the dashboard.
+    An unset secret stays empty, so the form shows which ones still need a value."""
+    return {k: (vault.MASK if k in secret_keys and v else v) for k, v in settings.items()}
+
+
+def _secret_field(name: str, value) -> str | None:
+    """Phase 1: one secret field from a settings form, routed to the vault. Returns what the settings table keeps:
+    the "vault:<name>" marker for a new value, "" when the owner cleared the field (the secret is deleted), or
+    None when the form sent the mask back (the secret is unchanged)."""
+    value = "" if value is None else str(value)
+    if value and set(value) <= {"•"}:
+        return None
+    if not value.strip():
+        vault.delete(name)
+        return ""
+    vault.put(name, value)
+    return vault.MARKER + name
+
+
 def _public_company(c: dict) -> dict:
     cs = db.company_settings(c)
     out = {k: v for k, v in c.items() if k != "settings"}
-    secret_keys = ("smtp_password", "imap_password", "netlify_token")
-    out["settings"] = {k: ("••••••••" if k in secret_keys and v else v) for k, v in cs.items()}
+    out["settings"] = _masked(cs, config.SECRET_COMPANY_SETTINGS)
     return out
 
 
@@ -66,19 +85,28 @@ def api_state(h, m, body):
 
 @route("GET", "/api/settings")
 def api_settings(h, m, body):
-    s = db.get_settings()
+    s = _masked(db.get_settings(), config.SECRET_SETTINGS)
     return {"settings": s, "policy_actions": config.POLICY_ACTIONS, "locked": sorted(config.LOCKED_POLICIES),
             "data_dir": str(config.DATA_DIR)}
 
 
 @route("PUT", "/api/settings")
 def api_settings_put(h, m, body):
+    values = dict(body or {})
+    secrets = {k: values.pop(k) for k in config.SECRET_SETTINGS if k in values}
     try:
-        s = db.set_settings(body or {})
+        db.validate_settings(values)   # a malformed value saves nothing, secrets included
+        for k, v in secrets.items():   # Phase 1: secrets go to the vault; the table keeps the marker
+            stored = _secret_field(f"settings.{k}", v)
+            if stored is not None:
+                values[k] = stored
+        s = db.set_settings(values)
     except ValueError as e:   # a malformed chat id or an unknown notify level: tell the owner, save nothing
         raise HTTPError(400, str(e))
+    except vault.VaultError as e:
+        raise HTTPError(500, f"The key could not be stored safely: {e}")
     bus.notify("settings")
-    return {"settings": s}
+    return {"settings": _masked(s, config.SECRET_SETTINGS)}
 
 
 @route("GET", "/api/llm/models")
@@ -209,10 +237,30 @@ def api_company_patch(h, m, body):
         p.write_text(fields["charter"], encoding="utf-8")
     if "settings" in b and isinstance(b["settings"], dict):
         cs = db.company_settings(c)
+        stored = db.loads(c.get("settings"), {}) or {}
+        stored = stored if isinstance(stored, dict) else {}
+        for k in config.SECRET_COMPANY_SETTINGS:
+            # Phase 1: write back the stored marker, never the value company_settings resolved it to. A plain-text
+            # value an older writer left behind moves into the vault on the way.
+            v = stored.get(k, "")
+            if isinstance(v, str) and v and not v.startswith(vault.MARKER):
+                try:
+                    v = _secret_field(f"company.{c['id']}.{k}", v)
+                except vault.VaultError:
+                    pass   # it stays where it was; the next start's migration tries again
+            cs[k] = v
         for k, v in b["settings"].items():
             if k not in config.DEFAULT_COMPANY_SETTINGS or k in INTERNAL_COMPANY_SETTINGS:
                 continue
-            if isinstance(v, str) and v == "••••••••":
+            if k in config.SECRET_COMPANY_SETTINGS:   # Phase 1: into the vault (the mask leaves it unchanged)
+                try:
+                    kept = _secret_field(f"company.{c['id']}.{k}", v)
+                except vault.VaultError as e:
+                    raise HTTPError(500, f"The key could not be stored safely: {e}")
+                if kept is not None:
+                    cs[k] = kept
+                continue
+            if isinstance(v, str) and v == vault.MASK:
                 continue  # unchanged secret
             if k in ("cycle_minutes", "daily_email_limit", "smtp_port", "imap_port"):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
@@ -228,7 +276,7 @@ def api_company_patch(h, m, body):
         fields["settings"] = json.dumps(cs)
         # Phase 0.5: a new mailbox, token, site address, postal address, standing orders or business type
         # changes what the team can do, so the CEO plans with it at the next tick.
-        if planning.capability_hash(cs) != caps_before:
+        if planning.capability_hash(db.company_settings({"settings": fields["settings"]})) != caps_before:
             fields["cycle_requested"] = 1
     if "charter" in fields and (fields["charter"] or "") != (c.get("charter") or ""):
         fields["cycle_requested"] = 1   # the owner rewrote the charter: plan against the new one

@@ -228,8 +228,8 @@ class TestDoctorModel(DoctorBase):
         for k in ("model_server", "model", "gpu_fit", "search", "disk", "backup", "errors_24h"):
             self.assertIn(k, keys)
         self.assertEqual(keys[:4], ["model_server", "model", "gpu_fit", "search"])
-        # Phase 0.5 added the search index and the daily token budgets after the Phase 0 rows.
-        self.assertEqual(keys[-5:], ["disk", "backup", "errors_24h", "search_index", "token_budgets"])
+        # Phase 0.5 added the search index and the daily token budgets after the Phase 0 rows; Phase 1 the vault.
+        self.assertEqual(keys[-6:], ["disk", "backup", "errors_24h", "search_index", "token_budgets", "vault"])
         for r in rows:
             # Phase 0 fix: every row carries its run number; connector rows also carry their company id.
             self.assertEqual(set(r) - {"company_id"}, {"key", "label", "status", "detail", "fix", "checked_at", "run"})

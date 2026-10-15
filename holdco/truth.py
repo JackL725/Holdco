@@ -27,7 +27,7 @@ import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
-from . import bus, checks, db, emailer, presets, workspace
+from . import bus, checks, db, emailer, presets, vault, workspace
 from .actions import ACTION_LABELS
 from .routing import company_or_404, route
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401  (tools register here)
@@ -809,10 +809,9 @@ def refresh_records(company: dict) -> None:
         with _records_lock:
             st = _state(company)
             rec = root / "records"
-            _write_atomic(rec / "STATUS.md", _status_text(st))
-            _write_atomic(rec / "outbound.md", _outbound_text(st))
-            _write_atomic(rec / "emails.md", _emails_text(st))
-            _write_atomic(rec / "owner.md", _owner_text(st))
+            for fname, text in (("STATUS.md", _status_text(st)), ("outbound.md", _outbound_text(st)),
+                                ("emails.md", _emails_text(st)), ("owner.md", _owner_text(st))):
+                _write_atomic(rec / fname, vault.redact(text))   # Phase 1: agents read these; no secret in them
             _last_write[cid] = time.monotonic()
         if not db.company_settings(st["company"]).get("truth_scan_done"):
             scan_existing(st["company"])
