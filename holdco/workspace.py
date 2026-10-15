@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import config
 
-SKIP = {".trash", ".runs", "__pycache__", "node_modules", ".git"}
+SKIP = {".trash", ".runs", ".cache", "__pycache__", "node_modules", ".git"}   # .cache: fetched pages (truth.py)
 
 
 def slugify(name: str) -> str:

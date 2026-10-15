@@ -154,7 +154,7 @@ def script(messages: list[dict], tools: list[dict]):
                  tc("social_post", platform="x", content="Meet PawPlan: weekly meal plans your dog will love."),
                  tc("finish", summary="Launch post drafted and queued.", deliverable="marketing/launch.md")],
         "Hunter": [tc("write_file", path="sales/leads.md", content="| Name | Company | Source |\n|---|---|---|\n| Jo | Happy Paws | https://example.com |\n"),
-                   tc("send_email", to="jo@happypaws.example", subject="Quick idea for Happy Paws",
+                   tc("send_email", to="jo@happypaws.co", subject="Quick idea for Happy Paws",
                       body="Hi Jo,\n\nWe built PawPlan. Worth a look? Reply 'no' and I won't follow up.\n\nPawPlan"),
                    tc("finish", summary="Leads saved; first email queued.", deliverable="sales/leads.md")],
         "Scout": [tc("web_search", query="dog meal plan app pricing"),

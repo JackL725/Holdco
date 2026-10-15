@@ -347,7 +347,10 @@ class TestTools(unittest.TestCase):
         t = db.one("SELECT * FROM tasks WHERE company_id=? AND title LIKE 'Revise:%' ORDER BY id DESC", (self.c["id"],))
         self.assertIsNotNone(t)
         self.assertIn("Too pushy", t["description"])
-        # an email with no SMTP set fails and can be retried
+        # an email with no SMTP set fails and can be retried (commercial email needs a postal address first)
+        s = db.company_settings(self.c)
+        s["postal_address"] = "1 Main Street, Springfield, IL 62701"
+        db.update("companies", self.c["id"], settings=json.dumps(s))
         sales = ctx_for(self.c, "sales")
         tools.execute(sales, "send_email", {"to": "a@b.co", "subject": "Hi", "body": "Hello"})
         aid = db.scalar("SELECT MAX(id) FROM approvals WHERE company_id=?", (self.c["id"],))

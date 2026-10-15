@@ -370,11 +370,12 @@ def api_task_create(h, m, body):
     if not agent or agent["company_id"] != c["id"]:
         agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
     ts = db.now()
+    kind = truth.classify_task(title, b.get("description", ""), b.get("deliverable") or "", b.get("kind") or "")
     tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 " deliverable, acceptance, kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (c["id"], title[:200], b.get("description", ""), agent["role"], agent["id"], "todo",
                   max(1, min(_int(b.get("priority"), 1), 3)), "owner", (b.get("deliverable") or "").strip()[:200],
-                  (b.get("acceptance") or "").strip()[:2000], ts, ts))
+                  (b.get("acceptance") or "").strip()[:2000], kind, ts, ts))
     bus.emit(c["id"], "task", f"created task #{tid} for {agent['name']}: {title}", None, {"task_id": tid, "by": "owner"})
     return {"task": db.get_task(tid)}
 

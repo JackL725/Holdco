@@ -689,7 +689,10 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
             ctx.claims_warned = True
             return f"Not finished yet: {problem}"
         if problem:
-            status = "partial"
+            # The action this task exists for is queued for the owner: the task waits for the decision instead
+            # of being retried; otherwise the check failed and the task is only partly done.
+            kind = (ctx.task or {}).get("kind") or truth.classify_task((ctx.task or {}).get("title", ""))
+            status = "waiting" if ctx.task and truth.action_state(ctx, kind) == "waiting" else "partial"
             open_issues = (open_issues + f"\nCheck failed: {problem}").strip()
     parts = [f"Status: {status}"]
     if target:

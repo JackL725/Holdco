@@ -41,7 +41,7 @@ MIN_QUOTE = 12
 
 # Fetched pages live in .cache/pages for record_fact. They are Holdco's working data, not the company's work, so
 # file listings (agents and dashboard) skip the folder like .runs and .trash.
-workspace.SKIP.add(".cache")
+# workspace.SKIP lists .cache (fetched pages) so file listings and the index skip it.
 
 _DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
