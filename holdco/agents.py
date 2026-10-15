@@ -56,9 +56,14 @@ def _memory_text(company_id: int) -> str:
 
 
 def _metrics_text(company_id: int) -> str:
-    rows = db.q("SELECT name, value, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                "WHERE company_id=? GROUP BY name) ORDER BY name", (company_id,))
-    return "\n".join(f"- {r['name']}: {r['value']:g} (as of {r['created_at'][:10]})" for r in rows) or "(none recorded)"
+    """Latest value of each metric with where it came from: "(source: stripe)" when a connector polled it,
+    "(manual)" when an agent typed it with record_metric (Phase 1)."""
+    rows = db.q("SELECT name, value, created_at, COALESCE(NULLIF(source, ''), 'manual') AS source FROM metrics "
+                "WHERE id IN (SELECT MAX(id) FROM metrics WHERE company_id=? GROUP BY name) ORDER BY name",
+                (company_id,))
+    return "\n".join(f"- {r['name']}: {float(r['value'] or 0):g} as of {(r['created_at'] or '')[:10]} "
+                     f"({'manual' if r['source'] == 'manual' else 'source: ' + r['source']})"
+                     for r in rows) or "(none recorded)"
 
 
 def _shared_rules(kind: str, max_steps: int) -> str:

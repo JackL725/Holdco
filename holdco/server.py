@@ -173,8 +173,10 @@ def api_company(h, m, body):
     c = _company_or_404(m.group(1))
     team = db.q("SELECT a.*, t.title AS task_title FROM agents a LEFT JOIN tasks t ON t.id=a.current_task_id "
                 "WHERE a.company_id=? ORDER BY a.id", (c["id"],))
-    metrics = db.q("SELECT name, value, note, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                   "WHERE company_id=? GROUP BY name) ORDER BY name", (c["id"],))
+    # Phase 1: source is the connector key that polled the number, or 'manual' when an agent typed it
+    metrics = db.q("SELECT name, value, note, created_at, COALESCE(NULLIF(source, ''), 'manual') AS source "
+                   "FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics WHERE company_id=? GROUP BY name) "
+                   "ORDER BY name", (c["id"],))
     cs = db.company_settings(c)
     return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": metrics,
             "email_ready": emailer.smtp_configured(cs), "inbox_ready": emailer.imap_configured(cs),
@@ -479,7 +481,9 @@ def api_memory_delete(h, m, body):
 @route("GET", r"/api/companies/(\d+)/metrics")
 def api_metrics(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"metrics": db.q("SELECT * FROM metrics WHERE company_id=? ORDER BY id DESC LIMIT 500", (c["id"],))}
+    return {"metrics": db.q("SELECT id, company_id, agent_id, name, value, note, created_at, "
+                            "COALESCE(NULLIF(source, ''), 'manual') AS source FROM metrics WHERE company_id=? "
+                            "ORDER BY id DESC LIMIT 500", (c["id"],))}
 
 
 @route("GET", r"/api/companies/(\d+)/emails")
