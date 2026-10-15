@@ -315,6 +315,8 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         if role not in team:
             raise ToolError(f"No teammate with role '{assign_to}'.")
         fields.update(role=role, agent_id=team[role]["id"])
+        if role != (t["role"] or ""):
+            fields["reassigned"] = int(t.get("reassigned") or 0) + 1   # the watchdog spots tasks that keep bouncing
     db.update("tasks", task_id, **fields)
     _log(ctx, "task", f"updated task #{task_id}{' → ' + status if status else ''}", task_id=task_id)
     bus.notify("tasks", company_id=ctx.company["id"])
