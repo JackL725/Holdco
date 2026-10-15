@@ -854,14 +854,19 @@ class TestModelOutage(unittest.TestCase):
 
 class TestFoundingRuns(unittest.TestCase):
     """Founding outcomes through agents.run: the charter sync, the partial question, the phone hook and the kill
-    switch."""
+    switch.
+
+    Phase 0.5 stages founding (research, charter, critic, plan; see tests/test_planning.py). The outcomes pinned
+    here (company active, the founding_partial question, the phone notice) happen when the last stage ends, so
+    each run here is the plan stage."""
 
     CHARTER = ("# FoundCo\n\n## One-liner\n**Weekly** meal plans for [dogs](https://example.com).\n\n"
                "## Problem\nOwners guess.\n")
 
     def setUp(self):
         self.c = make_company("FoundCo", members=("ceo", "engineering"))
-        db.update("companies", self.c["id"], status="founding", stage="idea", charter="", mission="")
+        db.update("companies", self.c["id"], status="founding", stage="idea", charter="", mission="",
+                  settings=json.dumps({"founding_stage": "plan"}))
         db.set_settings({"kill_switch": False, "scheduler_enabled": True})
         self.ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (self.c["id"],))
         self.sent: list = []
@@ -897,8 +902,10 @@ class TestFoundingRuns(unittest.TestCase):
         return db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.ceo["id"],))
 
     def test_charter_file_becomes_the_charter_and_the_question_sees_it(self):
-        run = self.run_script([("write_file", {"path": "docs/charter.md", "content": self.CHARTER}),
-                               ("finish", {"summary": "Charter drafted; no tasks yet.", "status": "partial"})])
+        # Phase 0.5: the file is already on disk (written outside update_charter, for example before the upgrade).
+        # The plan stage has no write_file, and write_file now refuses a charter that misses required sections.
+        workspace.safe_path(self.c, "docs/charter.md").write_text(self.CHARTER, encoding="utf-8")
+        run = self.run_script([("finish", {"summary": "Charter drafted; no tasks yet.", "status": "partial"})])
         self.assertEqual(run["status"], "partial")
         c = db.get_company(self.c["id"])
         self.assertEqual(c["status"], "active")
@@ -918,9 +925,11 @@ class TestFoundingRuns(unittest.TestCase):
         self.assertEqual(self.sent[-1], ("<b>FoundCo</b>: founding ended partial; see your inbox.", "important"))
 
     def test_update_charter_wins_and_a_clean_founding_reaches_the_phone(self):
-        run = self.run_script([("update_charter", {"charter": "# Real charter", "one_liner": "Real one-liner",
-                                                   "stage": "building"}),
-                               ("create_task", {"title": "Build landing page", "assign_to": "engineering",
+        # Phase 0.5: update_charter belongs to the charter stage, which saved this charter to the record; an older
+        # draft in the file must not replace it.
+        db.update("companies", self.c["id"], charter="# Real charter", mission="Real one-liner", stage="building")
+        workspace.safe_path(self.c, "docs/charter.md").write_text("# Older draft", encoding="utf-8")
+        run = self.run_script([("create_task", {"title": "Build landing page", "assign_to": "engineering",
                                                 "deliverable": "site/index.html"}),
                                ("finish", {"summary": "Founded."})])
         self.assertEqual(run["status"], "done")

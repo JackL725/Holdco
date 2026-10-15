@@ -190,10 +190,12 @@ def cycle_prompt(company: dict) -> str:
         f"## Recent chat with the owner\n{convo or '(none)'}\n\n"
         f"## Files in the company folder (newest first)\n{workspace.tree_text(company, 30)}\n\n"
         "## Your job now\n"
-        "Follow your workflow. In short: verify the finished work above (reopen anything MISSING or weak), pick at "
-        f"most 3 priorities, cancel stale tasks, create at most {room} new tasks (each with deliverable and "
-        "acceptance), handle anything the owner asked for, and report to the owner only if something matters. "
-        "Then call finish."
+        "Start from the Facts, Since your last session and Waiting on the owner sections of your instructions: they "
+        "are the real state, and everything under Waiting on the owner is already asked. If nothing changed and the "
+        "open work waits on the owner, finish now with status 'waiting'. Otherwise follow your workflow. In short: "
+        "verify the finished work above (reopen anything MISSING or weak), pick at most 3 priorities, cancel stale "
+        f"tasks, create at most {room} new tasks (each with deliverable and acceptance), handle anything the owner "
+        "asked for, and report to the owner only if something matters. Then call finish."
     )
 
 
@@ -223,8 +225,14 @@ def task_prompt(company: dict, task: dict) -> str:
     )
 
 
-def founding_prompt(company: dict, context: str) -> str:
-    named = db.company_settings(company).get("name_locked")
+def founding_prompt(company: dict, context: str, stage: str = "") -> str:
+    """The user prompt of one founding stage (research, charter, critic or plan; the texts live in planning.py).
+    Founding is staged so research cannot eat the whole budget: the first real founding spent 24 of its 26 steps
+    on research and created no tasks."""
+    stage = stage or planning.founding_stage(company)
+    if stage not in planning.FOUNDING_STAGES:
+        stage = planning.retry_stage(company)
+    named = bool(db.company_settings(company).get("name_locked"))
     roles_list = ", ".join(a["role"] for a in db.q("SELECT role FROM agents WHERE company_id=? AND enabled=1",
                                                        (company["id"],)))
     search_down = False
@@ -233,35 +241,7 @@ def founding_prompt(company: dict, context: str) -> str:
         search_down = bool(row and row.get("status") == "bad")
     except Exception:
         pass
-    search_note = (
-        "\nWeb search is down right now. Skip the research step: write the charter from the idea and what you "
-        "already know, mark the research gaps in research/market.md, and ask the owner with report_to_owner to "
-        "tell you about the market. Do not call web_search more than once.\n"
-    ) if search_down else ""
-    return (
-        "You are founding a brand-new company. The owner's idea:\n"
-        f'"""{company.get("idea")}"""\n'
-        + (f"\nAbout the owner and their constraints:\n{context}\n" if context else "")
-        + (f"\nThe owner already chose the name: {company['name']}. Keep it.\n" if named else "")
-        + f"\nYour team's roles: {roles_list}.\n"
-        + search_note
-        + "\nDo this, in order:\n"
-        "1. Research the market with web_search and fetch_url (3-6 searches): who the customers are, what they pay "
-        "for today, real competitors and their prices, and where these customers can be reached.\n"
-        "2. Save the findings, with source URLs, to research/market.md.\n"
-        "3. Call update_charter with a complete charter in Markdown with these sections: One-liner, Problem, "
-        "Customer, Offer & pricing, Business model, Go-to-market, Competitors & how we're different, Riskiest "
-        "assumption and how we'll test it (\"At least X% of Y will do Z\", with a threshold), North Star metric, "
-        "Risks, 30-day plan (week by week), KPIs. "
-        + ("" if named else "Give the company a short, memorable name. ")
-        + "Add a one-liner and set stage to 'building'.\n"
-        "4. Create 6-10 first tasks across the team, each with a deliverable path and acceptance criteria. Test demand "
-        "before building product: the first engineering task is a landing page at site/index.html with a clear offer "
-        "and a working signup form.\n"
-        "5. Send the owner a short welcome brief with report_to_owner: the plan, the riskiest assumption, and what "
-        "you need from them (for example a company email account, a domain, a budget).\n"
-        "6. Call finish."
-    )
+    return planning.founding_prompt(company, context, stage, roles_list, named, search_down)
 
 
 def chat_prompt(company: dict, agent: dict, latest: str) -> str:
@@ -337,8 +317,12 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
 
     settings = db.get_settings()
     max_steps = int(settings.get("max_steps_per_run", 14))
+    stage = ""   # a founding run does one stage: research, charter, critic or plan (planning.py)
     if kind == "founding":
-        max_steps = max(max_steps, 26)
+        stage = planning.founding_stage(company)
+        if stage not in planning.FOUNDING_STAGES:
+            stage = planning.retry_stage(company)
+        max_steps = planning.STAGE_STEPS[stage]
     elif kind == "cycle":
         max_steps = max(max_steps, 18)
     elif kind == "chat":
@@ -349,21 +333,28 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
         db.update("tasks", task["id"], status="in_progress", attempts=(task["attempts"] or 0) + 1, updated_at=ts)
         task = db.get_task(task["id"])
     note = {"task": f"Task #{task_id}: {task['title'] if task else ''}", "cycle": "Planning the next steps",
-            "founding": "Founding the company", "chat": "Replying to you"}.get(kind, kind)
+            "founding": f"Founding: {planning.STAGE_TEXT.get(stage, 'founding the company')}",
+            "chat": "Replying to you"}.get(kind, kind)
     db.update("agents", agent_id, status="working", current_task_id=task_id, status_note=note, last_run_at=ts)
     run_id = db.run("INSERT INTO runs(company_id, agent_id, task_id, kind, status, started_at) VALUES(?,?,?,?,?,?)",
                     (company["id"], agent_id, task_id, kind, "running", ts))
     bus.notify("agents", company_id=company["id"])
     if kind != "chat":
         bus.emit(company["id"], "run", f"started: {note}", agent_id, {"run_id": run_id, "task_id": task_id})
+    if kind == "founding":
+        bus.emit(company["id"], "founding", note, agent_id, {"stage": stage, "run_id": run_id})
 
     ctx = tools.Ctx(company=company, agent=agent, kind=kind, run_id=run_id, task=task, settings=settings)
-    tool_specs = tools.role_tools(agent, kind)
+    if kind == "founding":
+        tool_specs = tools.specs(roles.founding_tools(stage))
+        ctx.founding_stage = stage   # write_file's charter hook keeps the critic to docs/critique.md
+    else:
+        tool_specs = tools.role_tools(agent, kind)
     ctx.allowed = {t["name"] for t in tool_specs}
     info = roles.role_info(agent)
     think = agent.get("reasoning") or info.get("reasoning", "medium")
     if kind == "founding":
-        think = "high"
+        think = planning.STAGE_THINK.get(stage, "high")
     elif kind == "chat" and think == "high":
         think = "medium"   # keep chat replies quick
     creativity = info.get("creativity", "balanced")
@@ -372,7 +363,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     elif kind == "cycle":
         user = cycle_prompt(company)
     elif kind == "founding":
-        user = founding_prompt(company, context)
+        user = founding_prompt(company, context, stage)
     else:
         user = chat_prompt(company, agent, text)
     for refresh in (truth.refresh_records, ctxsys.reindex):   # the prompt must see the real state
@@ -383,6 +374,12 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     messages = [{"role": "system", "content": system_prompt(company, agent, kind, max_steps, task)},
                 {"role": "user", "content": user}]
     model = agent.get("model") or (settings.get("ceo_model") if agent["role"] == "ceo" else "") or settings["default_model"]
+    # The owner's strongest model for judgment (global review_model) does the reviewing: always for the founding
+    # critic, and for QA agents unless the owner picked a model for that agent.
+    review = str(settings.get("review_model") or "").strip()
+    if review and ((kind == "founding" and stage == "critic")
+                   or (roles.preset_key(agent) == "qa" and not agent.get("model"))):
+        model = review
     budget = int(int(settings.get("num_ctx", 32768)) * 2.6)  # rough chars-per-token headroom
     tokens, steps, nudges, status, error = 0, 0, 0, "done", ""
     seen_calls: dict[str, int] = {}
@@ -574,6 +571,7 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
     ts = db.now()
     cid, aid = company["id"], agent["id"]
     summary = ctx.finish_summary or (ctx.reply or "") or error
+    next_stage = ""   # staged founding: the next stage starts once this run has let go of the CEO (see finally)
     try:
         if kind == "chat":
             reply = ctx.reply if ctx.reply is not None else f"Sorry, I hit a problem: {error}"
@@ -614,16 +612,27 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
         if kind == "founding":
             _sync_charter(db.get_company(cid))   # before the watchdog looks at whether a charter exists
             c = db.get_company(cid)
-            if status in ("done", "out_of_steps") and c["status"] == "founding":
-                db.update("companies", cid, status="active", last_cycle_at=ts)
-                bus.emit(cid, "founding", f"{c['name']} is up and running. The team is starting on the first tasks.", aid)
-                thin = status == "out_of_steps" or (ctx.finished and ctx.finish_status != "done")
-                if thin:
-                    try:
-                        watchdog.founding_ended(db.get_company(cid), ctx.finish_status if ctx.finished else status, summary)
-                    except NotImplementedError:
-                        pass
-                _tell_phone_founding(c, thin)
+            stage = getattr(ctx, "founding_stage", "") or planning.founding_stage(c)
+            if status in ("done", "out_of_steps") and stage in planning.FOUNDING_STAGES:
+                # A stage that finished (done or partial, or at its step budget) moves founding on; the charter
+                # stage only with a valid charter in the record (planning.after_stage).
+                how = ctx.finish_status if ctx.finished else status
+                nxt = planning.after_stage(c, stage, how, summary)
+                c = db.get_company(cid)
+                if c["status"] not in ("founding", "active"):
+                    pass   # paused or archived meanwhile: the stage is recorded, nothing more starts
+                elif nxt != "done":
+                    next_stage = nxt
+                else:
+                    db.update("companies", cid, status="active", last_cycle_at=ts)
+                    bus.emit(cid, "founding", f"{c['name']} is up and running. The team is starting on the first tasks.", aid)
+                    thin = status == "out_of_steps" or (ctx.finished and ctx.finish_status != "done")
+                    if thin:
+                        try:
+                            watchdog.founding_ended(db.get_company(cid), how, summary)
+                        except NotImplementedError:
+                            pass
+                    _tell_phone_founding(c, thin)
             elif status == "error":
                 bus.emit(cid, "error", f"Founding stopped: {error}. Fix the model connection in Settings, then press "
                          "“Retry founding”.", aid)
@@ -657,6 +666,8 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
         with _running_lock:
             _running.pop(aid, None)
         bus.notify("agents", company_id=cid)
+        if next_stage:
+            found(cid)   # found() refuses while the CEO is still running, so this comes after the pop
 
 
 def start(agent_id: int, kind: str, **kwargs) -> bool:
@@ -683,6 +694,7 @@ def create_company(idea: str, name: str = "", context: str = "", template: str =
     settings["founding_context"] = context
     settings["name_locked"] = bool(name.strip())
     settings["template"] = template
+    settings["founding_stage"] = planning.FOUNDING_STAGES[0]   # staged founding starts with research
     cid = db.run("INSERT INTO companies(name, slug, idea, status, stage, settings, created_at) VALUES(?,?,?,?,?,?,?)",
                  (base_name, final, idea, "founding", "idea", json.dumps(settings), db.now()))
     company = db.get_company(cid)
@@ -697,13 +709,22 @@ def create_company(idea: str, name: str = "", context: str = "", template: str =
 
 
 def found(company_id: int) -> bool:
-    """Start a founding run for the company's CEO. Returns False when there is no CEO or the CEO is mid-run: the
-    status only becomes "founding" when a run really starts, so a busy CEO never leaves the company stuck there."""
+    """Start the founding run for the company's current stage (research, charter, critic or plan). A restart,
+    the kill switch or an outage resumes the stage it stopped in; after founding finished ("Retry founding"), it
+    restarts where the result was weakest (planning.retry_stage). Returns False when there is no CEO or the CEO is
+    mid-run: the status only becomes "founding" when a run really starts, so a busy CEO never leaves the company
+    stuck there."""
     company = db.get_company(company_id)
     ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (company_id,))
     if not company or not ceo or is_running(ceo["id"]):
         return False
     cs = db.company_settings(company)
+    stage = planning.founding_stage(company)
+    if stage not in planning.FOUNDING_STAGES:
+        stage = planning.retry_stage(company)
+        planning.set_founding_stage(company_id, stage, founding_retry="")
+    elif cs.get("founding_stage") != stage:
+        planning.set_founding_stage(company_id, stage)
     db.update("companies", company_id, status="founding")
     return start(ceo["id"], "founding", context=cs.get("founding_context", ""))
 
