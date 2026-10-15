@@ -175,15 +175,32 @@ def _cap(text: str, cap: int) -> str:
 # ---------------------------------------------------------------- the state, gathered once per use
 
 def _real_metrics(cid: int) -> list[dict]:
-    """Metrics recorded by a connector. Phase 1 adds metrics.source; until then nothing counts as real, because
-    record_metric lets an agent type any number."""
+    """The latest value of each metric a connector recorded (metrics.source is a connector key, not 'manual'),
+    newest first. record_metric writes 'manual' because an agent can type any number, so those never count."""
     try:
         cols = {r["name"] for r in db.q("PRAGMA table_info(metrics)")}
         if "source" not in cols:
             return []
-        return db.q("SELECT name, value, source, created_at FROM metrics WHERE company_id=? AND "
-                    "COALESCE(source, '') NOT IN ('', 'manual', 'agent') ORDER BY id DESC LIMIT 100", (cid,))
+        rows = db.q("SELECT name, value, source, created_at FROM metrics WHERE company_id=? AND "
+                    "COALESCE(source, '') NOT IN ('', 'manual', 'agent') ORDER BY id DESC LIMIT 200", (cid,))
     except Exception:
+        return []
+    seen: set = set()
+    latest = []
+    for r in rows:
+        if r["name"] not in seen:
+            seen.add(r["name"])
+            latest.append(r)
+    return latest
+
+
+def _connected(company: dict) -> list[dict]:
+    """Phase 1: the connector instances this company can use (connectors.connected), or none on any error."""
+    try:
+        from . import connectors   # imported here: connectors loads after this module (the bottom of tools.py)
+        return connectors.connected(company)
+    except Exception as e:
+        _warn("connected services", e)
         return []
 
 
@@ -198,7 +215,10 @@ def _down(cid: int) -> list[dict]:
             if not isinstance(r, dict) or r.get("status") != "bad":
                 continue
             key = str(r.get("key") or "")
-            if not (key == "search" or (key.startswith(("connector:", "conn:")) and r.get("company_id") == cid)):
+            # Phase 1: a global connector instance ("connector:<instance id>", no company) serves every company.
+            shared = bool(re.fullmatch(r"connector:\d+", key)) and r.get("company_id") is None
+            if not (key == "search" or (key.startswith(("connector:", "conn:")) and r.get("company_id") == cid)
+                    or shared):
                 continue
             out.append({"key": r.get("key", ""), "label": r.get("label") or r.get("key", ""),
                         "detail": _one_line(r.get("detail"), 160), "checked_at": r.get("checked_at")})
@@ -335,6 +355,8 @@ def _state(company: dict) -> dict:
         accounts.append({"kind": "netlify", "label": "Netlify hosting"})
     if webhook:
         accounts.append({"kind": "webhook", "label": f"posting webhook ({_host(webhook)})"})
+    for conn in _connected(company):   # Phase 1: services the owner connected, with their mode (test or live)
+        accounts.append({"kind": "connector", "key": conn["key"], "label": conn["account"]})
     have = ", ".join(a["label"] for a in accounts) or "none besides the local website"
     st["accounts"] = accounts
     st["accounts_line"] = (f"Accounts this company has: {have}. Do not link to or claim any other account "
@@ -383,16 +405,19 @@ def _state(company: dict) -> dict:
             bits.append(f"{_plural(len(aps), 'approval')} ({shown})")
         st["waiting_line"] = "Waiting on the owner: " + ", ".join(bits) + "."
 
-    # ---- signups, revenue, replies: only from a real source
+    # ---- signups, revenue, replies: only from a real source (a connector wrote the row; Phase 1 metric pipes)
     real = _real_metrics(cid)
     signup_rows = [m for m in real if re.search(r"sign|subscri|waitlist|member|registr|join", m["name"] or "", re.I)]
     revenue_rows = [m for m in real if re.search(r"revenue|mrr|sale|paid|payment|order", m["name"] or "", re.I)]
+    # The revenue figure itself first (stripe.revenue_usd_30d), before counts like payments_30d or mrr.
+    revenue_rows.sort(key=lambda m: 0 if re.search(r"revenue", m["name"] or "", re.I) else 1)
     form_rows = [m for m in real if re.search(r"form|submission", m["name"] or "", re.I)]
     parts = []
     if signup_rows:
-        parts.append(f"signups {signup_rows[0]['value']:g} ({signup_rows[0]['source']})")
+        parts.append(f"signups {signup_rows[0]['value']:g} ({signup_rows[0]['name']}, from {signup_rows[0]['source']})")
     if revenue_rows:
-        parts.append(f"revenue {revenue_rows[0]['value']:g} ({revenue_rows[0]['source']})")
+        parts.append(f"revenue {revenue_rows[0]['value']:g} ({revenue_rows[0]['name']}, from "
+                     f"{revenue_rows[0]['source']})")
     if in_rows:
         parts.append(f"replies: {_plural(len(in_rows), 'inbound email')} from "
                      f"{_plural(len(st['in_addrs']), 'address', 'addresses')}")
