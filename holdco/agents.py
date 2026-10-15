@@ -282,7 +282,15 @@ def chat_prompt(company: dict, agent: dict, latest: str) -> str:
 # ---------------------------------------------------------------- the loop
 
 def _trim(messages: list[dict], budget_chars: int) -> None:
-    total = sum(len(m.get("content") or "") + len(m.get("thinking") or "") for m in messages)
+    """Keep the conversation inside the context budget. The system prompt, the assignment and the last messages
+    stay intact. Older thinking goes first; then old long tool results become one line that keeps the reference
+    (which file and lines, which query) so the agent can fetch them again; last, the big arguments of old write
+    calls (whole files sent to write_file) are shortened, since the files themselves are on disk."""
+    def args_size(m: dict) -> int:
+        return sum(len(json.dumps(tc.get("arguments") or {}, ensure_ascii=False, default=str))
+                   for tc in m.get("tool_calls") or [])
+
+    total = sum(len(m.get("content") or "") + len(m.get("thinking") or "") + args_size(m) for m in messages)
     if total <= budget_chars:
         return
     for m in messages[2:-3]:
@@ -291,10 +299,32 @@ def _trim(messages: list[dict], budget_chars: int) -> None:
             m["thinking"] = ""
     if total <= budget_chars:
         return
+    calls_of: dict[int, dict] = {}   # tool message index -> the call it answers (ids can repeat across steps)
+    last: dict = {}
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant":
+            last = {tc.get("id"): tc for tc in (m.get("tool_calls") or [])}
+        elif m.get("role") == "tool":
+            calls_of[i] = last.get(m.get("tool_call_id")) or {}
+    for i in range(2, max(2, len(messages) - 4)):
+        m = messages[i]
+        if m.get("role") == "tool" and len(m.get("content") or "") > 500:
+            tc = calls_of.get(i) or {}
+            line = ctxsys.trim_reference(m.get("name") or tc.get("name") or "", tc.get("arguments") or {},
+                                         m["content"])
+            total -= len(m["content"]) - len(line)
+            m["content"] = line
+            if total <= budget_chars:
+                return
     for m in messages[2:-4]:
-        if m["role"] == "tool" and len(m.get("content") or "") > 700:
-            total -= len(m["content"]) - 700
-            m["content"] = m["content"][:700] + "\n[older result shortened to save context]"
+        for tc in m.get("tool_calls") or []:
+            args = tc.get("arguments") or {}
+            big = {k: v for k, v in args.items() if isinstance(v, str) and len(v) > 1500}
+            if not big:
+                continue
+            short = {k: f"[{len(v)} characters, shortened to save room]" for k, v in big.items()}
+            total -= sum(len(v) - len(short[k]) for k, v in big.items())
+            tc["arguments"] = {**args, **short}   # a new dict: the original call's arguments stay untouched
             if total <= budget_chars:
                 return
 

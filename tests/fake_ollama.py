@@ -99,6 +99,27 @@ def script(messages: list[dict], tools: list[dict]):
     return seq[min(step, len(seq) - 1)]
 
 
+# Phase 0.5: deterministic embeddings for POST /api/embed. A bag of words hashed into 64 buckets, with a few
+# synonyms folded together so a query can match a document that shares no words with it ("fee" finds "price").
+EMBED_DIM = 64
+EMBED_FAIL_MODEL = "broken-embed"
+EMBED_SYNONYMS = {"fee": "price", "fees": "price", "cost": "price", "costs": "price", "pricing": "price",
+                  "prices": "price", "charge": "price", "charges": "price", "tariff": "price",
+                  "customers": "customer", "clients": "customer", "client": "customer", "buyers": "customer"}
+
+
+def embed(text: str) -> list[float]:
+    import math
+    import re
+    import zlib
+    v = [0.0] * EMBED_DIM
+    for w in re.findall(r"[a-z0-9]+", (text or "").lower()):
+        w = EMBED_SYNONYMS.get(w, w)
+        v[zlib.crc32(w.encode()) % EMBED_DIM] += 1.0
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]
+
+
 IDEAS = {"ideas": [
     {"name": "PawPlan", "one_liner": "Meal plans for dogs", "customer": "Dog owners", "offer": "$9/mo",
      "why_it_fits": "You love dogs", "first_week": "Landing page + waitlist"},
@@ -149,6 +170,12 @@ class FakeModelServer:
                 outer.calls.append({"path": self.path, "model": body.get("model"), "think": body.get("think"),
                                     "options": body.get("options"), "temperature": body.get("temperature"),
                                     "ntools": len(body.get("tools") or [])})
+                if self.path == "/api/embed":   # Phase 0.5: meaning-based search
+                    if body.get("model") == EMBED_FAIL_MODEL:
+                        return self._json(500, {"error": "embedding model crashed"})
+                    inputs = body.get("input")
+                    inputs = [inputs] if isinstance(inputs, str) else list(inputs or [])
+                    return self._json(200, {"model": body.get("model"), "embeddings": [embed(t) for t in inputs]})
                 time.sleep(outer.delay)
                 msgs, tools = body["messages"], body.get("tools") or []
                 ping = "Call the ping tool" in msgs[-1]["content"]
