@@ -154,8 +154,18 @@ def web_search(ctx: Ctx, query: str, max_results: int = 6) -> str:
     _log(ctx, "tool", f"searched the web for “{query}”")
     try:
         results = web.search(query, max_results, ctx.settings)
+    except web.WebError as e:
+        # Every provider failed. Tell the agent once and clearly (each retry would waste a step) and tell the
+        # owner once per company per half hour instead of once per search.
+        reasons = str(e).removeprefix("All search providers failed: ")
+        if web.search_alert_due(ctx.company["id"]):
+            _log(ctx, "error", f"Web search is unavailable: {reasons}")
+        return (f"ERROR: web search is unavailable right now ({reasons}).\n"
+                "Do not retry web_search this session. Continue with URLs you already know (fetch_url still works), "
+                "note the gap with note_progress when you have that tool, and say in your finish summary that "
+                "research was skipped.")
     except Exception as e:
-        return f"Search failed ({e}). Try a different query or fetch a known URL directly."
+        return f"ERROR: search failed ({type(e).__name__}: {e}). Try other words or fetch a known URL directly."
     if not results:
         return "No results. Try different words."
     return "\n\n".join(f"{i + 1}. {r['title']}\n{r['url']}\n{r['snippet']}" for i, r in enumerate(results))
