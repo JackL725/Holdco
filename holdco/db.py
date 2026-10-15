@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY, created_at TEXT, company_id INTEGER, action TEXT, proposed_by TEXT DEFAULT '',
     approved_by TEXT DEFAULT '', payload TEXT DEFAULT '{}', result TEXT DEFAULT '', approval_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS index_state (
+    company_id INTEGER, source TEXT, ref TEXT, stamp TEXT, PRIMARY KEY (company_id, source, ref)
+);
+CREATE TABLE IF NOT EXISTS search_vectors (rowid INTEGER PRIMARY KEY, model TEXT, vector TEXT);
+CREATE TABLE IF NOT EXISTS fetched (
+    id INTEGER PRIMARY KEY, company_id INTEGER, url TEXT, sha TEXT, task_id INTEGER, run_id INTEGER, fetched_at TEXT
+);
+CREATE TABLE IF NOT EXISTS facts (
+    id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, task_id INTEGER, claim TEXT, url TEXT,
+    quote TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_fetched_company ON fetched(company_id, url);
+CREATE INDEX IF NOT EXISTS ix_facts_company ON facts(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_audit_company ON audit(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_tasks_company ON tasks(company_id, status);
@@ -81,6 +94,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
   INSERT INTO memory_fts(memory_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+    title, heading, body,
+    company_id UNINDEXED, source UNINDEXED, ref UNINDEXED, line UNINDEXED, updated_at UNINDEXED,
+    tokenize = 'porter unicode61'
+);
 CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
   INSERT INTO memory_fts(memory_fts, rowid, content) VALUES('delete', old.id, old.content);
   INSERT INTO memory_fts(rowid, content) VALUES (new.id, new.content);
@@ -113,7 +131,11 @@ MIGRATIONS = {
     "agents": {"preset": "TEXT DEFAULT ''", "reasoning": "TEXT DEFAULT ''", "routines_on": "INTEGER DEFAULT 1"},
     "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''",
               # Phase 0: working notes that survive retries, and how often a task changed hands (watchdog)
-              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0"},
+              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0",
+              # Phase 0.5: outreach | deploy | post | purchase | ask | research | build | write
+              "kind": "TEXT DEFAULT ''"},
+    # Phase 0.5: the change stamp and backoff that stop idle re-planning
+    "companies": {"last_cycle_stamp": "TEXT DEFAULT ''", "cycle_backoff": "INTEGER DEFAULT 0"},
 }
 
 

@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 
-from . import agents, backup, bus, db, doctor, emailer, notify, roles, watchdog
+from . import agents, backup, bus, db, doctor, emailer, notify, planning, roles, watchdog
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -86,6 +86,9 @@ class Scheduler(threading.Thread):
                 db.update("tasks", t["id"], agent_id=agent["id"])
             if agents.is_running(agent["id"]):
                 continue
+            company = db.get_company(t["company_id"])
+            if company and planning.over_budget(company):
+                continue   # the company used its daily token budget; owner chat and owner-started runs still work
             agents.start(agent["id"], "task", task_id=t["id"])
 
     def _housekeeping(self, s: dict) -> None:
@@ -157,8 +160,9 @@ class Scheduler(threading.Thread):
         due = since >= float(cs.get("cycle_minutes") or 60)
         idle = open_n == 0 and since >= 10        # team ran out of work
         requested = bool(c["cycle_requested"]) and since >= 3
-        if due or idle or requested:
+        if planning.should_cycle(c, due, idle, requested) and not planning.over_budget(c):
             db.update("companies", c["id"], cycle_requested=0, last_cycle_at=db.now())
+            planning.cycle_started(c)
             agents.start(ceo["id"], "cycle")
 
     def _routines(self, c: dict) -> None:

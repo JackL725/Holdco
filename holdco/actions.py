@@ -84,6 +84,7 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     verb = "asked the owner" if action == "question" else "requested approval"
     bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
     bus.notify("approvals")
+    _records_changed(company["id"])
     from . import notify  # imported here: notify and watchdog import tools, which imports this module
     try:
         notify.approval_requested(db.one("SELECT * FROM approvals WHERE id=?", (aid,)))
@@ -164,6 +165,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
             watchdog.resolve(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result)
         except NotImplementedError:
             pass
+    _records_changed(company["id"])
     db.update("companies", company["id"], cycle_requested=1)
     kind = "decision" if status != "failed" else "error"
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
@@ -171,9 +173,21 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
 
 
+def _records_changed(company_id: int) -> None:
+    """Phase 0.5: records/ is rewritten from the database after every outbound action or decision."""
+    try:
+        from . import truth   # imported here: truth imports tools, which imports this module
+        c = db.get_company(company_id)
+        if c:
+            truth.records_changed(c)
+    except Exception as e:   # records are a view; a failure must never undo or block the action
+        print(f"records refresh failed: {e}")
+
+
 def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payload: dict, result: str,
           approval_id: int | None = None) -> int:
     """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent."""
+    _records_changed(company_id)
     return db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
                   "approval_id) VALUES(?,?,?,?,?,?,?,?)",
                   (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,

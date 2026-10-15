@@ -8,6 +8,10 @@ FOUNDING_TOOLS = ["web_search", "fetch_url", "write_file", "read_file", "update_
 CHAT_EXTRA = ["list_tasks", "create_task", "update_task", "report_to_owner"]
 # Tools every role gets in task runs, on top of its preset's belt (Phase 0: working notes).
 TASK_EXTRA = ["note_progress"]
+# Phase 0.5: finding things and the real state of the company, for every role and run kind.
+CONTEXT_EXTRA = ["search", "grep", "edit_file", "company_status"]
+# Phase 0.5: verified facts and the source check, for roles that research (they have web_search).
+RESEARCH_EXTRA = ["record_fact", "check_sources"]
 
 
 def preset_key(agent: dict) -> str:
@@ -34,6 +38,8 @@ def tools_for(agent: dict, kind: str) -> list[str]:
         names = [n for n in names if n != "finish"] + CHAT_EXTRA
     elif kind == "task":
         names = [n for n in names if n != "finish"] + TASK_EXTRA + ["finish"]
+    research = RESEARCH_EXTRA if "web_search" in names else []
+    names = [n for n in names if n != "finish"] + CONTEXT_EXTRA + research + (["finish"] if "finish" in names else [])
     seen, out = set(), []
     for n in names:
         if n not in seen:

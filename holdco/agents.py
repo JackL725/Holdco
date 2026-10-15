@@ -7,7 +7,8 @@ import re
 import threading
 import traceback
 
-from . import bus, config, db, doctor, llm, presets, roles, tools, watchdog, workspace
+from . import bus, config, db, doctor, llm, planning, playbooks, presets, roles, tools, truth, watchdog, workspace
+from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
@@ -15,8 +16,9 @@ _running_lock = threading.Lock()
 
 # Loop guard bookkeeping. Re-reading or re-checking a file after it changed is progress, not a loop,
 # so a successful change to the workspace forgets the earlier read-only calls.
-_WORKSPACE_CHANGERS = {"write_file", "delete_file", "run_code"}
-_WORKSPACE_READERS = ("read_file", "list_files", "review_text", "audit_page")
+_WORKSPACE_CHANGERS = {"write_file", "edit_file", "delete_file", "run_code"}
+_WORKSPACE_READERS = ("read_file", "list_files", "review_text", "audit_page", "search", "grep", "check_sources",
+                      "company_status")
 
 
 def _forget_reads(seen_calls: dict[str, int]) -> None:
@@ -89,13 +91,21 @@ def _shared_rules(kind: str, max_steps: int) -> str:
     return "# Operating rules\n" + "\n".join(f"- {r}" for r in rules)
 
 
-def system_prompt(company: dict, agent: dict, kind: str, max_steps: int) -> str:
+def _section(fn, *args) -> str:
+    """One provider's prompt section; a failing provider costs its section, never the run."""
+    try:
+        return (fn(*args) or "").strip()
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: dict | None = None) -> str:
+    """The system prompt, built from capped sections (design: phase-0.5 section 1.1). Providers that have nothing
+    to add return "", and their heading is left out."""
     cs = db.company_settings(company)
     s = db.get_settings()
     today = _dt.datetime.now().strftime("%A, %B %d, %Y")
-    charter = (company.get("charter") or "").strip()
-    if len(charter) > 3500:
-        charter = charter[:3500] + "\n[charter truncated; full text in docs/charter.md]"
     pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (company["id"],))
     owner = s.get("owner_name") or "the owner"
     parts = [
@@ -105,15 +115,19 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int) -> str:
         "# Owner's standing orders (always follow these)\n" + (cs.get("directives") or "None yet."),
         presets.render(roles.preset_key(agent), agent.get("focus") or ""),
         _shared_rules(kind, max_steps),
-        "# The company\n"
-        f"Name: {company['name']}\nOne-liner: {company.get('mission') or '(not set yet)'}\n"
-        f"Stage: {company.get('stage') or 'idea'}\nOriginal idea: {(company.get('idea') or '')[:600]}\n\n"
-        f"Charter:\n{charter or '(not written yet)'}",
+        _section(truth.facts_section, company),
+        "# The company\n" + _section(ctxsys.company_core, company),
+        _section(playbooks.section, company),
+        _section(ctxsys.pinned_section, company),
+        _section(truth.changes_section, company, agent, kind),
+        _section(truth.waiting_section, company),
         "# Team (assign tasks by role)\n" + _team_text(company["id"]),
-        "# Shared memory (notes, decisions, owner answers)\n" + _memory_text(company["id"]),
+        "# Shared memory (notes, decisions, owner answers)\n" + (_section(ctxsys.memory_section, company, agent, task)
+                                                                 or "(nothing yet)"),
         "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}",
+        _section(ctxsys.index_section, company),
     ]
-    return "\n\n".join(parts)
+    return "\n\n".join(p for p in parts if p)
 
 
 def deliverable_status(company: dict, path: str) -> str:
@@ -165,9 +179,11 @@ def cycle_prompt(company: dict) -> str:
                    "ORDER BY id DESC LIMIT 5", (cid,))
     dec = "\n".join(f"- {d['status']}: {d['summary']}" + (f" (owner note: {d['feedback']})" if d["feedback"] else "")
                     for d in decided) or "(none)"
+    header = _section(planning.cycle_header, company)
     return (
         f"Run a planning cycle for {company['name']}.\n\n"
-        f"## Open tasks\n{_task_lines(company, tools.OPEN_STATUSES, 'priority, id', 40)}\n\n"
+        + (header + "\n\n" if header else "")
+        + f"## Open tasks\n{_task_lines(company, tools.OPEN_STATUSES, 'priority, id', 40)}\n\n"
         f"## Recently finished (with automatic deliverable checks)\n"
         f"{_task_lines(company, ('done', 'cancelled'), 'updated_at DESC', 8, verify=True)}\n\n"
         f"## Owner's recent decisions\n{dec}\n\n"
@@ -359,7 +375,12 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
         user = founding_prompt(company, context)
     else:
         user = chat_prompt(company, agent, text)
-    messages = [{"role": "system", "content": system_prompt(company, agent, kind, max_steps)},
+    for refresh in (truth.refresh_records, ctxsys.reindex):   # the prompt must see the real state
+        try:
+            refresh(company)
+        except Exception:
+            traceback.print_exc()
+    messages = [{"role": "system", "content": system_prompt(company, agent, kind, max_steps, task)},
                 {"role": "user", "content": user}]
     model = agent.get("model") or (settings.get("ceo_model") if agent["role"] == "ceo" else "") or settings["default_model"]
     budget = int(int(settings.get("num_ctx", 32768)) * 2.6)  # rough chars-per-token headroom

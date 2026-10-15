@@ -311,20 +311,28 @@ PC with your model, not only in tests.
    nightly backups.
    *Gate:* a new company founds with no help from you, and any failure reaches your phone within 5 minutes as
    one clear question.
-2. **Phase 1: Connect.** The MCP client (both protocol generations, stdio and HTTP, OAuth), the vault, risk
+2. **Phase 0.5: Ground truth and context.** Added after the first real runs: agents see what really happened
+   (a facts block and a records folder they cannot edit), claims about deploys, emails and signups are checked
+   before they reach you, one open question per topic, no re-planning while nothing changes, staged founding, a
+   validated charter, business playbooks, verified research facts, and one search over everything Holdco knows,
+   including your own context files. Spec: [phases/phase-0.5-ground-truth-and-context.md](phases/phase-0.5-ground-truth-and-context.md).
+   *Gate:* replaying the first run's failures, no fabricated record is accepted, at most one question per topic is
+   pending, and no planning runs while nothing changes; on your GPU a new company founds with its charter saved,
+   sourced research and a first week that reaches real customers.
+3. **Phase 1: Connect.** The MCP client (both protocol generations, stdio and HTTP, OAuth), the vault, risk
    tags, `find_tool`, health checks and metric pipes. First connectors: Stripe, Resend, Playwright MCP, Buffer
    and Brave.
    *Gate:* in Stripe test mode, an agent creates a payment link, a browser check confirms it opens, and a test
    purchase shows up as revenue without anyone typing it.
-3. **Phase 2: Organize.** The company brain, goals and experiments, task contracts with dependencies and file
+4. **Phase 2: Organize.** The company brain, goals and experiments, task contracts with dependencies and file
    leases, the daily and weekly rhythms, the daily brief, the board memo and the decisions queue.
    *Gate:* every open task links to a goal, and the weekly review is built from connector data rather than
    agents' summaries.
-4. **Phase 3: Verify.** Holdco Bench, the browser QA gate, structured-output tool calls, the code sandbox, taint
+5. **Phase 3: Verify.** Holdco Bench, the browser QA gate, structured-output tool calls, the code sandbox, taint
    tracking, the trust ladder, and model routing with embeddings.
    *Gate:* the Bench runs in CI against the fake model and on your GPU against real ones, and no site task can be
    marked done without passing the browser check.
-5. **Phase 4: Scale.** Holdco as an MCP server, portfolio capital allocation, and the remaining connectors:
+6. **Phase 4: Scale.** Holdco as an MCP server, portfolio capital allocation, and the remaining connectors:
    Porkbun, Cloudflare, GitHub, analytics, forms and n8n. Then ComfyUI, ads and accounting when revenue justifies
    them.
    *Gate:* you can run the portfolio for a week from the daily brief and your phone alone.

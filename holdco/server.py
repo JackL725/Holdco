@@ -13,7 +13,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, backup, bus, config, db, doctor, emailer, llm, notify, presets, roles, watchdog, workspace  # noqa: F401
+from . import actions, agents, backup, bus, config, context, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, watchdog, workspace  # noqa: F401
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -207,6 +207,10 @@ def api_company_patch(h, m, body):
                 continue  # unchanged secret
             if k in ("cycle_minutes", "daily_email_limit", "smtp_port", "imap_port"):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
+            if k == "daily_token_budget":
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # 0 = no limit
+            if k == "pinned_context":
+                v = [str(x)[:300] for x in v][:40] if isinstance(v, list) else []
             if k == "policies" and isinstance(v, dict):
                 v = {a: p for a, p in v.items() if a in config.POLICY_ACTIONS and p in ("approve", "auto", "off", "")
                      and a not in config.LOCKED_POLICIES}

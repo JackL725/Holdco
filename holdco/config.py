@@ -49,6 +49,10 @@ DEFAULT_SETTINGS: dict = {
     "kill_switch": False,             # stops every agent and freezes outbound actions until turned off
     "max_task_attempts": 2,           # failed attempts before a task is blocked and escalated to you
     "backup_keep": 14,                # nightly backups to keep
+    # Ground truth and context (Phase 0.5)
+    "review_model": "",               # stronger model for the critic pass and QA reviews; blank = CEO/agent model
+    "embedding_model": "",            # optional Ollama embedding model (e.g. nomic-embed-text) for meaning search
+    "pinned_context": [],             # files under data/context/ included in every prompt ("always include")
 }
 
 # What happens when an agent tries an outbound action.
@@ -86,6 +90,12 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "netlify_token": "", "netlify_site_id": "", "site_url": "",
     # Social posts / outbound automation (optional): a webhook (Zapier, Make, n8n, Discord...).
     "webhook_url": "",
+    # Ground truth and context (Phase 0.5)
+    "postal_address": "",        # sender's postal address; commercial email must carry one (CAN-SPAM)
+    "archetype": "",             # business type override for the playbook; blank = detected from the idea
+    "daily_token_budget": 3000000,   # background tokens per day; 0 = no limit
+    "pinned_context": [],        # files under this company's context/ included in every prompt
+    "founding_stage": "",        # research | charter | critic | plan while founding (staged founding)
 }
 
 
