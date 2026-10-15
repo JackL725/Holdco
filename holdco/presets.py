@@ -11,7 +11,8 @@ from __future__ import annotations
 
 # A routine is a recurring duty: the scheduler creates the task when it is due.
 #   every_hours: how often; first_after_hours: company age before the first one;
-#   requires: "imap" / "smtp" when it only makes sense with email connected.
+#   requires: a connector capability the duty needs: "imap" / "smtp" (email), "payments", "forms", "analytics",
+#   "calendar" or "" (none). The scheduler skips duties whose requirement isn't met.
 
 
 def R(title, description, every_hours, first_after_hours=None, priority=3, deliverable="", requires=""):
@@ -49,8 +50,8 @@ PRESETS: dict[str, dict] = {
             "of more than two dependent steps.",
             "Write each task like the example below: objective, inputs and out-of-scope in the description, plus a "
             "deliverable path and acceptance criteria.",
-            "Record important decisions in docs/decisions.md (date, decision, options considered, why, reversible "
-            "or not).",
+            "Record important decisions with record_decision (what, why, options considered, reversible or not) and "
+            "durable facts such as prices and URLs with record_fact, so the whole team works from the same numbers.",
             "Message the owner only when something changed, a decision is needed or something went wrong. Then finish.",
         ],
         "rules": [
@@ -73,8 +74,9 @@ PRESETS: dict[str, dict] = {
         ),
         "kpis": ["the North Star metric in the charter", "weekly growth of that metric", "tasks verified done per week",
                  "owner decisions waiting"],
-        "tools": ["list_tasks", "create_task", "update_task", "read_file", "write_file", "web_search", "remember",
-                  "recall", "record_metric", "report_to_owner", "ask_owner", "update_charter", "hire_agent", "finish"],
+        "tools": ["list_tasks", "create_task", "update_task", "read_file", "write_file", "remember", "recall",
+                  "record_fact", "record_decision", "record_metric", "report_to_owner", "ask_owner", "update_charter",
+                  "hire_agent", "finish"],
         "routines": [
             R("Morning report",
               "Send the owner a short morning report with report_to_owner: what shipped in the last 24 hours (with "
@@ -133,7 +135,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["experiments run", "hypotheses resolved", "activation rate"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "list_tasks", "create_task",
-                  "remember", "recall", "ask_owner", "finish"],
+                  "remember", "recall", "record_decision", "ask_owner", "finish"],
         "routines": [
             R("Roadmap review",
               "Re-score open bets in docs/roadmap.md with RICE using the latest metrics, judge any bet whose test "
@@ -176,7 +178,8 @@ PRESETS: dict[str, dict] = {
             "Size markets bottom-up: reachable customers x yearly revenue per customer. Use top-down figures only as "
             "a sanity check.",
             "If two searches in a row find nothing useful, stop searching: write what you have and list the gaps.",
-            "Save the file, remember the 1-3 most important findings, and finish.",
+            "Save the file, record the 1-3 most important numbers with record_fact (e.g. market.competitor_price_usd, "
+            "with the source URL) and remember the key findings, then finish.",
         ],
         "rules": [
             "Never invent a source, quote, statistic or price. A clearly marked gap is better than a guess; models "
@@ -188,7 +191,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["share of claims with sources (target 100%)", "findings used in decisions"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "remember", "recall",
-                  "create_task", "ask_owner", "finish"],
+                  "record_fact", "create_task", "ask_owner", "finish"],
         "routines": [
             R("Competitor watch",
               "Revisit the websites and pricing pages in research/competitors.md. Record any changes to prices, "
@@ -428,7 +431,8 @@ PRESETS: dict[str, dict] = {
             "above the fold; proof only if it's real; short sentences.",
             "Check copy with review_text and fix what it flags.",
             "Hand page changes to engineering as a task with your copy file as input. Queue social posts with social_post.",
-            "Record metrics you can verify with record_metric, then finish.",
+            "Check real numbers before planning: site_stats for traffic and list_signups for form signups (when "
+            "connected). Record metrics you can verify with record_metric, then finish.",
         ],
         "rules": [
             "Never invent testimonials, logos, user counts, ratings or statistics, and always disclose paid or "
@@ -441,7 +445,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["visitor-to-signup rate (median landing page: 6.6%)", "signups by channel", "experiments completed"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "social_post", "create_task",
-                  "remember", "recall", "record_metric", "ask_owner", "finish"],
+                  "remember", "recall", "record_metric", "site_stats", "list_signups", "ask_owner", "finish"],
         "routines": [
             R("Weekly growth plan",
               "Review last week's signups by channel and experiment results, pick the single best channel to double "
@@ -489,7 +493,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["indexed pages", "search impressions and clicks", "signups from organic search"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "review_text", "audit_page",
-                  "create_task", "remember", "finish"],
+                  "create_task", "remember", "site_stats", "finish"],
         "routines": [
             R("Weekly article",
               "Research and write one high-quality article for a question our customers search for, following your "
@@ -585,12 +589,17 @@ PRESETS: dict[str, dict] = {
         "kpis": ["welcome-email click rate (about 4% is typical)", "activation rate", "unsubscribes under 0.5%",
                  "complaints under 0.1%"],
         "tools": ["read_file", "write_file", "review_text", "send_email", "web_search", "fetch_url", "create_task",
-                  "remember", "record_metric", "finish"],
+                  "remember", "recall", "record_metric", "list_signups", "save_contact", "finish"],
         "routines": [
             R("Newsletter draft",
               "Write next week's newsletter issue in marketing/email/newsletter.md (one main idea, real news only, "
               "one call to action) and check it with review_text.",
               168, 168, deliverable="marketing/email/newsletter.md"),
+            R("New signups",
+              "Run list_signups to pull new website signups into the ledger's contacts book, then check with "
+              "recall(book='contacts') that each new signup has a stage and a source. Note anything unusual (spam, "
+              "a sudden spike) for the owner.",
+              24, 24, requires="forms"),
         ],
         "reasoning": "medium", "creativity": "creative",
         "sources": [
@@ -632,7 +641,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["CPA vs target", "click-through rate", "landing-page conversion", "payback period"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "request_purchase",
-                  "create_task", "remember", "ask_owner", "finish"],
+                  "create_task", "remember", "recall", "site_stats", "ask_owner", "finish"],
         "routines": [],
         "reasoning": "high", "creativity": "balanced",
         "sources": [
@@ -666,7 +675,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["partners contacted", "replies", "signups from partners"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "send_email", "check_inbox",
-                  "remember", "recall", "create_task", "finish"],
+                  "remember", "recall", "save_contact", "create_task", "finish"],
         "routines": [],
         "reasoning": "medium", "creativity": "balanced",
         "sources": [
@@ -687,18 +696,20 @@ PRESETS: dict[str, dict] = {
         "done": [
             "sales/leads.md lists each lead: name, role, company, why they fit (a specific trigger), published business "
             "email, source URL and date found. One or two contacts per company.",
-            "sales/pipeline.md shows each lead's stage: Researched, Contacted, Replied, Qualified, Meeting, Proposal, "
-            "Won or Lost, plus Do-not-contact.",
+            "Every lead is in the ledger's contacts book (save_contact) with a stage: new, contacted, replied, "
+            "qualified, meeting, proposal, customer, lost or do_not_contact. recall(book='contacts') is the pipeline.",
             "Each email is plain text, under 80 words, with a personal first line tied to the trigger, one low-pressure "
             "question (\"Worth a look?\"), an opt-out line, the company name and a postal address line; review_text passes.",
         ],
         "workflow": [
-            "Read the ideal customer profile in the charter, sales/suppression.md and the pipeline.",
+            "Read the ideal customer profile in the charter and the pipeline: recall(book='contacts'). Never email "
+            "anyone whose stage is do_not_contact.",
             "Find leads on public business sources (company team and contact pages, directories) and confirm the "
             "address was published for business contact.",
             "Write each email for one person, check it with review_text (kind cold_email), and queue it with send_email.",
             "Follow-ups: 3-4 touches in total over about 2 weeks, 3-4 days apart; stop at any reply.",
-            "Use check_inbox for replies, update the pipeline, and add opt-outs to sales/suppression.md immediately.",
+            "Use check_inbox for replies, update each contact's stage with save_contact, and set opt-outs to "
+            "do_not_contact immediately.",
             "Finish with counts.",
         ],
         "rules": [
@@ -715,13 +726,13 @@ PRESETS: dict[str, dict] = {
         "kpis": ["reply rate (3%+)", "positive replies", "meetings per 100 leads", "bounces under 2%",
                  "complaints under 0.1%"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "send_email", "check_inbox",
-                  "mark_email_handled", "remember", "recall", "create_task", "finish"],
+                  "mark_email_handled", "remember", "recall", "save_contact", "list_bookings", "create_task", "finish"],
         "routines": [
             R("Follow-ups and replies",
-              "Check sales/pipeline.md for leads contacted 3 or more days ago with no reply and fewer than 4 touches, "
-              "and queue the next short follow-up for each. Then check_inbox for replies and update stages and the "
-              "suppression list.",
-              72, 72, priority=2, deliverable="sales/pipeline.md", requires="smtp"),
+              "List contacts with recall(book='contacts'). For leads contacted 3 or more days ago with no reply and "
+              "fewer than 4 touches, queue the next short follow-up. Then check_inbox for replies and update each "
+              "contact's stage with save_contact (opt-outs become do_not_contact).",
+              72, 72, priority=2, requires="smtp"),
         ],
         "reasoning": "medium", "creativity": "balanced",
         "sources": [
@@ -772,7 +783,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["first response time", "resolved without reopening", "satisfaction (75-85% is healthy)", "escalations"],
         "tools": ["check_inbox", "read_file", "write_file", "send_email", "mark_email_handled", "recall", "remember",
-                  "ask_owner", "create_task", "finish"],
+                  "save_contact", "ask_owner", "create_task", "finish"],
         "routines": [
             R("Inbox sweep",
               "Use check_inbox and handle every unhandled email following your workflow.",
@@ -826,7 +837,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["activation rate (SaaS median about 30%)", "monthly churn", "failed-payment recovery"],
         "tools": ["read_file", "write_file", "check_inbox", "send_email", "review_text", "recall", "remember",
-                  "record_metric", "create_task", "ask_owner", "finish"],
+                  "record_metric", "save_contact", "payments_summary", "create_task", "ask_owner", "finish"],
         "routines": [
             R("Churn review",
               "Review churn signals and recent cancellations, update support/churn-signals.md, and queue check-ins for "
@@ -851,15 +862,17 @@ PRESETS: dict[str, dict] = {
             "paid, and a runway everyone can see. You never move money; you prepare things and the owner decides."
         ),
         "done": [
-            "ops/ledger.md has every transaction with a category from the chart of accounts and a source.",
+            "Every transaction is in the ledger's money book (record_transaction, or sync_payments for the payment "
+            "provider) with a category from the chart of accounts and a source. recall(book='money') shows the totals.",
             "Monthly close notes are in ops/close-<YYYY-MM>.md.",
             "Numbers are recorded with record_metric: revenue_usd, mrr_usd, burn_usd, runway_months, gross_margin_pct.",
         ],
         "workflow": [
-            "Read ops/ and the latest metrics.",
-            "Use this chart of accounts: Revenue (by product); Refunds and chargebacks; Cost of revenue (payment fees, "
-            "hosting, AI and API costs); Advertising; Contractors; Software; Legal and professional; Taxes and "
-            "licences; Sales tax payable; Owner contributions and draws.",
+            "Read ops/, recall(book='money') and the latest metrics. If a payment provider is connected, run "
+            "sync_payments first so the money book is current, and payments_summary for balance, MRR and subscriptions.",
+            "Categories: revenue, refunds, fees, cost_of_revenue (hosting, AI and API costs), advertising, contractors, "
+            "software, legal, taxes, sales_tax, owner_contribution, owner_draw. Record owner-reported expenses with "
+            "record_transaction; never invent a transaction.",
             "Monthly close by business day 5: reconcile payouts (gross minus fees, refunds and disputes), categorise "
             "everything, list subscriptions, compute MRR, gross margin, net burn and runway (cash / average net burn "
             "of the last 3 months), flag anything that moved more than 10%, and ask the owner to sign off.",
@@ -877,13 +890,18 @@ PRESETS: dict[str, dict] = {
             "Cash-basis books are fine for most small sellers; note deferred revenue for annual plans.",
         ],
         "kpis": ["runway (months)", "gross margin (SaaS ~70%+)", "net burn", "payback on acquisition cost (<12 months)"],
-        "tools": ["read_file", "write_file", "list_files", "record_metric", "request_purchase", "web_search",
-                  "fetch_url", "run_code", "remember", "recall", "create_task", "ask_owner", "finish"],
+        "tools": ["read_file", "write_file", "record_metric", "record_transaction", "sync_payments", "payments_summary",
+                  "request_purchase", "fetch_url", "run_code", "remember", "recall", "create_task", "ask_owner", "finish"],
         "routines": [
             R("Monthly close",
               "Run the monthly close from your workflow for the month that just ended and write "
               "ops/close-<YYYY-MM>.md. Ask the owner to sign off.",
               720, 700, priority=2),
+            R("Payments sync",
+              "Run sync_payments so every charge, refund and fee from the payment provider is in the ledger's money "
+              "book, then payments_summary. Record mrr_usd and revenue metrics, and tell the owner only if something "
+              "moved more than 10% or a refund or dispute appeared.",
+              24, 24, requires="payments"),
         ],
         "reasoning": "high", "creativity": "precise",
         "sources": [
@@ -929,8 +947,8 @@ PRESETS: dict[str, dict] = {
             "Escalate any legal notice to the owner the same day.",
         ],
         "kpis": ["open compliance risks", "days to fix"],
-        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "audit_page", "create_task",
-                  "remember", "ask_owner", "report_to_owner", "finish"],
+        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "audit_page", "check_domain",
+                  "create_task", "remember", "recall", "ask_owner", "report_to_owner", "finish"],
         "routines": [
             R("Compliance check",
               "Re-check the website and recent outbound messages against ops/compliance.md, update statuses with "
@@ -966,8 +984,9 @@ PRESETS: dict[str, dict] = {
         ],
         "workflow": [
             "Read ops/metrics.md, or write it first if it's missing.",
-            "Collect numbers only from sources you can check: analytics exports or APIs (http_request GET), form "
-            "submission counts, the ledger, files. If a number isn't available, write \"no data\".",
+            "Collect numbers only from sources you can check: site_stats (analytics), list_signups (form signups), "
+            "payments_summary (sales, MRR), recall(book='money') and recall(book='metrics', key=<name>) for history, "
+            "http_request GET for other APIs. If a number isn't available, write \"no data\".",
             "Cover the funnel: acquisition (visitors by source), activation, retention (cohorts), referral, revenue "
             "(MRR, average revenue per account).",
             "The North Star reflects value to customers, leads revenue and can be moved by the team; never pageviews "
@@ -983,7 +1002,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["report delivered on time", "data problems fixed"],
         "tools": ["read_file", "write_file", "list_files", "record_metric", "http_request", "run_code", "recall",
-                  "remember", "report_to_owner", "create_task", "finish"],
+                  "remember", "site_stats", "list_signups", "payments_summary", "report_to_owner", "create_task", "finish"],
         "routines": [
             R("Weekly KPI report",
               "Write this week's KPI report following your workflow and send the owner a 3-line summary.",
@@ -1038,7 +1057,7 @@ DEFAULT_TEMPLATE = "launch"
 
 # Tools every custom (non-preset) agent gets.
 CUSTOM_TOOLS = ["web_search", "fetch_url", "read_file", "write_file", "list_files", "review_text", "send_email",
-                "social_post", "create_task", "remember", "recall", "ask_owner", "finish"]
+                "social_post", "create_task", "remember", "recall", "record_fact", "ask_owner", "finish"]
 
 
 def get(key: str) -> dict | None:

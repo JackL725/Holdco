@@ -4,7 +4,7 @@ from __future__ import annotations
 from . import presets
 
 FOUNDING_TOOLS = ["web_search", "fetch_url", "write_file", "read_file", "update_charter", "create_task", "remember",
-                  "report_to_owner", "finish"]
+                  "record_fact", "check_domain", "report_to_owner", "finish"]
 CHAT_EXTRA = ["list_tasks", "create_task", "update_task", "report_to_owner"]
 
 

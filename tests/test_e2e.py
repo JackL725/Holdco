@@ -2,7 +2,7 @@
 
 Covers founding from a template, the 24/7 scheduler, approvals, chat, QA review with the deliverable check,
 recurring duties, restart recovery, the prompt-based tool fallback, the OpenAI-compatible backend, pausing,
-security checks and deletion.
+security checks, deletion, the shared ledger and the connectors (against a fake of every outside service).
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tests.fake_apis import FakeAPIServer  # noqa: E402
 from tests.fake_ollama import FakeModelServer  # noqa: E402
 from tests.helpers import HoldcoProcess, wait_for  # noqa: E402
 
@@ -21,7 +22,8 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FakeModelServer(delay=0.05).start()
-        cls.app = HoldcoProcess().start()
+        cls.apis = FakeAPIServer().start()
+        cls.app = HoldcoProcess(env=cls.apis.env()).start()
         cls.api = cls.app.client
         cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "max_concurrent_runs": 2})
 
@@ -29,6 +31,7 @@ class EndToEnd(unittest.TestCase):
     def tearDownClass(cls):
         cls.app.stop()
         cls.model.stop()
+        cls.apis.stop()
 
     def tearDown(self):
         problems = [line for line in self.app.log().splitlines() if "Traceback" in line]
@@ -240,11 +243,136 @@ class EndToEnd(unittest.TestCase):
     def test_15_feed_and_delete(self):
         events = self.api.get(f"/api/events?company_id={self.cid}&limit=300")["events"]
         kinds = {e["kind"] for e in events}
-        self.assertTrue({"founding", "run", "tool", "file", "task", "approval", "decision", "done"} <= kinds, kinds)
+        self.assertTrue({"founding", "run", "tool", "file", "task", "approval", "decision", "done", "ledger"} <= kinds, kinds)
         self.api.delete(f"/api/companies/{self.cid2}", {"confirm": "wrong"}, expect=400)
         self.api.delete(f"/api/companies/{self.cid2}", {"confirm": "BrewBuzz"})
         self.assertNotIn(self.cid2, [c["id"] for c in self.api.get("/api/state")["companies"]])
         self.assertTrue((Path(self.app.data_dir) / "trash").exists())
+
+    # ---------------------------------------------------------------- the ledger
+    def ledger(self, book, **qs):
+        extra = "".join(f"&{k}={v}" for k, v in qs.items())
+        return self.api.get(f"/api/companies/{self.cid}/ledger?book={book}{extra}")["entries"]
+
+    def test_16_ledger_is_the_source_of_truth(self):
+        cid = self.cid
+        # agents wrote typed entries while working
+        facts = {e["key"]: e["data"]["value"] for e in self.ledger("facts")}
+        self.assertEqual(facts.get("pricing.monthly_usd"), "9")
+        contacts = self.ledger("contacts")
+        jo = next(e for e in contacts if e["key"] == "jo@happypaws.example")
+        self.assertEqual((jo["data"]["name"], jo["data"]["company"], jo["data"]["stage"]), ("Jo", "Happy Paws", "contacted"))
+        money = self.ledger("transactions")
+        self.assertTrue(any(e["data"]["counterparty"] == "Namecheap" and e["data"]["amount"] == 12 for e in money), money)
+        self.assertEqual(len([e for e in money if e["data"]["counterparty"] == "Namecheap"]), 1)   # recorded once despite retries
+        wait_for(lambda: self.api.post(f"/api/companies/{cid}/cycle")["ok"], 30, what="CEO free to plan")
+        wait_for(lambda: any(e["data"]["by"] == "Atlas" and "waitlist" in e["data"]["decision"] for e in self.ledger("decisions")),
+                 40, what="the CEO's decision in the ledger")
+        decisions = self.ledger("decisions")
+        self.assertTrue(any(e["data"]["by"] == "owner" and e["data"]["decision"].startswith("Rejected") and
+                            e["data"]["why"] == "Fix the form labels first" for e in decisions), decisions)
+        handoffs = self.ledger("handoffs")
+        built = next(e for e in handoffs if e["data"]["title"] == "Build landing page")
+        self.assertEqual((built["data"]["status"], built["data"]["deliverable"]), ("done", "site/index.html"))
+        self.assertTrue(all(e["agent_name"] for e in handoffs))
+        # summary, search, history, owner edits, void, export, files
+        summary = self.api.get(f"/api/companies/{cid}/ledger/summary")["summary"]
+        self.assertGreaterEqual(summary["money"]["month_out"], 12)
+        self.assertEqual(summary["contacts"].get("contacted"), 1)
+        self.assertTrue(any("Namecheap" in e["summary"] for e in self.api.get(f"/api/companies/{cid}/ledger?q=namecheap")["entries"]))
+        e = self.api.post(f"/api/companies/{cid}/ledger", {"book": "facts", "key": "pricing.monthly_usd", "value": "12", "source": "owner"})["entry"]
+        self.assertEqual((e["action"], e["agent_name"]), ("updated", "You"))
+        hist = self.ledger("facts", key="pricing.monthly_usd")
+        self.assertEqual([h["data"]["value"] for h in hist], ["12", "9"])
+        self.api.post(f"/api/companies/{cid}/ledger", {"book": "money", "date": "2026-13-45", "amount": 5, "category": "software"}, expect=400)
+        note = self.api.post(f"/api/companies/{cid}/ledger", {"book": "notes", "content": "Never offer discounts", "pinned": True})["entry"]
+        self.assertEqual(note["pinned"], 1)
+        self.api.patch(f"/api/ledger/{note['id']}", {"pinned": False})
+        self.api.delete(f"/api/ledger/{note['id']}")
+        self.assertNotIn(note["id"], [x["id"] for x in self.ledger("notes")])
+        self.assertIn(note["id"], [x["id"] for x in self.ledger("notes", history=1)])   # voided entries stay in the history
+        status, body, headers = self.api.raw("GET", f"/api/companies/{cid}/ledger/export?book=contacts")
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", headers.get("Content-Type", ""))
+        self.assertIn(b"jo@happypaws.example,Jo,Happy Paws", body)
+        files = [f["path"] for f in self.api.get(f"/api/companies/{cid}/files")["files"]]
+        for path in ("ledger/README.md", "ledger/facts.md", "ledger/contacts.csv", "ledger/transactions.csv", "ledger/handoffs.md", "ledger/decisions.md"):
+            self.assertIn(path, files)
+        self.assertIn("pricing.monthly_usd", self.api.get(f"/api/companies/{cid}/file?path=ledger/facts.md")["content"])
+        # the old memory API still works, backed by the ledger
+        mem = self.api.get(f"/api/companies/{cid}/memory")["memory"]
+        self.assertTrue(all("content" in m and "kind" in m for m in mem))
+        metrics = self.api.get(f"/api/companies/{cid}")["metrics"]
+        self.assertIn("waitlist_signups", [m["name"] for m in metrics])
+
+    # ---------------------------------------------------------------- connectors
+    def test_17_connectors(self):
+        cid = self.cid
+        cat = self.api.get("/api/connectors")
+        self.assertTrue({"email", "netlify", "stripe", "plausible", "x", "bluesky", "calcom"} <= {c["key"] for c in cat["connectors"]})
+        self.assertFalse(self.api.get(f"/api/companies/{cid}/connectors")["status"]["stripe"]["configured"])
+        c = self.api.patch(f"/api/companies/{cid}", {"settings": {
+            "stripe_secret_key": "rk_test_ok", "plausible_site_id": "pawplan.example", "plausible_api_key": "pl_ok",
+            "netlify_token": "nf_ok", "netlify_site_id": "site_1", "x_api_key": "xk", "x_api_secret": "xs",
+            "x_access_token": "xt", "x_access_secret": "xts"}})["company"]
+        self.assertEqual(c["settings"]["stripe_secret_key"], "••••••••")                 # never shown back
+        st = self.api.get(f"/api/companies/{cid}/connectors")
+        self.assertTrue(st["status"]["stripe"]["configured"] and st["status"]["x"]["configured"])
+        self.assertTrue({"payments", "analytics", "deploy", "forms", "social:x"} <= set(st["capabilities"]))
+        r = self.api.post(f"/api/companies/{cid}/connectors/stripe/test")
+        self.assertTrue(r["ok"], r)
+        self.assertIn("Balance $123.45", r["message"])
+        r = self.api.post(f"/api/companies/{cid}/connectors/netlify/test")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.api.get(f"/api/companies/{cid}")["company"]["settings"]["site_url"], "https://pawplan.netlify.app")
+        self.api.patch(f"/api/companies/{cid}", {"settings": {"stripe_secret_key": "••••••••"}})   # masked value = unchanged
+        self.assertTrue(self.api.post(f"/api/companies/{cid}/connectors/stripe/test")["ok"])
+        bad = self.api.post(f"/api/companies/{cid}/connectors/calcom/test")
+        self.assertFalse(bad["ok"])
+        self.assertIn("Fill in", bad["message"])
+        self.api.post(f"/api/companies/{cid}/connectors/nothing/test", expect=404)
+        # the finance agent syncs Stripe into the ledger; a social post goes straight to X
+        ops = self.agent(cid, "ops")
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Reconcile payments", "agent_id": ops["id"], "priority": 1})["task"]
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "done", 60, what="payments task")
+        stripe_rows = [e for e in self.ledger("transactions") if e["data"]["provider"] == "stripe"]
+        self.assertEqual({e["data"]["external_id"] for e in stripe_rows}, {"txn_1", "txn_1:fee", "txn_2", "txn_2:fee", "txn_4"})
+        self.assertIn("revenue_30d_usd", [m["name"] for m in self.api.get(f"/api/companies/{cid}")["metrics"]])
+        echo = self.agent(cid, "marketing")
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Draft launch post v3", "agent_id": echo["id"], "priority": 1})["task"]
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "done", 60, what="post task")
+        post = next(a for a in self.pending(cid) if a["action"] == "social_post")
+        r = self.api.post(f"/api/approvals/{post['id']}", {"decision": "approve"})["approval"]
+        self.assertEqual(r["status"], "done")
+        self.assertIn("Posted on X: https://x.com/i/web/status/1790", r["result"])
+        tweet = next(c for c in self.apis.calls if c["path"] == "/x/2/tweets")
+        self.assertIn("PawPlan", tweet["body"]["text"])
+        # a deploy now really goes to (fake) Netlify
+        forge = self.agent(cid, "engineering")
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Republish the site", "agent_id": forge["id"], "priority": 1})["task"]
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "done", 60, what="deploy task")
+        dep = next(a for a in self.pending(cid) if a["action"] == "deploy_site")
+        r = self.api.post(f"/api/approvals/{dep['id']}", {"decision": "approve"})["approval"]
+        self.assertEqual((r["status"], r["result"]), ("done", "Website deployed: https://pawplan.netlify.app"))
+        # recurring duties that need a connector appear once it is connected
+        wait_for(lambda: "ops:Payments sync" in {x["routine"] for x in self.tasks(cid) if x["routine"]}, 30, what="payments routine")
+
+    def test_18_owner_notifications(self):
+        self.api.put("/api/settings", {"notify_webhook_url": self.apis.url + "/hooks/slack", "telegram_bot_token": "123:abc",
+                                       "telegram_chat_id": "42", "notify_events": ["approvals", "messages"]})
+        r = self.api.post("/api/connectors/notifications/test")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual({x["channel"] for x in r["results"]}, {"webhook", "telegram"})
+        self.apis.calls.clear()
+        hunter = self.agent(self.cid, "sales")
+        t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Email one more lead", "agent_id": hunter["id"], "priority": 1})["task"]
+        wait_for(lambda: next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"] == "done", 60, what="sales task")
+        wait_for(lambda: any(c["path"] == "/hooks/slack" and "needs your OK" in c["body"]["text"] for c in self.apis.calls), 10,
+                 what="approval notification")
+        self.assertTrue(any(c["path"].startswith("/telegram/bot123:abc/") for c in self.apis.calls))
+        self.api.put("/api/settings", {"notify_webhook_url": "", "telegram_bot_token": "", "telegram_chat_id": ""})
+        bad = self.api.post("/api/connectors/notifications/test")
+        self.assertFalse(bad["ok"])
 
 
 if __name__ == "__main__":

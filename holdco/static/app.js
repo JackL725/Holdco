@@ -661,6 +661,17 @@ function Settings() {
           <label class="field">${esc(label)}${data.locked.includes(k) ? `<div class="box small">Always asks you</div>`
             : sel(`policy_${k}`, pol[k], [['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']])}</label>`).join('')}</div>
       </div>
+      <div class="section"><h2>Notifications</h2><p class="muted">Get a ping on your phone when agents need a decision, send you a report or hit an error. Any one channel is enough.</p>
+        <div class="form-grid">
+          <label class="field">Slack or Discord webhook<span class="hint">An incoming webhook URL. Any URL that accepts JSON works too.</span><input type="url" name="notify_webhook_url" value="${esc(s.notify_webhook_url || '')}" placeholder="https://hooks.slack.com/services/…"></label>
+          <label class="field">Telegram bot token<span class="hint">Create a bot with @BotFather, then send it a message once.</span><input type="password" name="telegram_bot_token" value="${esc(s.telegram_bot_token || '')}" autocomplete="off"></label>
+          <label class="field">Telegram chat ID<span class="hint">Your numeric id (ask @userinfobot).</span><input type="text" name="telegram_chat_id" value="${esc(s.telegram_chat_id || '')}"></label>
+          <label class="field">ntfy topic<span class="hint">A topic on ntfy.sh (free app), or a full URL on your own ntfy server.</span><input type="text" name="ntfy_topic" value="${esc(s.ntfy_topic || '')}" placeholder="holdco-${Math.random().toString(36).slice(2, 8)}"></label>
+        </div>
+        <div class="actions" style="margin-top:14px">
+          ${[['approvals', 'Requests waiting for you'], ['messages', 'Reports and messages from agents'], ['errors', 'Agent errors']].map(([k, l]) => `<label class="check small" style="align-items:center"><input type="checkbox" name="notify_${k}" ${(s.notify_events || []).includes(k) ? 'checked' : ''} style="margin:0"> ${l}</label>`).join('')}
+          <button class="btn" type="button" data-act="test-notify">Save and send a test</button><span id="notify-result" class="small"></span></div>
+      </div>
       <div class="section"><h2>Web search</h2>
         <div class="form-grid">
           <label class="field">Search with${sel('search_provider', s.search_provider, [['duckduckgo', 'DuckDuckGo (no key)'], ['searxng', 'SearXNG (self-hosted)'], ['brave', 'Brave Search API']])}</label>
@@ -680,10 +691,12 @@ function Settings() {
     async submit(name, form) {
       const f = new FormData(form);
       const body = {};
-      for (const [k, v] of f.entries()) if (!k.startsWith('policy_')) body[k] = v;
+      for (const [k, v] of f.entries()) if (!k.startsWith('policy_') && !k.startsWith('notify_')) body[k] = v;
       ['num_ctx', 'max_concurrent_runs', 'max_steps_per_run'].forEach((k) => { body[k] = parseInt(body[k], 10); });
       body.temperature = parseFloat(body.temperature);
       body.scheduler_enabled = !!form.scheduler_enabled.checked;
+      body.notify_webhook_url = form.notify_webhook_url.value.trim();
+      body.notify_events = ['approvals', 'messages', 'errors'].filter((k) => form[`notify_${k}`].checked);
       body.policies = {};
       Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
       try {
@@ -694,6 +707,15 @@ function Settings() {
       } catch (e) { fail(e); }
     },
     async act(name) {
+      if (name === 'test-notify') {
+        await this.submit('settings', $('form', el));
+        const out = $('#notify-result', el);
+        out.innerHTML = '<span class="spinner"></span> Sending…';
+        try {
+          const r = await api('POST', '/api/connectors/notifications/test', {});
+          out.innerHTML = `<span class="badge ${r.ok ? 'good' : 'bad'}">${r.ok ? 'Sent' : 'Failed'}</span> ${esc(r.message)}`;
+        } catch (e) { out.textContent = e.message; }
+      }
       if (name === 'test-llm') {
         const form = $('form', el);
         await this.submit('settings', form);
@@ -710,7 +732,7 @@ function Settings() {
 }
 
 // ---------------------------------------------------------------- company
-const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
+const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['ledger', 'Ledger'], ['email', 'Email'], ['connectors', 'Connectors'], ['charter', 'Charter'], ['settings', 'Settings']];
 
 function CompanyView(cid, tab, arg) {
   let el, d, tabView;
@@ -744,13 +766,13 @@ function CompanyView(cid, tab, arg) {
       el = holder;
       await reload();
       el.innerHTML = `<div id="co-head">${head()}</div><div id="tab"></div>`;
-      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
+      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, ledger: TabLedger, memory: TabLedger, email: TabEmail, connectors: TabConnectors, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
       tabView = factory(cid, () => d, arg, async () => { await redrawHead(); tabView?.onCompany?.(); });
       await tabView.mount($('#tab', el));
     },
     live(ev) {
       if (ev.company_id && ev.company_id !== cid) return;
-      if (['event', 'agents', 'company', 'approvals', 'tasks'].includes(ev.type)) refreshHeadSoon();
+      if (['event', 'agents', 'company', 'approvals', 'tasks', 'ledger'].includes(ev.type)) refreshHeadSoon();
       tabView?.live?.(ev);
     },
     async act(name, t, e) {
@@ -792,6 +814,9 @@ function TabOverview(cid, data) {
       <div class="kpi"><div class="v">${d.stats.tasks_done}</div><div class="k">Tasks done</div></div>
       <div class="kpi"><div class="v">${d.stats.done_today}</div><div class="k">Done today</div></div>
       <div class="kpi"><div class="v">${(c.tokens_used / 1e6).toFixed(c.tokens_used > 1e7 ? 0 : 2)}M</div><div class="k">Tokens used</div></div>
+      ${d.ledger && d.ledger.money && d.ledger.money.transactions ? `<div class="kpi" title="Money in minus money out this month, from the ledger"><div class="v">${esc(money(d.ledger.money.month_net, d.ledger.money.currency))}</div><div class="k">Net this month</div></div>
+        <div class="kpi" title="All money in minus all money out recorded in the ledger"><div class="v">${esc(money(d.ledger.money.cash, d.ledger.money.currency))}</div><div class="k">Cash (ledger)</div></div>` : ''}
+      ${d.ledger && d.ledger.contacts && Object.keys(d.ledger.contacts).length ? `<div class="kpi" title="${esc(Object.entries(d.ledger.contacts).map(([k, v]) => `${k}: ${v}`).join(', '))}"><div class="v">${Object.values(d.ledger.contacts).reduce((a, b) => a + b, 0)}</div><div class="k">Contacts</div></div>` : ''}
       ${d.metrics.map((m) => `<div class="kpi" title="${esc(m.note)}"><div class="v">${esc(Number(m.value).toLocaleString())}</div><div class="k">${esc(m.name.replace(/_/g, ' '))}</div></div>`).join('')}`;
     $('#ov-folder', el).innerHTML = `<p class="small muted" style="margin:0 0 6px">Everything the team makes is a normal file on your PC:</p><code class="small" style="overflow-wrap:anywhere">${esc(d.folder)}</code>`;
   };
@@ -1216,43 +1241,206 @@ function TabFiles(cid, data, initial) {
   };
 }
 
-// ---- memory
-function TabMemory(cid) {
-  let el;
-  const load = async () => {
-    const r = await GET(`/api/companies/${cid}/memory`);
-    $('#mem', el).innerHTML = r.memory.length ? r.memory.map((m) => `<li data-mem="${m.id}"><div class="grow">
-      <div class="small faint">${m.pinned ? '<span class="badge accent">Pinned</span> ' : ''}${esc(m.kind)} from ${esc(m.agent_name || 'you')}, ${when(m.created_at)}</div>
-      <div>${inline(m.content)}</div></div>
-      <button class="btn sm ghost" data-act="pin" data-p="${m.pinned ? 0 : 1}">${m.pinned ? 'Unpin' : 'Pin'}</button>
-      <button class="btn sm ghost" data-act="forget">Delete</button></li>`).join('') : '<li class="faint">Nothing remembered yet.</li>';
+// ---- ledger: the team's source of truth (append-only books; entries are superseded or voided, never deleted)
+const LEDGER_BOOKS = [['notes', 'Notes'], ['facts', 'Facts'], ['decisions', 'Decisions'], ['contacts', 'Contacts'], ['transactions', 'Money'], ['metrics', 'Metrics'], ['handoffs', 'Handoffs'], ['all', 'Everything']];
+function money(v, cur) {
+  const sym = { USD: '$', EUR: '€', GBP: '£' }[cur] || '';
+  const num = Number(v || 0);
+  const n = Math.abs(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const sign = num < 0 ? '−' : '';
+  return sym ? `${sign}${sym}${n}` : `${sign}${n} ${cur || ''}`.trim();
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+function TabLedger(cid, data, arg) {
+  let el, book = LEDGER_BOOKS.some(([k]) => k === arg) ? arg : 'notes', q = '', entries = [], meta = { categories: {}, stages: [] }, summary = null;
+  const sel = (name, value, opts) => `<select name="${name}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+  const rowHtml = (e) => {
+    const d = e.data || {};
+    const who = `${esc(e.agent_name || 'You')}, ${when(e.created_at)}${e.source && !['agent', 'owner'].includes(e.source) ? ` via ${esc(e.source)}` : ''}`;
+    const voidBtn = `<button class="btn sm ghost" data-act="void" title="Strike this entry out. It stays in the history.">Void</button>`;
+    const hist = `<button class="btn sm ghost" data-act="history">History</button>`;
+    const bookTag = book === 'all' ? `<span class="badge">${esc((LEDGER_BOOKS.find(([k]) => k === e.book) || [])[1] || e.book)}</span> ` : '';
+    switch (e.book) {
+      case 'notes':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div class="small faint">${bookTag}${e.pinned ? '<span class="badge accent">Pinned</span> ' : ''}${esc(d.kind || 'note')} · ${who}</div><div>${inline(d.content || e.summary)}</div></div>
+          <button class="btn sm ghost" data-act="pin" data-p="${e.pinned ? 0 : 1}">${e.pinned ? 'Unpin' : 'Pin'}</button>${voidBtn}</li>`;
+      case 'facts':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<code>${esc(d.key || e.key)}</code> = <b>${esc(String(d.value ?? ''))}</b></div><div class="small faint">${d.source ? `source: ${inline(d.source)} · ` : ''}${who}</div></div>${hist}${voidBtn}</li>`;
+      case 'decisions':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<b>${esc(d.title)}</b> <span class="badge">${d.reversible === false ? 'hard to reverse' : 'reversible'}</span></div><div>${inline(d.decision)}</div>
+          ${d.why ? `<div class="small muted">Why: ${inline(d.why)}</div>` : ''}${d.options ? `<div class="small muted">Options considered: ${inline(d.options)}</div>` : ''}<div class="small faint">by ${esc(d.by || e.agent_name)} · ${who}</div></div>${hist}${voidBtn}</li>`;
+      case 'contacts':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<b>${esc(d.name || d.email || d.company)}</b>${d.email && d.name ? ` <span class="muted">&lt;${esc(d.email)}&gt;</span>` : ''}${d.company && d.company !== (d.name || d.email) ? ` · ${esc(d.company)}` : ''}${d.role ? `, ${esc(d.role)}` : ''} <span class="badge ${d.do_not_contact ? 'bad' : d.stage === 'customer' ? 'good' : ''}">${esc(d.do_not_contact ? 'do not contact' : d.stage)}</span></div>
+          ${d.notes ? `<div class="small muted">${inline(d.notes)}</div>` : ''}<div class="small faint">${d.source ? `source: ${inline(d.source)} · ` : ''}${d.touches ? `${plural(d.touches, 'touch', 'touches')} · ` : ''}${who}</div></div>${hist}${voidBtn}</li>`;
+      case 'transactions':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<span class="num" style="font-weight:600;color:${d.direction === 'in' ? 'var(--good)' : 'var(--ink)'}">${d.direction === 'in' ? '+' : '−'}${esc(money(d.amount, d.currency))}</span> <span class="badge">${esc(meta.categories[d.category] || d.category)}</span> <span class="muted">${esc(d.date)}</span></div>
+          <div class="small muted">${esc(d.counterparty || '')}${d.counterparty && d.description ? ': ' : ''}${esc(d.description || '')}</div><div class="small faint">${d.external_id ? `${esc(d.provider || 'id')} ${esc(d.external_id)} · ` : ''}${who}</div></div>${voidBtn}</li>`;
+      case 'metrics':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<b>${esc(d.name)}</b> = <span class="num">${esc(Number(d.value).toLocaleString())}</span></div><div class="small faint">${d.note ? `${inline(d.note)} · ` : ''}${who}</div></div>${hist}${voidBtn}</li>`;
+      case 'handoffs':
+        return `<li data-entry="${e.id}" data-book="${e.book}" data-key="${esc(e.key)}"><div class="grow"><div>${bookTag}<b>Task #${d.task_id}</b> ${esc(d.title)} <span class="badge ${d.status === 'done' ? 'good' : d.status === 'blocked' ? 'bad' : 'warn'}">${esc(d.status)}</span></div><div>${inline(d.summary)}</div>
+          ${d.deliverable ? `<div class="small">Deliverable: ${/^[\w./-]+$/.test(d.deliverable) && /[/.]/.test(d.deliverable) ? `<a href="#/c/${cid}/files/${encodeURIComponent(d.deliverable)}">${esc(d.deliverable)}</a>` : esc(d.deliverable)}</div>` : ''}
+          ${d.evidence ? `<div class="small muted">Evidence: ${inline(d.evidence)}</div>` : ''}${d.open_issues ? `<div class="small" style="color:var(--warn)">Open: ${inline(d.open_issues)}</div>` : ''}${d.next_step ? `<div class="small muted">Next: ${inline(d.next_step)}</div>` : ''}<div class="small faint">${who}</div></div>${hist}</li>`;
+      default:
+        return `<li data-entry="${e.id}" data-book="${e.book}"><div class="grow">${bookTag}${inline(e.summary)}<div class="small faint">${who}</div></div>${voidBtn}</li>`;
+    }
   };
-  const loadSoon = debounce(() => load().catch(() => {}), 800);
+  const moneyStrip = () => {
+    const m = summary && summary.money;
+    if (book !== 'transactions' || !m) return '';
+    const cats = Object.entries(m.by_category || {});
+    return `<div class="kpis" style="padding:0 0 14px">
+      <div class="kpi"><div class="v">${esc(money(m.month_in, m.currency))}</div><div class="k">In this month</div></div>
+      <div class="kpi"><div class="v">${esc(money(m.month_out, m.currency))}</div><div class="k">Out this month</div></div>
+      <div class="kpi"><div class="v">${esc(money(m.month_net, m.currency))}</div><div class="k">Net this month</div></div>
+      <div class="kpi"><div class="v">${esc(money(m.cash, m.currency))}</div><div class="k">Cash, all time</div></div>
+      <div class="kpi"><div class="v">${m.transactions}</div><div class="k">Transactions</div></div></div>
+      ${cats.length ? `<table class="mini" style="margin-bottom:14px"><thead><tr><th>Category</th><th class="num">This month</th><th class="num">All time</th></tr></thead><tbody>${cats.map(([k, v]) => `<tr><td>${esc(meta.categories[k] || k)}</td><td class="num">${esc(money(v.month_in - v.month_out, m.currency))}</td><td class="num">${esc(money(v.in - v.out, m.currency))}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${m.other_currencies && m.other_currencies.length ? `<p class="small faint">Also recorded in ${esc(m.other_currencies.join(', '))} (not included above).</p>` : ''}`;
+  };
+  const draw = () => {
+    $('#lg-chips', el).innerHTML = LEDGER_BOOKS.map(([k, l]) => `<button class="btn sm ${book === k ? 'primary' : ''}" data-act="book" data-book="${k}">${l}${summary && summary.counts && summary.counts[k] ? ` <span class="faint">${summary.counts[k]}</span>` : ''}</button>`).join('');
+    $('#lg-strip', el).innerHTML = moneyStrip();
+    const hint = { notes: 'Facts, lessons and context agents chose to remember. Pin what must never be forgotten.', facts: 'Key = value facts (prices, URLs, policies, market numbers). The latest value per key wins; history is kept.', decisions: 'What was decided, why, and the options considered, by agents and by you (your approvals and answers land here too).', contacts: 'Leads, customers and partners, one entry per email address, with a pipeline stage.', transactions: 'Money in and out, categorised with the chart of accounts. Synced from your payment provider or recorded by agents and you.', metrics: 'KPI readings over time. The latest per name is the number agents see; the history is the trend.', handoffs: 'The end-of-task report of every finished task: status, deliverable, evidence, open issues, next step.', all: 'Everything recorded, newest first.' }[book];
+    $('#lg-hint', el).textContent = hint || '';
+    $('#lg-add', el).classList.toggle('hidden', ['handoffs', 'all'].includes(book));
+    $('#lg-export', el).classList.toggle('hidden', book === 'all');
+    $('#lg-list', el).innerHTML = entries.length ? entries.map(rowHtml).join('') : `<li class="faint">${q ? 'Nothing matches.' : 'Nothing here yet.'}</li>`;
+  };
+  const load = async () => {
+    const [r, sm] = await Promise.all([GET(`/api/companies/${cid}/ledger?limit=300${book !== 'all' ? `&book=${book}` : ''}${q ? `&q=${encodeURIComponent(q)}` : ''}`), GET(`/api/companies/${cid}/ledger/summary`)]);
+    entries = r.entries; meta = r; summary = sm.summary;
+    draw();
+  };
+  const loadSoon = debounce(() => load().catch(() => {}), 500);
+  const addForm = () => {
+    const cats = Object.entries(meta.categories || {});
+    switch (book) {
+      case 'notes': return `<label class="field">Note<textarea name="content" rows="3" required placeholder="Our refund policy is 30 days, no questions asked."></textarea></label><div class="form-grid"><label class="field">Kind${sel('kind', 'note', [['note', 'note'], ['fact', 'fact'], ['lesson', 'lesson'], ['owner', 'owner instruction']])}</label><label class="check" style="align-self:end"><input type="checkbox" name="pinned"> Pin it (every agent sees it in every session)</label></div>`;
+      case 'facts': return `<div class="form-grid"><label class="field">Key<span class="hint">Short and dotted, e.g. pricing.pro_usd or site.url</span><input type="text" name="key" required></label><label class="field">Value<input type="text" name="value" required></label></div><label class="field">Source<input type="text" name="source" placeholder="owner"></label>`;
+      case 'decisions': return `<label class="field">Title<input type="text" name="title" required placeholder="Pricing: one $29 plan"></label><label class="field">Decision<textarea name="decision" rows="2" required></textarea></label><label class="field">Why<textarea name="why" rows="2"></textarea></label><label class="field">Options considered<textarea name="options" rows="2"></textarea></label><label class="check"><input type="checkbox" name="reversible" checked> Reversible</label>`;
+      case 'contacts': return `<div class="form-grid"><label class="field">Email<input type="email" name="email"></label><label class="field">Name<input type="text" name="name"></label><label class="field">Company<input type="text" name="company"></label><label class="field">Role<input type="text" name="role"></label><label class="field">Stage${sel('stage', 'new', (meta.stages || []).map((s) => [s, s.replace(/_/g, ' ')]))}</label><label class="field">Source<input type="text" name="source"></label></div><label class="field">Notes<textarea name="notes" rows="2"></textarea></label>`;
+      case 'transactions': return `<div class="form-grid"><label class="field">Date<input type="date" name="date" value="${today()}" required></label><label class="field">Amount<input type="number" name="amount" step="0.01" min="0.01" required></label><label class="field">Currency<input type="text" name="currency" value="${esc((summary && summary.money && summary.money.currency) || 'USD')}" maxlength="3"></label>
+        <label class="field">Direction${sel('direction', '', [['', 'From the category'], ['in', 'Money in'], ['out', 'Money out']])}</label><label class="field">Category${sel('category', 'software', cats)}</label><label class="field">Counterparty<input type="text" name="counterparty" placeholder="Who paid or was paid"></label></div>
+        <label class="field">Description<input type="text" name="description"></label><label class="field">Reference<span class="hint">Invoice or bank id, if any (prevents duplicates)</span><input type="text" name="external_id"></label>`;
+      case 'metrics': return `<div class="form-grid"><label class="field">Name<span class="hint">snake_case, e.g. visitors_7d</span><input type="text" name="name" required></label><label class="field">Value<input type="number" name="value" step="any" required></label></div><label class="field">Note<input type="text" name="note" placeholder="Where the number came from"></label>`;
+      default: return '';
+    }
+  };
   return {
     async mount(holder) {
       el = holder;
-      el.innerHTML = `<section class="panel"><form class="panel-body form-stack" data-form="note">
-          <label class="field">Tell the team something to remember<span class="hint">Pinned notes are shown to every agent in every session. Use them for facts that must never be forgotten.</span>
-          <textarea name="content" rows="2" placeholder="Our refund policy is 30 days, no questions asked."></textarea></label>
-          <div class="actions"><label class="check small"><input type="checkbox" name="pinned"> Pin it</label><button class="btn primary" type="submit">Save note</button></div></form></section>
-        <section class="panel" style="margin-top:18px"><ul class="rows" id="mem"></ul></section>`;
+      el.innerHTML = `<section class="panel"><div class="panel-body">
+        <div class="actions" style="justify-content:space-between;margin-bottom:10px"><div id="lg-chips" class="chips"></div>
+          <div class="actions"><input type="search" id="lg-q" placeholder="Search the ledger…" style="max-width:240px" aria-label="Search the ledger">
+            <button class="btn sm primary" id="lg-add" data-act="add">Add</button><a class="btn sm ghost" id="lg-export" href="/api/companies/${cid}/ledger/export?book=${book}" download>Export</a></div></div>
+        <p class="small muted" id="lg-hint" style="margin:0 0 10px"></p><div id="lg-strip"></div></div>
+        <ul class="rows" id="lg-list"></ul></section>`;
+      $('#lg-q', el).addEventListener('input', (e) => { q = e.target.value.trim(); loadSoon(); });
       await load();
     },
-    live(ev) { if (ev.type === 'event' && ['memory', 'decision'].includes(ev.kind)) loadSoon(); },
+    live(ev) { if (ev.type === 'ledger' || (ev.type === 'event' && ev.company_id === cid && ['memory', 'ledger', 'metric', 'decision', 'done'].includes(ev.kind))) loadSoon(); },
     async act(name, t) {
-      const id = t.closest('[data-mem]')?.dataset.mem;
+      const li = t.closest('[data-entry]');
+      const id = li && li.dataset.entry;
       try {
-        if (name === 'pin') await api('PATCH', `/api/memory/${id}`, { pinned: !!+t.dataset.p });
-        if (name === 'forget') await api('DELETE', `/api/memory/${id}`);
-        await load();
+        if (name === 'book') {
+          book = t.dataset.book;
+          history.replaceState(null, '', `#/c/${cid}/ledger/${book}`);
+          $('#lg-export', el).href = `/api/companies/${cid}/ledger/export?book=${book}`;
+          await load();
+        }
+        if (name === 'pin') { await api('PATCH', `/api/ledger/${id}`, { pinned: !!+t.dataset.p }); await load(); }
+        if (name === 'void') {
+          if (!confirm('Void this entry? It stops being current but stays in the history.')) return;
+          await api('DELETE', `/api/ledger/${id}`); toast('Voided.'); await load();
+        }
+        if (name === 'history') {
+          const r = await GET(`/api/companies/${cid}/ledger?book=${li.dataset.book}&key=${encodeURIComponent(li.dataset.key)}`);
+          modal({ title: `History of ${li.dataset.key}`, wide: true, body: `<ul class="rows">${r.entries.map((e) => `<li><div class="grow"><div class="small faint">${when(e.created_at)} by ${esc(e.agent_name || 'You')}${e.voided ? ' <span class="badge bad">voided</span>' : e.current ? ' <span class="badge good">current</span>' : ''}</div><div>${inline(e.summary)}</div></div></li>`).join('') || '<li class="faint">No history.</li>'}</ul>` });
+        }
+        if (name === 'add') {
+          modal({ title: `Add to ${(LEDGER_BOOKS.find(([k]) => k === book) || ['', 'the ledger'])[1]}`, body: `<form class="form-stack" data-form="ledger-add" id="la">${addForm()}</form>`,
+            foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn primary" type="submit" form="la">Add</button>` });
+        }
       } catch (e) { fail(e); }
     },
     async submit(name, form) {
+      if (name !== 'ledger-add') return;
+      const f = Object.fromEntries(new FormData(form));
+      const body = { ...f, book };
+      if ('pinned' in form.elements) body.pinned = form.pinned.checked;
+      if ('reversible' in form.elements) body.reversible = form.reversible.checked;
+      if (f.amount !== undefined) body.amount = parseFloat(f.amount);
+      if (f.value !== undefined && book === 'metrics') body.value = parseFloat(f.value);
+      try { await api('POST', `/api/companies/${cid}/ledger`, body); closeModal(); toast('Added to the ledger.'); await load(); } catch (e) { fail(e); }
+    },
+  };
+}
+
+// ---- connectors: the outside services a company runs on
+function TabConnectors(cid, data, _arg, reloadCompany) {
+  let el, cat = null, status = {};
+  const fieldHtml = (f, s) => {
+    const v = s[f.key] ?? f.default ?? '';
+    const type = f.secret ? 'password' : f.kind === 'number' ? 'number' : f.kind === 'url' ? 'url' : 'text';
+    return `<label class="field">${esc(f.label)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}<input type="${type}" name="${esc(f.key)}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" autocomplete="${f.secret ? 'new-password' : 'off'}"></label>`;
+  };
+  const card = (c) => {
+    const s = data().company.settings;
+    const st = status[c.key] || {};
+    return `<form class="connector ${st.configured ? 'on' : ''}" data-form="connector" data-key="${c.key}">
+      <div class="connector-head"><div><b>${esc(c.label)}</b> <span class="badge ${st.configured ? 'good' : ''}">${st.configured ? 'Connected' : 'Not set up'}</span></div>
+        <a class="small" href="${esc(c.docs)}" target="_blank" rel="noopener noreferrer">Where to get this</a></div>
+      <p class="small muted" style="margin:0 0 10px">${esc(c.blurb)}</p>
+      <div class="form-grid">${c.fields.map((f) => fieldHtml(f, s)).join('')}
+        ${c.key === 'email' ? `<label class="field">Send a test email to<span class="hint">Optional, used by "Save and test".</span><input type="email" name="_test_to" placeholder="you@example.com"></label>` : ''}</div>
+      <div class="actions" style="margin-top:12px"><button class="btn primary sm" type="submit">Save</button><button class="btn sm" type="button" data-act="test" data-key="${c.key}">Save and test</button><span class="small result"></span></div></form>`;
+  };
+  const draw = () => {
+    const groups = cat.categories.map((g) => {
+      const items = cat.connectors.filter((c) => c.category === g);
+      return items.length ? `<section class="gallery-group"><h3>${esc(g)}</h3><div class="connectors">${items.map(card).join('')}</div></section>` : '';
+    }).join('');
+    const caps = data().capabilities || [];
+    $('#cn-body', el).innerHTML = `<p class="muted" style="margin:0 0 18px">Keys are stored on this PC only (in the data folder) and never shown to agents: agents call tools, Holdco makes the requests. Anything that leaves your computer still goes through your inbox first. ${caps.length ? `Enabled: <b>${esc(caps.map((c) => c.replace('social:', 'posting to ')).join(', '))}</b>.` : 'Nothing is connected yet.'}</p>${groups}`;
+  };
+  const loadStatus = async () => { status = (await GET(`/api/companies/${cid}/connectors`)).status; };
+  const save = async (form) => {
+    const settings = {};
+    for (const [k, v] of Object.entries(Object.fromEntries(new FormData(form)))) if (!k.startsWith('_')) settings[k] = v;
+    await api('PATCH', `/api/companies/${cid}`, { settings });
+    await reloadCompany();
+    await loadStatus();
+  };
+  return {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel"><div class="panel-body" id="cn-body"><span class="spinner"></span></div></section>`;
+      [cat] = await Promise.all([GET('/api/connectors'), loadStatus()]);
+      draw();
+    },
+    async submit(name, form) {
+      if (name !== 'connector') return;
+      try { await save(form); toast('Saved.'); draw(); } catch (e) { fail(e); }
+    },
+    async act(name, t) {
+      if (name !== 'test') return;
+      const form = t.closest('form');
+      const out = $('.result', form);
+      t.disabled = true;
+      out.innerHTML = '<span class="spinner"></span> Testing…';
       try {
-        await api('POST', `/api/companies/${cid}/memory`, { content: form.content.value, pinned: form.pinned.checked });
-        form.reset();
-        await load();
-      } catch (e) { fail(e); }
+        await save(form);
+        const to = form._test_to ? form._test_to.value.trim() : '';
+        const r = await api('POST', `/api/companies/${cid}/connectors/${t.dataset.key}/test`, to ? { to } : {});
+        await reloadCompany();
+        await loadStatus();
+        draw();
+        const again = $(`form[data-key="${t.dataset.key}"] .result`, el);
+        if (again) again.innerHTML = `<span class="badge ${r.ok ? 'good' : 'bad'}">${r.ok ? 'OK' : 'Failed'}</span> ${esc(r.message)}`;
+      } catch (e) { out.textContent = e.message; t.disabled = false; }
     },
   };
 }
@@ -1273,7 +1461,7 @@ function TabEmail(cid, data) {
       const d = data();
       el.innerHTML = `${!d.email_ready || !d.inbox_ready ? `<div class="banner warn"><div class="grow"><b>${!d.email_ready && !d.inbox_ready ? 'Email isn\'t connected yet.' : !d.email_ready ? 'Sending isn\'t set up yet.' : 'Receiving isn\'t set up yet.'}</b>
         Give this company its own mailbox (any provider with SMTP and IMAP, e.g. Gmail with an app password, Zoho or Fastmail). Sales and support agents use it for outreach and replies, always through your inbox first.</div>
-        <a class="btn" href="#/c/${cid}/settings">Set up email</a></div>` : ''}
+        <a class="btn" href="#/c/${cid}/connectors">Set up email</a></div>` : ''}
         <section class="panel"><div class="panel-head"><h2>Mail</h2>${d.inbox_ready ? '<button class="btn sm" data-act="check-mail">Check for new mail</button>' : ''}</div><ul class="rows" id="mail" style="padding-top:8px"></ul></section>`;
       await load();
     },
@@ -1334,31 +1522,7 @@ function TabSettings(cid, data) {
         <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
           `<select name="policy_${k}"><option value="">Default (${esc({ approve: 'ask me', auto: 'allowed', off: 'never' }[global.settings.policies[k]])})</option>
           ${[['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']].map(([v, l]) => `<option value="${v}" ${pol[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`}</label>`).join('')}</div></div>
-      <div class="section"><h2>Email</h2><p class="muted">Sending (SMTP). Port 587 uses STARTTLS, 465 uses SSL. For Gmail, create an app password.</p>
-        <div class="form-grid">
-          <label class="field">SMTP server<input type="text" name="smtp_host" value="${val('smtp_host')}" placeholder="smtp.gmail.com"></label>
-          <label class="field">Port<input type="number" name="smtp_port" value="${val('smtp_port')}"></label>
-          <label class="field">Username<input type="text" name="smtp_user" value="${val('smtp_user')}" autocomplete="off"></label>
-          <label class="field">Password<input type="password" name="smtp_password" value="${val('smtp_password')}" autocomplete="new-password"></label>
-          <label class="field">From address<input type="email" name="smtp_from" value="${val('smtp_from')}"></label>
-          <label class="field">From name<input type="text" name="smtp_from_name" value="${val('smtp_from_name')}" placeholder="${esc(c.name)}"></label>
-        </div>
-        <p class="muted" style="margin-top:16px">Receiving (IMAP). New mail becomes a task for the support agent.</p>
-        <div class="form-grid">
-          <label class="field">IMAP server<input type="text" name="imap_host" value="${val('imap_host')}" placeholder="imap.gmail.com"></label>
-          <label class="field">Port<input type="number" name="imap_port" value="${val('imap_port')}"></label>
-          <label class="field">Username<input type="text" name="imap_user" value="${val('imap_user')}" autocomplete="off"></label>
-          <label class="field">Password<input type="password" name="imap_password" value="${val('imap_password')}" autocomplete="new-password"></label>
-        </div>
-        <div class="actions" style="margin-top:14px"><input type="email" id="test-to" placeholder="Send a test email to…" style="max-width:280px"><button class="btn" type="button" data-act="test-email">Send test</button></div></div>
-      <div class="section"><h2>Website</h2><p class="muted">The site in <code>site/</code> always previews locally. To publish it, add a Netlify personal access token; Holdco creates the site on first deploy.</p>
-        <div class="form-grid">
-          <label class="field">Netlify token<input type="password" name="netlify_token" value="${val('netlify_token')}" autocomplete="off"></label>
-          <label class="field">Netlify site ID<span class="hint">Leave blank to create one.</span><input type="text" name="netlify_site_id" value="${val('netlify_site_id')}"></label>
-          <label class="field">Public address<input type="url" name="site_url" value="${val('site_url')}"></label>
-        </div></div>
-      <div class="section"><h2>Posting webhook</h2><p class="muted">Approved social posts are sent here as JSON, so you can wire them to X, LinkedIn, Discord or anything else with Zapier, Make or n8n. Without it, you get a ready-to-post link.</p>
-        <label class="field">Webhook address<input type="url" name="webhook_url" value="${val('webhook_url')}"></label></div>
+      <div class="section"><h2>Connected services</h2><p class="muted" style="margin:0">Email, website hosting and forms, payments, analytics, social accounts and scheduling are set up on the <a href="#/c/${cid}/connectors">Connectors tab</a>.</p></div>
       <div class="section actions" style="justify-content:flex-end"><button class="btn primary" type="submit">Save</button></div>
     </form>
     <section class="panel" style="margin-top:18px"><div class="section"><h2>Archive or delete</h2><p class="muted">Archiving stops all work and keeps everything. Deleting removes the company from Holdco and moves its folder to the trash folder in your data directory.</p>
@@ -1381,12 +1545,6 @@ function TabSettings(cid, data) {
       } catch (e) { fail(e); }
     },
     async act(name) {
-      if (name === 'test-email') {
-        const to = $('#test-to', el).value.trim();
-        if (!to) { toast('Enter an address to send the test to.', true); return; }
-        await this.submit('co-settings', $('form', el));
-        try { const r = await api('POST', `/api/companies/${cid}/emails/test`, { to }); toast(r.message, !r.ok); } catch (e) { fail(e); }
-      }
       if (name === 'delete') {
         const c = data().company;
         modal({

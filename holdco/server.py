@@ -13,9 +13,16 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, bus, config, db, emailer, llm, presets, roles, workspace
+from . import actions, agents, bus, config, connectors, db, emailer, ledger, llm, presets, roles, workspace
 
 ROUTES: list[tuple[str, re.Pattern, callable]] = []
+
+
+class Raw:
+    """A non-JSON response from a route (a file download)."""
+
+    def __init__(self, body: bytes, ctype: str, headers: dict | None = None):
+        self.body, self.ctype, self.headers = body, ctype, headers or {}
 
 
 class HTTPError(Exception):
@@ -49,8 +56,7 @@ def _company_or_404(cid) -> dict:
 def _public_company(c: dict) -> dict:
     cs = db.company_settings(c)
     out = {k: v for k, v in c.items() if k != "settings"}
-    secret_keys = ("smtp_password", "imap_password", "netlify_token")
-    out["settings"] = {k: ("••••••••" if k in secret_keys and v else v) for k, v in cs.items()}
+    out["settings"] = {k: ("••••••••" if k in config.SECRET_COMPANY_KEYS and v else v) for k, v in cs.items()}
     return out
 
 
@@ -165,13 +171,12 @@ def api_company(h, m, body):
     c = _company_or_404(m.group(1))
     team = db.q("SELECT a.*, t.title AS task_title FROM agents a LEFT JOIN tasks t ON t.id=a.current_task_id "
                 "WHERE a.company_id=? ORDER BY a.id", (c["id"],))
-    metrics = db.q("SELECT name, value, note, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                   "WHERE company_id=? GROUP BY name) ORDER BY name", (c["id"],))
     cs = db.company_settings(c)
-    return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": metrics,
+    return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": ledger.latest_metrics(c["id"]),
             "email_ready": emailer.smtp_configured(cs), "inbox_ready": emailer.imap_configured(cs),
             "has_site": workspace.safe_path(c, "site/index.html").exists(),
-            "folder": str(workspace.root(c))}
+            "folder": str(workspace.root(c)), "ledger": ledger.summary(c["id"]),
+            "capabilities": sorted(connectors.capabilities(cs))}
 
 
 @route("PATCH", r"/api/companies/(\d+)")
@@ -217,7 +222,7 @@ def api_company_delete(h, m, body):
     if (body or {}).get("confirm") != c["name"]:
         raise HTTPError(400, "Type the company name to confirm.")
     db.update("companies", c["id"], status="archived")
-    for t in ("agents", "tasks", "memory", "approvals", "events", "messages", "runs", "emails", "metrics"):
+    for t in ("agents", "tasks", "memory", "approvals", "events", "messages", "runs", "emails", "metrics", "ledger"):
         db.run(f"DELETE FROM {t} WHERE company_id=?", (c["id"],))
     db.run("DELETE FROM companies WHERE id=?", (c["id"],))
     workspace.remove_company_folder(c)
@@ -413,11 +418,24 @@ def api_message_send(h, m, body):
     return agents.send_chat(c["id"], text, _int((body or {}).get("agent_id")) or None)
 
 
+def _with_names(cid: int, rows: list[dict]) -> list[dict]:
+    names = {a["id"]: a["name"] for a in db.q("SELECT id, name FROM agents WHERE company_id=?", (cid,))}
+    for r in rows:
+        r["agent_name"] = names.get(r.get("agent_id")) or ("You" if r.get("agent_id") is None else "agent")
+    return rows
+
+
+def _notes_compat(rows: list[dict]) -> list[dict]:
+    """Notes in the shape the old memory API returned."""
+    return [{"id": e["id"], "company_id": e["company_id"], "agent_id": e["agent_id"], "kind": e["data"].get("kind", "note"),
+             "content": e["data"].get("content", e["summary"]), "pinned": e["pinned"], "created_at": e["created_at"],
+             "agent_name": e.get("agent_name")} for e in rows]
+
+
 @route("GET", r"/api/companies/(\d+)/memory")
 def api_memory(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"memory": db.q("SELECT m.*, a.name AS agent_name FROM memory m LEFT JOIN agents a ON a.id=m.agent_id "
-                           "WHERE m.company_id=? ORDER BY m.pinned DESC, m.id DESC LIMIT 300", (c["id"],))}
+    return {"memory": _notes_compat(_with_names(c["id"], ledger.current(c["id"], "notes", limit=300)))}
 
 
 @route("POST", r"/api/companies/(\d+)/memory")
@@ -426,28 +444,190 @@ def api_memory_add(h, m, body):
     text = ((body or {}).get("content") or "").strip()
     if not text:
         raise HTTPError(400, "Write the note first.")
-    mid = db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
-                 (c["id"], None, "owner", text, 1 if (body or {}).get("pinned") else 0, db.now()))
-    return {"id": mid}
+    e = ledger.note(c["id"], text, "owner", bool((body or {}).get("pinned")), None, "owner")
+    ledger.render(c, "notes")
+    bus.notify("ledger", company_id=c["id"], book="notes")
+    return {"id": e["id"]}
 
 
 @route("PATCH", r"/api/memory/(\d+)")
 def api_memory_patch(h, m, body):
     if "pinned" in (body or {}):
-        db.run("UPDATE memory SET pinned=? WHERE id=?", (1 if body["pinned"] else 0, _int(m.group(1))))
+        ledger.set_pinned(_int(m.group(1)), bool(body["pinned"]))
     return {"ok": True}
 
 
 @route("DELETE", r"/api/memory/(\d+)")
 def api_memory_delete(h, m, body):
-    db.run("DELETE FROM memory WHERE id=?", (_int(m.group(1)),))
+    ledger.void(_int(m.group(1)))
     return {"ok": True}
 
 
 @route("GET", r"/api/companies/(\d+)/metrics")
 def api_metrics(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"metrics": db.q("SELECT * FROM metrics WHERE company_id=? ORDER BY id DESC LIMIT 500", (c["id"],))}
+    return {"metrics": ledger.metric_rows(c["id"])}
+
+
+# ======================= the ledger =======================
+
+@route("GET", r"/api/companies/(\d+)/ledger")
+def api_ledger(h, m, body):
+    c = _company_or_404(m.group(1))
+    qs = h.query
+    book = qs.get("book", [""])[0]
+    query = qs.get("q", [""])[0]
+    key = qs.get("key", [""])[0]
+    hist = bool(_int(qs.get("history", [0])[0]))
+    limit = max(1, min(_int(qs.get("limit", [200])[0], 200), 2000))
+    try:
+        if key and book:
+            rows = ledger.history(c["id"], book, key, limit, include_voided=True)
+        elif query.strip():
+            rows = ledger.search(c["id"], query, book, limit, current_only=not hist)
+        elif book:
+            rows = ledger.all_entries(c["id"], book, limit, include_voided=True) if hist else ledger.current(c["id"], book, limit=limit)
+        else:
+            rows = ledger.all_entries(c["id"], "", limit)
+    except ledger.LedgerError as e:
+        raise HTTPError(400, str(e))
+    return {"entries": _with_names(c["id"], rows), "books": {k: v["label"] for k, v in ledger.BOOKS.items()},
+            "categories": {k: v[0] for k, v in ledger.CATEGORIES.items()}, "stages": list(ledger.STAGES)}
+
+
+@route("GET", r"/api/companies/(\d+)/ledger/summary")
+def api_ledger_summary(h, m, body):
+    c = _company_or_404(m.group(1))
+    return {"summary": ledger.summary(c["id"])}
+
+
+@route("GET", r"/api/companies/(\d+)/ledger/export")
+def api_ledger_export(h, m, body):
+    c = _company_or_404(m.group(1))
+    book = h.query.get("book", ["transactions"])[0]
+    try:
+        name, content = ledger.export(c["id"], book)
+    except ledger.LedgerError as e:
+        raise HTTPError(400, str(e))
+    ctype = "text/csv; charset=utf-8" if name.endswith(".csv") else "text/markdown; charset=utf-8"
+    return Raw(content.encode("utf-8"), ctype, {"Content-Disposition": f'attachment; filename="{c["slug"]}-{name}"'})
+
+
+@route("POST", r"/api/companies/(\d+)/ledger")
+def api_ledger_add(h, m, body):
+    c = _company_or_404(m.group(1))
+    b = body or {}
+    cid = c["id"]
+    g = lambda k, d="": (b.get(k) if b.get(k) is not None else d)  # noqa: E731
+    try:
+        book = ledger.book_name(g("book", "notes"))
+        if book == "notes":
+            e = ledger.note(cid, str(g("content")), str(g("kind", "owner")) or "owner", bool(g("pinned", False)), None, "owner")
+        elif book == "facts":
+            e = ledger.fact(cid, str(g("key")), g("value"), str(g("source", "owner")) or "owner", None, "owner")
+        elif book == "decisions":
+            e = ledger.decision(cid, str(g("title")), str(g("decision")), str(g("why")), str(g("options")),
+                                bool(g("reversible", True)), "owner", None, "owner")
+        elif book == "contacts":
+            e = ledger.contact(cid, str(g("email")), str(g("name")), str(g("company")), str(g("role")), str(g("stage")),
+                               str(g("source")), str(g("notes")), None, str(g("url")), None, "owner")
+        elif book == "transactions":
+            e = ledger.transaction(cid, str(g("date")), g("amount", 0), str(g("currency", "USD")), str(g("direction")),
+                                   str(g("category", "other")), str(g("counterparty")), str(g("description")),
+                                   str(g("external_id")), "", None, "owner")
+        elif book == "metrics":
+            e = ledger.metric(cid, str(g("name")), g("value", 0), str(g("note")), "", None, "owner")
+        else:
+            raise HTTPError(400, "Handoffs are written by agents when they finish a task.")
+    except ledger.LedgerError as err:
+        raise HTTPError(400, str(err))
+    except (TypeError, ValueError) as err:
+        raise HTTPError(400, f"Invalid entry: {err}")
+    ledger.render(c, book)
+    bus.emit(cid, "ledger", f"added to the {ledger.BOOKS[book]['label'].lower()} book: {e['summary'][:140]}", None,
+             {"by": "owner", "book": book, "entry_id": e["id"]})
+    bus.notify("ledger", company_id=cid, book=book)
+    return {"entry": _with_names(cid, [e])[0]}
+
+
+@route("PATCH", r"/api/ledger/(\d+)")
+def api_ledger_patch(h, m, body):
+    e = ledger.get(_int(m.group(1)))
+    if not e:
+        raise HTTPError(404, "Entry not found")
+    if "pinned" in (body or {}):
+        ledger.set_pinned(e["id"], bool(body["pinned"]))
+    c = db.get_company(e["company_id"])
+    if c:
+        ledger.render(c, e["book"])
+    bus.notify("ledger", company_id=e["company_id"], book=e["book"])
+    return {"entry": ledger.get(e["id"])}
+
+
+@route("DELETE", r"/api/ledger/(\d+)")
+def api_ledger_void(h, m, body):
+    e = ledger.get(_int(m.group(1)))
+    if not e:
+        raise HTTPError(404, "Entry not found")
+    ledger.void(e["id"])
+    c = db.get_company(e["company_id"])
+    if c:
+        ledger.render(c, e["book"])
+        bus.emit(e["company_id"], "ledger", f"voided a {e['book']} entry: {e['summary'][:120]}", None,
+                 {"by": "owner", "book": e["book"], "entry_id": e["id"]})
+    bus.notify("ledger", company_id=e["company_id"], book=e["book"])
+    return {"ok": True}
+
+
+# ======================= connectors =======================
+
+@route("GET", "/api/connectors")
+def api_connectors(h, m, body):
+    s = db.get_settings()
+    return {**connectors.catalogue(), "notifications": {"targets": connectors.notify_targets(s),
+                                                        "events": s.get("notify_events") or []}}
+
+
+@route("GET", r"/api/companies/(\d+)/connectors")
+def api_company_connectors(h, m, body):
+    c = _company_or_404(m.group(1))
+    cs = db.company_settings(c)
+    return {"status": connectors.status(cs), "capabilities": sorted(connectors.capabilities(cs))}
+
+
+@route("POST", r"/api/companies/(\d+)/connectors/([a-z_]+)/test")
+def api_connector_test(h, m, body):
+    c = _company_or_404(m.group(1))
+    key = m.group(2)
+    if key not in config.CONNECTORS:
+        raise HTTPError(404, "Unknown connector")
+    cs = db.company_settings(c)
+    try:
+        message, updates = connectors.test(key, cs, {**(body or {}), "company": c})
+    except (connectors.ConnectorError, emailer.EmailError) as e:
+        return {"ok": False, "message": str(e)}
+    except Exception as e:  # a provider replied with something unexpected
+        return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+    if updates:
+        changed = {k: v for k, v in updates.items() if k in config.DEFAULT_COMPANY_SETTINGS and v and v != cs.get(k)}
+        if changed:
+            cs.update(changed)
+            db.update("companies", c["id"], settings=json.dumps(cs))
+            bus.notify("company", company_id=c["id"])
+    bus.emit(c["id"], "info", f"tested the {config.CONNECTORS[key]['label']} connection: {message[:160]}", None, {"by": "owner"})
+    return {"ok": True, "message": message}
+
+
+@route("POST", "/api/connectors/notifications/test")
+def api_notifications_test(h, m, body):
+    s = db.get_settings()
+    if not connectors.notify_targets(s):
+        return {"ok": False, "results": [], "message": "Add a webhook, a Telegram bot or an ntfy topic first, then save."}
+    results = connectors.deliver(s, "Holdco test", "Notifications are working. You'll get a ping when agents need you.")
+    ok = all(r["ok"] for r in results)
+    return {"ok": ok, "results": results,
+            "message": "Sent to " + ", ".join(r["channel"] for r in results if r["ok"]) + "." if ok else
+            "; ".join(f"{r['channel']}: {r['message']}" for r in results if not r["ok"])}
 
 
 @route("GET", r"/api/companies/(\d+)/emails")
@@ -652,7 +832,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise HTTPError(400, "Invalid JSON")
                 for mth, rx, fn in ROUTES:
                     if mth == method and (mm := rx.match(path)):
-                        return self._send(200, fn(self, mm, body))
+                        out = fn(self, mm, body)
+                        if isinstance(out, Raw):
+                            return self._send(200, out.body, out.ctype, out.headers)
+                        return self._send(200, out)
                 raise HTTPError(404, "Not found")
             if method not in ("GET", "HEAD"):
                 raise HTTPError(405, "Method not allowed")

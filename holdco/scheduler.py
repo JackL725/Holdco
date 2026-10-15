@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 
-from . import agents, bus, db, emailer, roles
+from . import agents, bus, connectors, db, emailer, roles
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -92,9 +92,7 @@ class Scheduler(threading.Thread):
         age_h = db.minutes_since(c["created_at"]) / 60
         for a in db.q("SELECT * FROM agents WHERE company_id=? AND enabled=1 AND routines_on=1", (c["id"],)):
             for r in roles.role_info(a).get("routines", []):
-                if r["requires"] == "imap" and not emailer.imap_configured(cs):
-                    continue
-                if r["requires"] == "smtp" and not emailer.smtp_configured(cs):
+                if not connectors.has(cs, r["requires"]):   # e.g. imap, smtp, payments, forms, analytics
                     continue
                 if age_h < r["first_after_hours"]:
                     continue

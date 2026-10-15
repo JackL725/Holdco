@@ -368,6 +368,18 @@ details > summary::-webkit-details-marker { display: none; }
 details > summary h2::after { content: " +"; color: var(--ink-3); font-weight: 400; }
 details[open] > summary h2::after { content: " −"; }
 
+/* ---------- ledger & connectors ---------- */
+table.mini { border-collapse: collapse; font-size: 13px; }
+table.mini th, table.mini td { padding: 4px 14px 4px 0; text-align: left; border-bottom: 1px solid var(--line); }
+table.mini th { color: var(--ink-3); font-weight: 600; font-size: 12px; }
+table.mini th.num, table.mini td.num { text-align: right; }
+.connectors { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+.connector { border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; background: var(--panel); }
+.connector.on { border-color: color-mix(in srgb, var(--good) 45%, var(--line)); }
+.connector-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.feed li.k-ledger .msg { color: var(--ink); }
+@media (max-width: 760px) { .connectors { grid-template-columns: 1fr; } }
+
 /* ---------- memory & lists ---------- */
 .rows { list-style: none; margin: 0; padding: 0; }
 .rows li { display: flex; gap: 12px; padding: 11px 18px; border-top: 1px solid var(--line); align-items: flex-start; }

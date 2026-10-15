@@ -32,6 +32,8 @@ def script(messages: list[dict], tools: list[dict]):
     if user.startswith("You are founding"):
         seq = [tc("web_search", query="dog meal plan subscription market"),
                tc("write_file", path="research/market.md", content="# Market\n\n- FACT: example (source: https://example.com)\n"),
+               tc("check_domain", domain="pawplan.com"),
+               tc("record_fact", key="pricing.monthly_usd", value="9", source="charter"),
                tc("update_charter", charter="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n",
                   company_name="PawPlan", one_liner="Weekly meal plans for dog owners", stage="building"),
                tc("create_task", title="Build landing page", assign_to="engineering", priority=1,
@@ -45,6 +47,8 @@ def script(messages: list[dict], tools: list[dict]):
         return seq[min(step, len(seq) - 1)]
     if user.startswith("Run a planning cycle"):
         seq = [tc("list_tasks"),
+               tc("record_decision", title=f"Priority {stamp}", decision="Focus on waitlist signups this week",
+                  why="Cheapest demand test", options="Build the product first (rejected)"),
                tc("create_task", title=f"Follow up on leads batch {stamp}", assign_to="sales",
                   deliverable=f"sales/followups-{stamp}.md", priority=3),
                tc("finish", summary="Reviewed progress, queued follow-ups.")]
@@ -68,6 +72,8 @@ def script(messages: list[dict], tools: list[dict]):
                  tc("social_post", platform="x", content="Meet PawPlan: weekly meal plans your dog will love."),
                  tc("finish", summary="Launch post drafted and queued.", deliverable="marketing/launch.md")],
         "Hunter": [tc("write_file", path="sales/leads.md", content="| Name | Company | Source |\n|---|---|---|\n| Jo | Happy Paws | https://example.com |\n"),
+                   tc("save_contact", email="jo@happypaws.example", name="Jo", company="Happy Paws", stage="contacted",
+                      source="https://happypaws.example/team", notes="Opened a second shop"),
                    tc("send_email", to="jo@happypaws.example", subject="Quick idea for Happy Paws",
                       body="Hi Jo,\n\nWe built PawPlan. Worth a look? Reply 'no' and I won't follow up.\n\nPawPlan"),
                    tc("finish", summary="Leads saved; first email queued.", deliverable="sales/leads.md")],
@@ -76,6 +82,9 @@ def script(messages: list[dict], tools: list[dict]):
                   tc("remember", content="Competitors charge $9-15/month", kind="fact"),
                   tc("finish", summary="Competitor scan saved.", deliverable="research/competitors.md")],
         "Ledger": [tc("record_metric", name="waitlist_signups", value=0, note="baseline"),
+                   tc("record_transaction", date=time.strftime("%Y-%m-%d"), amount=12, category="software",
+                      counterparty="Namecheap", description="pawplan.co domain, paid by the owner"),
+                   tc("sync_payments", days=30),
                    tc("request_purchase", item="pawplan.co domain", amount_usd=12, vendor="Namecheap", reason="Brand domain"),
                    tc("run_code", language="python", code="print(2+2)"),
                    tc("finish", summary="KPIs set up; domain purchase requested.")],

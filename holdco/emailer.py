@@ -60,6 +60,41 @@ def send(company: dict, to: str, subject: str, body: str, in_reply_to: str = "")
     return f"Email sent to {to}."
 
 
+def test(company: dict, to: str = "") -> str:
+    """Log in to SMTP (and IMAP when set up) and optionally send a test email."""
+    cs = db.company_settings(company)
+    if not smtp_configured(cs):
+        raise EmailError("Add the SMTP server, username and password first.")
+    port = int(cs.get("smtp_port") or 587)
+    ctx = ssl.create_default_context()
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(cs["smtp_host"], port, context=ctx, timeout=20) as s:
+                s.login(cs["smtp_user"], cs["smtp_password"])
+        else:
+            with smtplib.SMTP(cs["smtp_host"], port, timeout=20) as s:
+                s.starttls(context=ctx)
+                s.login(cs["smtp_user"], cs["smtp_password"])
+    except (smtplib.SMTPException, OSError) as e:
+        raise EmailError(f"SMTP login failed: {e}") from None
+    parts = ["SMTP login OK"]
+    if imap_configured(cs):
+        try:
+            with imaplib.IMAP4_SSL(cs["imap_host"], int(cs.get("imap_port") or 993)) as M:
+                M.login(cs["imap_user"], cs["imap_password"])
+                typ, data = M.select("INBOX", readonly=True)
+                n = int((data[0] or b"0").decode()) if typ == "OK" else 0
+            parts.append(f"IMAP login OK ({n} messages in the inbox)")
+        except (imaplib.IMAP4.error, OSError, ValueError) as e:
+            raise EmailError(f"IMAP login failed: {e}") from None
+    else:
+        parts.append("IMAP not set up (agents can send but won't see replies)")
+    if to.strip():
+        send(company, to.strip(), f"Test from {company['name']}", "This is a test email from Holdco. Email sending works.")
+        parts.append(f"test email sent to {to.strip()}")
+    return "; ".join(parts) + "."
+
+
 def _body_text(msg) -> str:
     if msg.is_multipart():
         plain = html = None

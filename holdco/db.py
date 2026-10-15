@@ -134,6 +134,19 @@ def init() -> None:
         except sqlite3.OperationalError:
             HAS_FTS = False
         _conn.commit()
+    from . import ledger  # the shared ledger lives in its own module; its tables come from the same database
+    ledger.init()
+
+
+def locked():
+    """The storage lock, for callers that need several statements to be atomic (it is re-entrant)."""
+    return _lock
+
+
+def executescript(sql: str) -> None:
+    with _lock:
+        _conn.executescript(sql)
+        _conn.commit()
 
 
 def q(sql: str, params: tuple | list = ()) -> list[dict]:

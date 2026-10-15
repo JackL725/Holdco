@@ -80,15 +80,16 @@ class Client:
 class HoldcoProcess:
     """Runs `python run.py` against a temporary data folder."""
 
-    def __init__(self, data_dir: str | None = None):
+    def __init__(self, data_dir: str | None = None, env: dict | None = None):
         self.data_dir = data_dir or tempfile.mkdtemp(prefix="holdco-test-")
+        self.extra_env = env or {}
         self.port = free_port()
         self.proc: subprocess.Popen | None = None
         self.client = Client(f"http://127.0.0.1:{self.port}")
         self.log_path = Path(self.data_dir) / "server.log"
 
     def start(self):
-        env = {**os.environ, "HOLDCO_DATA": self.data_dir, "HOLDCO_PORT": str(self.port),
+        env = {**os.environ, **self.extra_env, "HOLDCO_DATA": self.data_dir, "HOLDCO_PORT": str(self.port),
                "HOLDCO_TICK_SECONDS": "1", "HOLDCO_ROUTINE_CHECK_SECONDS": "1", "PYTHONUNBUFFERED": "1"}
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "a", encoding="utf-8")

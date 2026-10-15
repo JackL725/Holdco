@@ -28,8 +28,18 @@ No cloud AI, no API bills, no pip installs.
 - **Live feed** of everything every agent does, plus full transcripts of every work session.
 - **Thinking tab.** Watch each agent's reasoning, the tool it picks and what the tool returns, live, per agent.
   Shows the model's own reasoning when it shares it (gpt-oss, Qwen3 and other thinking models).
-- **Integrations:** web search (DuckDuckGo, SearXNG or Brave), company email (SMTP/IMAP; inbound mail becomes
-  support tasks), website publishing (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
+- **Shared ledger.** Each company has one append-only ledger that every agent reads and writes, and that you can
+  audit: facts (prices, URLs, policies), decisions with their reasoning, contacts with a pipeline stage, money in
+  and out on a chart of accounts, KPI readings over time, and a handoff report for every finished task. Nothing is
+  ever deleted, only superseded or voided, so you can always see who changed what and why. Browse and edit it on
+  the Ledger tab, export any book as CSV, or read the generated files in `ledger/`. [docs/LEDGER.md](docs/LEDGER.md)
+  explains the design.
+- **Connectors to run a real business:** company email (SMTP/IMAP; inbound mail becomes support tasks), Netlify
+  (publishing and form signups), Stripe, Lemon Squeezy and Gumroad (sales, refunds, fees, subscriptions and MRR
+  flow into the ledger), Plausible and GoatCounter (traffic), direct posting to X, Bluesky, Mastodon and LinkedIn
+  plus a webhook for everything else (Zapier, Make, n8n, Discord), Cal.com bookings, a domain-availability check,
+  and web search (DuckDuckGo, SearXNG or Brave). Standard library only; keys stay on your PC and agents never see them.
+- **Owner notifications** on Slack, Discord, Telegram or ntfy when agents need a decision, report to you or hit an error.
 
 ## Quick start
 
@@ -78,7 +88,7 @@ What's built into every preset, and why:
 - **Short, structured prompts.** Mission, definition of done, numbered workflow, at most about 7 rules with the
   reason behind each. Instruction-following in small models drops as instruction counts climb, so the
   important rules come first.
-- **8–14 tools per role** instead of all 28. Small models pick the right tool far more often from a short list,
+- **8–15 tools per role** instead of all 38. Small models pick the right tool far more often from a short list,
   and an agent can't use tools outside its role.
 - **Tasks with a deliverable and acceptance criteria.** An agent can't mark a task done while its deliverable
   file is missing or unchanged; it gets sent back once, then the task is marked partial. "Done but never
@@ -141,14 +151,26 @@ Agents work while Holdco is running and your PC is awake.
   `http://<your-pc's-ip>:8420` on your home Wi-Fi. For access away from home, use a private network such as
   Tailscale rather than opening a port on your router.
 
-## Connecting the outside world (per company, in its Settings tab)
+## Connecting the outside world (per company, on its Connectors tab)
 
-| What | How | Without it |
-|---|---|---|
-| Email | Any mailbox with SMTP + IMAP (Gmail with an app password, Zoho, Fastmail…). Inbound mail becomes tasks for the support agent. | Sales and support write drafts only |
-| Website | A Netlify personal access token. Holdco creates the site on the first approved deploy. | The site still previews locally at `/preview/<company>/` |
-| Social posts | A webhook URL (Zapier, Make, n8n, Discord…). Approved posts are sent there as JSON. | You get a one-click "post on X" link with the text filled in |
-| Search | DuckDuckGo works with no key. For heavy use, run SearXNG locally or add a Brave Search API key in Settings. Optional: `pip install ddgs` makes DuckDuckGo searches more reliable. | |
+Every connector has a "Save and test" button that checks the keys and tells you what it found. Keys are stored
+in `data/holdco.db` on your PC and are never shown to agents: agents call tools, Holdco makes the requests, and
+anything that leaves your computer still waits in your inbox first.
+
+| What | Services | What agents get | Without it |
+|---|---|---|---|
+| Email | Any mailbox with SMTP + IMAP (Gmail with an app password, Zoho, Fastmail…) | `send_email`, `check_inbox`; inbound mail becomes support tasks | Sales and support write drafts only |
+| Website and signups | Netlify personal access token | `deploy_site` publishes `site/`; `list_signups` pulls Netlify Forms submissions into the contacts book | The site still previews locally at `/preview/<company>/` |
+| Payments | Stripe (use a restricted, read-only key), Lemon Squeezy, Gumroad | `payments_summary` (balance, sales, refunds, fees, subscriptions, MRR) and `sync_payments` (every transaction into the money book, idempotent); a daily "Payments sync" duty for the finance agent | The finance agent records what you tell it |
+| Analytics | Plausible, GoatCounter | `site_stats`: visitors, pageviews, top pages and sources, recorded as metrics | Reports say "no data" instead of guessing |
+| Social | X, Bluesky, Mastodon, LinkedIn, or a webhook (Zapier, Make, n8n, Discord…) for anything else | Approved posts are published directly, with the link back in your inbox | You get a one-click "post on X" link with the text filled in |
+| Scheduling | Cal.com | `list_bookings` shows upcoming meetings to sales and success agents | |
+| Domains | Public RDAP data, no account | `check_domain` tells the CEO and legal whether a name is taken | |
+| Search | DuckDuckGo works with no key. For heavy use, run SearXNG locally or add a Brave Search API key in Settings. Optional: `pip install ddgs` makes DuckDuckGo searches more reliable. | `web_search`, `fetch_url` | |
+| Notifications (global, in Settings) | A Slack or Discord webhook, a Telegram bot, or an ntfy topic | You get pinged for approval requests, agent reports and errors | You check the dashboard |
+
+Recurring duties that need a connector (support's inbox sweep, the finance agent's payments sync, the lifecycle
+marketer's signup import) only start once it is connected.
 
 ## How it works
 
@@ -160,16 +182,18 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
              idle agents pick up tasks ◄───────────────────┘
                       │
                       ▼
-   agent session: system prompt (role, charter, standing orders, memory, metrics)
+   agent session: system prompt (role, charter, standing orders, the ledger, metrics, connected services)
                   → model calls tools → results → … → finish
                       │
-     files in the company folder · memory · new tasks · requests in your inbox
+     files in the company folder · the shared ledger · new tasks · requests in your inbox
 ```
 
 - **Standing orders** (company Settings) are injected into every agent's every session: brand rules,
   things to avoid, priorities.
-- **Memory**: agents save facts, decisions and lessons. Your approvals, rejections and answers are saved
-  too, so agents learn what you accept. Pin notes that must never be forgotten.
+- **The ledger**: agents save facts, decisions, contacts, transactions, metrics and lessons to one shared,
+  append-only ledger, and every finished task leaves a handoff report there. Your approvals, rejections and answers
+  are recorded as decisions too, so agents learn what you accept. Pin notes that must never be forgotten.
+  See [docs/LEDGER.md](docs/LEDGER.md).
 - **Approval policies**: per action type, globally and per company: *Ask me first* (default),
   *Let agents do it*, or *Never allow*. Purchases are always *Ask me first*.
 
@@ -179,7 +203,9 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - Agent-built web pages are served sandboxed so they can't control the dashboard.
 - **Run code** really runs Python or shell commands on your PC (inside the company's folder, with a time
   limit, but not in a sandbox). Leave it on *Ask me first* unless you're comfortable with that.
-- Passwords and tokens you enter are stored in plain text in `data/holdco.db` on your PC. Protect that folder.
+- Passwords, tokens and connector keys you enter are stored in plain text in `data/holdco.db` on your PC. Protect
+  that folder, and use the least-privileged key a service offers (a Stripe *restricted* key with read access, a
+  Bluesky app password, a Gmail app password).
 - You are the owner of these companies. Laws about marketing email (CAN-SPAM, GDPR), business registration,
   taxes and refunds apply to you, not the AI. Review outreach before you approve it.
 
@@ -204,6 +230,9 @@ company under `data/companies/`. Back it up by copying the folder. Deleted compa
   For models without native tool calling, set *Tool calling* to *Prompt-based*.
 - **Port 8420 in use**: Holdco is probably already running; open <http://127.0.0.1:8420>, or start with `--port 8421`.
 - **Search returns nothing**: DuckDuckGo may be rate-limiting you. Install `ddgs`, or switch to SearXNG or Brave.
+- **A connector test fails**: the message quotes the service's reply (usually a wrong or under-privileged key).
+  For Stripe, the restricted key needs read access to Balance, Charges, Balance transactions and Subscriptions.
+  For X, the app needs read *and write* permissions and user access tokens generated after that change.
 
 ## Running the tests
 
@@ -211,12 +240,15 @@ company under `data/companies/`. Back it up by copying the folder. Deleted compa
 python -m unittest discover -s tests -t . -v
 ```
 
-No GPU or model needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the OpenAI-compatible
-API) so the whole app runs end to end. The suite covers the quality checks, the model client, preset
-integrity, file and network safety, tools and approvals, and a full run of the real server: founding from a
-template, the 24/7 scheduler, approvals, chat, QA review with the deliverable check, recurring duties, restart
-recovery, the prompt-based tool fallback, the OpenAI-compatible backend, pausing and deletion. GitHub Actions
-runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
+No GPU, model or accounts needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the
+OpenAI-compatible API) and `tests/fake_apis.py` imitates every outside service (Stripe, Lemon Squeezy, Gumroad,
+Plausible, GoatCounter, Netlify, X, Bluesky, Mastodon, LinkedIn, Cal.com, RDAP, Telegram, ntfy, webhooks), so the
+whole app runs end to end. The suite covers the quality checks, the model client, preset integrity, file and
+network safety, tools and approvals, the ledger (typed books, history, dedup, export, upgrade from older
+databases), every connector, and a full run of the real server: founding from a template, the 24/7 scheduler,
+approvals, chat, QA review with the deliverable check, recurring duties, restart recovery, the prompt-based tool
+fallback, the OpenAI-compatible backend, pausing, deletion, the ledger API and connectors. GitHub Actions runs it
+on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
 
 To click around the dashboard without a GPU, run `python tests/fake_ollama.py 11999`, start Holdco, and set the
 server address in Settings to `http://127.0.0.1:11999`.
@@ -229,6 +261,9 @@ autostart.py        start-at-login / systemd service helper
 holdco/
   agents.py         agent loop, prompts, founding, chat, idea generation
   presets.py        the agent library: 19 roles and 6 team templates
+  ledger.py         the shared ledger: append-only books (facts, decisions, contacts, money, metrics, handoffs)
+  connectors.py     Stripe, Lemon Squeezy, Gumroad, Plausible, GoatCounter, Netlify Forms, X, Bluesky, Mastodon,
+                    LinkedIn, Cal.com, RDAP, owner notifications (Slack/Discord/Telegram/ntfy)
   checks.py         audit_page, check_contrast and review_text
   tools.py          every tool agents can call
   actions.py        approval inbox and outbound actions (email, posts, deploys, code, purchases)
@@ -237,5 +272,6 @@ holdco/
   roles.py          maps agents to presets and tool belts
   web.py, emailer.py, workspace.py, db.py, bus.py, server.py, config.py
   static/           the dashboard (plain HTML, CSS and JavaScript)
-tests/              unit and end-to-end tests, plus the fake model server
+docs/LEDGER.md      how the ledger works and why
+tests/              unit and end-to-end tests, the fake model server and the fake outside-service server
 ```

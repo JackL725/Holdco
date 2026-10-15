@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from . import bus, db, emailer, web, workspace
+from . import bus, connectors, db, emailer, ledger, web, workspace
 
 ACTION_LABELS = {
     "send_email": "Send email",
@@ -79,6 +79,8 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     verb = "asked the owner" if action == "question" else "requested approval"
     bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
     bus.notify("approvals")
+    connectors.notify("approvals", f"{company['name']}: {agent['name']} {'has a question' if action == 'question' else 'needs your OK'}",
+                      f"#{aid} {ACTION_LABELS.get(action, action)}: {summary}")
     if action == "question":
         return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
                 f"without it, finish with status 'waiting'.")
@@ -120,8 +122,22 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
 
     db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
               feedback=feedback, summary=_summary(row["action"], p) if row["action"] != "question" else row["summary"])
-    db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
-           (company["id"], row["agent_id"], "decision", note, 0, ts))
+    # The owner's call goes into the ledger's decisions book, so every agent learns from it.
+    if row["action"] == "question":
+        title, decided = f"Owner's answer: {(p.get('question') or '')[:110]}", result
+    else:
+        title = f"{label}: {_summary(row['action'], p)[:120]}"
+        decided = {"done": "Approved", "failed": "Approved, but it failed", "rejected": "Rejected"}.get(status, status)
+        if status == "done" and result:
+            decided += f". {result[:300]}"
+        elif status == "failed":
+            decided += f": {result[:300]}"
+    try:
+        ledger.decision(company["id"], title, decided, why=feedback if row["action"] != "question" else "", by="owner",
+                        agent_id=None, source="owner")
+        ledger.render(company, "decisions")
+    except Exception:
+        pass
     if row["task_id"]:
         t = db.get_task(row["task_id"])
         if t and t["status"] in ("waiting", "blocked"):
@@ -181,16 +197,15 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float
 
 def _social(company: dict, p: dict) -> str:
     cs = db.company_settings(company)
-    content = p.get("content", "")
-    if cs.get("webhook_url"):
-        status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
-                                                      "platform": p.get("platform", ""), "content": content,
-                                                      "link": p.get("link", "")})
-        if status >= 400:
-            raise RuntimeError(f"Webhook returned HTTP {status}: {text[:300]}")
-        return f"Sent to the posting webhook (HTTP {status})."
-    intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": content[:280]})
-    return f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+    content, platform, link = p.get("content", ""), p.get("platform", ""), p.get("link", "")
+    if connectors.social_provider(cs, platform):
+        try:
+            return connectors.social_post(cs, company["name"], platform, content, link)
+        except connectors.ConnectorError as e:
+            raise RuntimeError(str(e)) from None
+    intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": (content + ("\n" + link if link else ""))[:280]})
+    return (f"Approved. No connector can post to {platform or 'that platform'} yet (add one on the Connectors tab), so the owner "
+            f"posts it by hand. One-click X link: {intent}")
 
 
 def _http(p: dict) -> str:
@@ -224,8 +239,9 @@ def _deploy_netlify(company: dict) -> str:
                 z.write(f, f.relative_to(site_dir).as_posix())
     auth = {"Authorization": f"Bearer {token}", "User-Agent": web.UA}
     site_id = cs.get("netlify_site_id")
+    api = connectors.base("netlify")
     if not site_id:
-        status, text = _post_json("https://api.netlify.com/api/v1/sites", {"name": f"{company['slug']}-{int(time.time()) % 100000}"}, auth)
+        status, text = _post_json(f"{api}/api/v1/sites", {"name": f"{company['slug']}-{int(time.time()) % 100000}"}, auth)
         if status >= 400:
             raise RuntimeError(f"Netlify couldn't create a site: HTTP {status} {text[:300]}")
         site = json.loads(text)
@@ -233,7 +249,7 @@ def _deploy_netlify(company: dict) -> str:
         cs["netlify_site_id"] = site_id
         cs["site_url"] = site.get("ssl_url") or site.get("url", "")
         db.update("companies", company["id"], settings=json.dumps(cs))
-    req = urllib.request.Request(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
+    req = urllib.request.Request(f"{api}/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
                                  method="POST", headers={**auth, "Content-Type": "application/zip"})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:

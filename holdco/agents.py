@@ -6,7 +6,7 @@ import json
 import threading
 import traceback
 
-from . import bus, config, db, llm, presets, roles, tools, workspace
+from . import bus, config, connectors, db, ledger, llm, presets, roles, tools, workspace
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
@@ -34,18 +34,34 @@ def _team_text(company_id: int) -> str:
     return "\n".join(out)
 
 
-def _memory_text(company_id: int) -> str:
-    pinned = db.q("SELECT * FROM memory WHERE company_id=? AND pinned=1 ORDER BY id DESC LIMIT 15", (company_id,))
-    recent = db.q("SELECT * FROM memory WHERE company_id=? AND pinned=0 ORDER BY id DESC LIMIT 14", (company_id,))
-    lines = [f"- (pinned) {m['content'][:400]}" for m in pinned]
-    lines += [f"- [{m['kind']}] {m['content'][:300]}" for m in reversed(recent)]
-    return "\n".join(lines) or "(nothing yet)"
+def _ledger_text(company_id: int) -> str:
+    return ledger.overview_text(company_id)
 
 
 def _metrics_text(company_id: int) -> str:
-    rows = db.q("SELECT name, value, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                "WHERE company_id=? GROUP BY name) ORDER BY name", (company_id,))
-    return "\n".join(f"- {r['name']}: {r['value']:g} (as of {r['created_at'][:10]})" for r in rows) or "(none recorded)"
+    rows = ledger.latest_metrics(company_id)
+    return "\n".join(f"- {r['name']}: {float(r['value']):g} (as of {r['created_at'][:10]})" for r in rows) or "(none recorded)"
+
+
+def _connectors_text(cs: dict) -> str:
+    caps = connectors.capabilities(cs)
+    have = []
+    if "smtp" in caps:
+        have.append("email sending" + (" and receiving" if "imap" in caps else ""))
+    if "deploy" in caps:
+        have.append("website publishing")
+    if "forms" in caps:
+        have.append("website signups (list_signups)")
+    if "payments" in caps:
+        have.append(f"payments via {config.CONNECTORS[connectors.provider_for(cs, 'payments')]['label']} (payments_summary, sync_payments)")
+    if "analytics" in caps:
+        have.append("site analytics (site_stats)")
+    socials = [c.split(":")[1] for c in caps if c.startswith("social:")]
+    if socials:
+        have.append("direct posting to " + ", ".join(s for s in socials if s != "webhook") + (" and a posting webhook" if "webhook" in socials else ""))
+    if "calendar" in caps:
+        have.append("meeting bookings (list_bookings)")
+    return ", ".join(have) if have else "none yet (email, payments, analytics and social accounts can be added by the owner on the Connectors tab)"
 
 
 def _shared_rules(kind: str, max_steps: int) -> str:
@@ -95,8 +111,12 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int) -> str:
         f"Stage: {company.get('stage') or 'idea'}\nOriginal idea: {(company.get('idea') or '')[:600]}\n\n"
         f"Charter:\n{charter or '(not written yet)'}",
         "# Team (assign tasks by role)\n" + _team_text(company["id"]),
-        "# Shared memory (notes, decisions, owner answers)\n" + _memory_text(company["id"]),
-        "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}",
+        "# Shared ledger (the team's source of truth: notes, facts, decisions, contacts, money, metrics, task handoffs)\n"
+        "Write to it with remember, record_fact, record_decision, save_contact, record_transaction and record_metric; search it "
+        "with recall. Entries are never deleted, only superseded, so record corrections rather than silently changing things.\n"
+        + _ledger_text(company["id"]),
+        "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}\n"
+        f"Connected services: {_connectors_text(cs)}",
     ]
     return "\n\n".join(parts)
 
@@ -432,6 +452,15 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
                 if ctx.deliverable and not t.get("deliverable"):
                     fields["deliverable"] = ctx.deliverable[:200]
                 db.update("tasks", t["id"], **fields)
+                if ctx.finished and ctx.finish_fields:
+                    # The structured handoff goes into the ledger so teammates can find what happened to any task.
+                    try:
+                        f = ctx.finish_fields
+                        ledger.handoff(cid, t, agent, ctx.finish_status, f.get("summary", ""), f.get("deliverable", ""),
+                                       f.get("evidence", ""), f.get("open_issues", ""), f.get("next_step", ""))
+                        ledger.render(company, "handoffs")
+                    except Exception:
+                        traceback.print_exc()
             bus.notify("tasks", company_id=cid)
         if kind == "founding":
             c = db.get_company(cid)
@@ -453,6 +482,7 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
                   finished_at=ts)
         if status == "error":
             bus.emit(cid, "error", f"{agent['name']} hit an error: {error}", aid, {"run_id": run_id})
+            connectors.notify("errors", f"{company['name']}: {agent['name']} hit an error", error[:500])
         elif kind != "chat":
             short = summary
             if short.startswith("Status:"):

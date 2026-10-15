@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import actions, bus, checks, db, presets, roles, web, workspace
+from . import actions, bus, checks, connectors, db, ledger, presets, roles, web, workspace
 
 MAX_RESULT = 7000
 OPEN_STATUSES = ("todo", "in_progress", "blocked", "waiting")
@@ -34,6 +34,7 @@ class Ctx:
     finish_warned: bool = False
     deliverable: str = ""
     written: set = field(default_factory=set)   # files written in this session
+    finish_fields: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -328,48 +329,244 @@ def list_tasks(ctx: Ctx, status: str = "open") -> str:
                      + (f" | {t['result'][-160:]}" if t["result"] else "") for t in rows)
 
 
-# ======================= memory & metrics =======================
+# ======================= the shared ledger =======================
 
-@tool("remember", "Save a fact, decision or lesson to the company's shared memory.",
+def _ledger_saved(ctx: Ctx, book: str) -> None:
+    """After a ledger write: refresh the book's file in the company folder and tell the dashboard."""
+    try:
+        ctx.written.add(ledger.render(ctx.company, book))
+    except Exception:
+        pass
+    bus.notify("ledger", company_id=ctx.company["id"], book=book)
+
+
+def _ledger_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ledger.LedgerError as e:
+        raise ToolError(str(e)) from None
+
+
+@tool("remember", "Save a fact, decision, lesson or note to the shared ledger, where every teammate can find it.",
       {"content": S("What to remember (one clear statement)"),
        "kind": S("fact, decision, lesson, contact or note"),
        "pin": {"type": "boolean", "description": "Pin it so every agent always sees it (use sparingly)"}},
       ("content",))
 def remember(ctx: Ctx, content: str, kind: str = "note", pin: bool = False) -> str:
-    mid = db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
-                 (ctx.company["id"], ctx.agent["id"], (kind or "note")[:20], content[:2000], int(bool(pin)), db.now()))
+    kind = (kind or "note").strip().lower()
+    if kind == "decision":
+        title = re.split(r"[.:;\n]", content.strip(), maxsplit=1)[0][:120]
+        e = _ledger_call(ledger.decision, ctx.company["id"], title, content, by=ctx.agent["name"], agent_id=ctx.agent["id"])
+        book = "decisions"
+    else:
+        e = _ledger_call(ledger.note, ctx.company["id"], content, kind, pin, ctx.agent["id"])
+        book = "notes"
+    _ledger_saved(ctx, book)
     _log(ctx, "memory", f"noted: {content[:140]}")
-    return f"Saved to memory (#{mid})."
+    return f"Saved to the ledger ({book} #{e['id']})."
 
 
-@tool("recall", "Search the company's shared memory.", {"query": S("Words to look for")}, ("query",))
-def recall(ctx: Ctx, query: str) -> str:
-    rows = []
-    if db.HAS_FTS:
-        terms = " OR ".join(f'"{w}"' for w in re.findall(r"\w+", query)[:8])
-        if terms:
-            try:
-                rows = db.q("SELECT m.* FROM memory_fts f JOIN memory m ON m.id=f.rowid WHERE memory_fts MATCH ? "
-                            "AND m.company_id=? ORDER BY rank LIMIT 15", (terms, ctx.company["id"]))
-            except Exception:
-                rows = []
-    if not rows:
-        rows = db.q("SELECT * FROM memory WHERE company_id=? AND content LIKE ? ORDER BY id DESC LIMIT 15",
-                    (ctx.company["id"], f"%{query}%"))
-    if not rows:
-        return "Nothing found."
-    return "\n".join(f"- [{m['kind']}] {m['content']}" for m in rows)
+@tool("recall", "Search the shared ledger, or list one of its books: notes, facts, decisions, contacts, money, metrics or handoffs.",
+      {"query": S("Words to look for (leave empty to list a whole book)"),
+       "book": S("notes, facts, decisions, contacts, money, metrics or handoffs; empty = everything"),
+       "key": S("Optional: a fact key, metric name, contact email or task number to see its full history")}, ())
+def recall(ctx: Ctx, query: str = "", book: str = "", key: str = "") -> str:
+    return _ledger_call(ledger.text, ctx.company["id"], book, query, key)
 
 
-@tool("record_metric", "Record a KPI value (e.g. visitors, signups, revenue_usd, emails_sent, leads).",
+@tool("record_fact", "Save a durable fact as key = value in the ledger (prices, URLs, accounts, policies, market numbers). "
+                     "Writing the same key again replaces the value; the history is kept.",
+      {"key": S("Short dotted key, e.g. pricing.pro_usd, site.url, policy.refund_days, market.size_usd"),
+       "value": S("The value"), "source": S("Where it came from: a URL, a file, or 'owner'")}, ("key", "value"))
+def record_fact(ctx: Ctx, key: str, value: str, source: str = "") -> str:
+    e = _ledger_call(ledger.fact, ctx.company["id"], key, value, source, ctx.agent["id"])
+    _ledger_saved(ctx, "facts")
+    _log(ctx, "ledger", f"recorded fact {e['data']['key']} = {str(e['data']['value'])[:80]}")
+    return {"created": "Saved", "updated": "Updated", "unchanged": "Already recorded"}[e["action"]] + f": {e['summary'][:200]}"
+
+
+@tool("record_decision", "Record a decision in the ledger: what was decided, why, and what else was considered.",
+      {"title": S("Short name for the decision, e.g. 'Pricing: single $29 plan'"),
+       "decision": S("What was decided, in one or two sentences"), "why": S("The reasoning and evidence"),
+       "options": S("Other options considered and why they lost"),
+       "reversible": {"type": "boolean", "description": "Can it be undone cheaply? (default true)"}}, ("title", "decision"))
+def record_decision(ctx: Ctx, title: str, decision: str, why: str = "", options: str = "", reversible: bool = True) -> str:
+    e = _ledger_call(ledger.decision, ctx.company["id"], title, decision, why, options, reversible, ctx.agent["name"], ctx.agent["id"])
+    _ledger_saved(ctx, "decisions")
+    _log(ctx, "ledger", f"recorded decision: {e['data']['title']}")
+    return f"Recorded decision #{e['id']}: {e['data']['title']}."
+
+
+@tool("save_contact", "Add or update a lead, customer or partner in the ledger's contacts book (one entry per email address).",
+      {"email": S("Email address (the identity of the contact)"), "name": S("Full name"), "company": S("Their company"),
+       "role": S("Their job title"),
+       "stage": S("new, contacted, replied, qualified, meeting, proposal, customer, churned, lost or do_not_contact"),
+       "source": S("Where you found them (URL) or how they reached us"), "notes": S("One line of context: trigger, objection, next step")},
+      ("email",))
+def save_contact(ctx: Ctx, email: str, name: str = "", company: str = "", role: str = "", stage: str = "", source: str = "",
+                 notes: str = "") -> str:
+    e = _ledger_call(ledger.contact, ctx.company["id"], email, name, company, role, stage, source, notes, agent_id=ctx.agent["id"])
+    _ledger_saved(ctx, "contacts")
+    _log(ctx, "ledger", f"{'added' if e['action'] == 'created' else 'updated'} contact {e['data'].get('email') or e['data'].get('name')}")
+    return {"created": "Added", "updated": "Updated", "unchanged": "Already up to date"}[e["action"]] + f": {e['summary'][:240]}"
+
+
+@tool("record_transaction", "Record money in or out in the ledger's money book, one entry per transaction.",
+      {"date": S("YYYY-MM-DD"), "amount": {"type": "number", "description": "Positive amount"},
+       "currency": S("USD, EUR, GBP... (default USD)"), "direction": S("in (money received) or out (money paid)"),
+       "category": S(", ".join(ledger.CATEGORIES)), "counterparty": S("Who paid or was paid"),
+       "description": S("What it was for"), "external_id": S("Id from the payment provider, bank or invoice, if any")},
+      ("date", "amount", "category"))
+def record_transaction(ctx: Ctx, date: str, amount: float, category: str, currency: str = "USD", direction: str = "",
+                       counterparty: str = "", description: str = "", external_id: str = "") -> str:
+    e = _ledger_call(ledger.transaction, ctx.company["id"], date, amount, currency, direction, category, counterparty,
+                     description, external_id, "", ctx.agent["id"])
+    _ledger_saved(ctx, "transactions")
+    _log(ctx, "ledger", f"recorded {e['summary'][:120]}")
+    if e["action"] == "unchanged":
+        return f"That transaction is already in the ledger (#{e['id']}). Not recorded twice."
+    return f"Recorded in the money book (#{e['id']}): {e['summary'][:200]}"
+
+
+@tool("record_metric", "Record a KPI reading in the ledger (e.g. visitors_7d, signups, revenue_usd, emails_sent, leads).",
       {"name": S("Metric name, snake_case"), "value": {"type": "number", "description": "The value"},
        "note": S("Where the number came from")}, ("name", "value"))
 def record_metric(ctx: Ctx, name: str, value: float, note: str = "") -> str:
-    name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")[:40]
-    db.run("INSERT INTO metrics(company_id, agent_id, name, value, note, created_at) VALUES(?,?,?,?,?,?)",
-           (ctx.company["id"], ctx.agent["id"], name, value, note[:300], db.now()))
-    _log(ctx, "metric", f"recorded {name} = {value:g}")
-    return f"Recorded {name} = {value:g}."
+    e = _ledger_call(ledger.metric, ctx.company["id"], name, value, note, agent_id=ctx.agent["id"])
+    _ledger_saved(ctx, "metrics")
+    _log(ctx, "metric", f"recorded {e['data']['name']} = {value:g}")
+    return f"Recorded {e['data']['name']} = {value:g}."
+
+
+# ======================= connectors =======================
+
+def _cs(ctx: Ctx) -> dict:
+    return db.company_settings(db.get_company(ctx.company["id"]) or ctx.company)
+
+
+def _connector_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except connectors.ConnectorError as e:
+        raise ToolError(str(e)) from None
+
+
+def _cur_name(name: str, currency: str) -> str:
+    return f"{name}_{(currency or 'usd').lower()}"
+
+
+@tool("payments_summary", "Balance, sales, refunds, fees, active subscriptions and MRR from the connected payment provider "
+                          "(Stripe, Lemon Squeezy or Gumroad). Also records the mrr and balance metrics.",
+      {"days": I("Look back this many days (default 30)")})
+def payments_summary(ctx: Ctx, days: int = 30) -> str:
+    days = max(1, min(int(days or 30), 365))
+    s = _connector_call(connectors.payments_summary, _cs(ctx), days)
+    _log(ctx, "tool", f"checked payments ({s['provider']}, last {days} days)")
+    cid, aid = ctx.company["id"], ctx.agent["id"]
+    if s.get("mrr") is not None:
+        ledger.metric(cid, _cur_name("mrr", s["currency"]), round(s["mrr"], 2), f"{s['provider']}: {s['subscriptions_active']} active subscriptions", agent_id=aid)
+    if s.get("balance_available") is not None:
+        ledger.metric(cid, _cur_name("balance", s["currency"]), round(s["balance_available"], 2), f"{s['provider']} available balance", agent_id=aid)
+    _ledger_saved(ctx, "metrics")
+    return connectors.payments_text(s) + "\nUse sync_payments to bring these into the ledger's money book."
+
+
+@tool("sync_payments", "Pull charges, refunds and fees from the connected payment provider into the ledger's money book. "
+                       "Safe to run repeatedly: nothing is recorded twice.",
+      {"days": I("Look back this many days (default 30)")})
+def sync_payments(ctx: Ctx, days: int = 30) -> str:
+    days = max(1, min(int(days or 30), 365))
+    cs = _cs(ctx)
+    rows = _connector_call(connectors.payments_transactions, cs, days)
+    provider = connectors.payments_provider(cs) or "payments"
+    cid, aid = ctx.company["id"], ctx.agent["id"]
+    created = 0
+    for r in rows:
+        e = ledger.transaction(cid, r["date"], r["amount"], r["currency"], r["direction"], r["category"], r["counterparty"],
+                               r["description"], r["external_id"], r["provider"], aid, source=r["provider"])
+        created += e["action"] != "unchanged"
+    cur = rows[0]["currency"] if rows else "USD"
+    revenue = sum(r["amount"] for r in rows if r["category"] == "revenue")
+    refunds = sum(r["amount"] for r in rows if r["category"] == "refunds" and r["direction"] == "out")
+    fees = sum(r["amount"] for r in rows if r["category"] == "fees" and r["direction"] == "out")
+    ledger.metric(cid, _cur_name(f"revenue_{days}d", cur), round(revenue, 2), f"{provider} gross sales, last {days} days", agent_id=aid)
+    _ledger_saved(ctx, "transactions")
+    _ledger_saved(ctx, "metrics")
+    _log(ctx, "ledger", f"synced {len(rows)} payment entries from {provider} ({created} new)")
+    return (f"Synced {len(rows)} entries from {provider}: {created} new, {len(rows) - created} already in the ledger. Last {days} "
+            f"days: revenue {revenue:,.2f} {cur}, refunds {refunds:,.2f} {cur}, fees {fees:,.2f} {cur}. "
+            f"See the money book with recall(book='money') or ledger/transactions.csv.")
+
+
+@tool("site_stats", "Visitors, visits, pageviews, top pages and top sources from the connected analytics (Plausible or "
+                    "GoatCounter). Also records the visitors and pageviews metrics.",
+      {"period": S("7d (default), 30d, month, 6mo or 12mo")})
+def site_stats(ctx: Ctx, period: str = "7d") -> str:
+    period = (period or "7d").strip().lower()
+    s = _connector_call(connectors.site_stats, _cs(ctx), period)
+    _log(ctx, "tool", f"checked site analytics ({s['provider']}, {s['period']})")
+    cid, aid = ctx.company["id"], ctx.agent["id"]
+    ledger.metric(cid, f"visitors_{s['period']}", s["visitors"], f"{s['provider']}", agent_id=aid)
+    ledger.metric(cid, f"pageviews_{s['period']}", s["pageviews"], f"{s['provider']}", agent_id=aid)
+    _ledger_saved(ctx, "metrics")
+    return connectors.stats_text(s)
+
+
+@tool("list_signups", "Recent form submissions from the website (waitlist, contact form) via Netlify Forms. New ones are "
+                      "added to the ledger's contacts book.",
+      {"limit": I("How many to fetch (default 50, max 100)")})
+def list_signups(ctx: Ctx, limit: int = 50) -> str:
+    limit = max(1, min(int(limit or 50), 100))
+    subs = _connector_call(connectors.netlify_submissions, _cs(ctx), limit)
+    cid, aid = ctx.company["id"], ctx.agent["id"]
+    added = 0
+    for s in subs:
+        if not s["email"]:
+            continue
+        extra = "; ".join(f"{k}: {v[:80]}" for k, v in list(s["fields"].items())[:4])
+        try:
+            e = ledger.contact(cid, s["email"], s["name"], source_note=f"website form '{s['form']}'", notes=extra, agent_id=aid,
+                               source="netlify")
+        except ledger.LedgerError:
+            continue
+        added += e["action"] == "created"
+    if len(subs) < limit:
+        ledger.metric(cid, "signups_total", len(subs), "Netlify form submissions", agent_id=aid)
+    _ledger_saved(ctx, "contacts")
+    _ledger_saved(ctx, "metrics")
+    _log(ctx, "tool", f"read {len(subs)} form submissions ({added} new contacts)")
+    if not subs:
+        return "No form submissions yet."
+    lines = [f"{len(subs)} submissions ({added} new contacts added to the ledger). Newest first:"]
+    for s in subs[:25]:
+        bits = ", ".join(f"{k}: {v[:60]}" for k, v in list(s["fields"].items())[:3])
+        lines.append(f"- {s['created_at'][:10]} {s['name'] or ''} {s['email'] or '(no email)'} [{s['form']}]" + (f" {bits}" if bits else ""))
+    return "\n".join(lines)
+
+
+@tool("check_domain", "Check whether a domain name is already registered (public RDAP data; no account needed).",
+      {"domain": S("A domain name like pawplan.com")}, ("domain",))
+def check_domain(ctx: Ctx, domain: str) -> str:
+    r = _connector_call(connectors.domain_check, domain)
+    _log(ctx, "tool", f"checked domain {r['domain']}")
+    if r["registered"] is False:
+        return f"{r['domain']}: not registered. {r['note']}"
+    if r["registered"] is None:
+        return f"{r['domain']}: unknown. {r['note']}"
+    return (f"{r['domain']}: registered" + (f" via {r['registrar']}" if r.get("registrar") else "")
+            + (f" since {r['registered_on']}" if r.get("registered_on") else "") + (f", expires {r['expires']}" if r.get("expires") else "")
+            + ". Pick another name or a different ending.")
+
+
+@tool("list_bookings", "Upcoming meetings booked through the connected scheduling tool (Cal.com).",
+      {"limit": I("How many (default 20)")})
+def list_bookings(ctx: Ctx, limit: int = 20) -> str:
+    rows = _connector_call(connectors.calcom_bookings, _cs(ctx), limit)
+    _log(ctx, "tool", f"checked upcoming bookings ({len(rows)})")
+    if not rows:
+        return "No upcoming bookings."
+    return "\n".join(f"- {b['start'][:16].replace('T', ' ')} {b['title']} with {', '.join(b['attendees']) or '?'}"
+                      + (f" ({b['location']})" if b["location"] else "") for b in rows)
 
 
 # ======================= owner =======================
@@ -381,6 +578,8 @@ def report_to_owner(ctx: Ctx, message: str) -> str:
            (ctx.company["id"], ctx.agent["id"], "agent", message, db.now()))
     _log(ctx, "message", f"messaged the owner: {message[:160]}")
     bus.notify("messages", company_id=ctx.company["id"])
+    if ctx.kind != "chat":
+        connectors.notify("messages", f"{ctx.agent['name']} at {ctx.company['name']}", message)
     if ctx.kind == "chat":
         ctx.reply = message
         ctx.reply_sent = True
@@ -655,6 +854,8 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     ctx.finish_status = status
     ctx.finish_summary = "\n".join(parts)
     ctx.deliverable = target
+    ctx.finish_fields = {"summary": summary.strip(), "deliverable": target, "evidence": evidence, "open_issues": open_issues,
+                         "next_step": next_step}
     return "Session ended."
 
 
