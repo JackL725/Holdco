@@ -439,6 +439,11 @@ class _StdioTransport:
 
     def _gone(self, what: str) -> MCPError:
         code = self.proc.poll() if self.proc else None
+        if code is None and self.proc is not None and (self._dead or what.startswith("the server process")):
+            try:   # the pipe closed first; on Windows the exit code arrives a moment later
+                code = self.proc.wait(timeout=2)
+            except Exception:
+                code = None
         state = f"the server process exited (code {code})" if code is not None else what
         tail = self.stderr_tail()
         return MCPError(f"{self.name}: {state}." + (f" Its last output:\n{tail}" if tail else ""))
