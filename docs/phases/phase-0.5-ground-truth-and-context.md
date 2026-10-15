@@ -1,6 +1,6 @@
 # Phase 0.5: Ground truth and context
 
-Status: design, built after Phase 0 and before Phase 1. Branch `claude/phase-0.5-context`, its own pull request.
+Status: built. Branch `claude/phase-0.5-context`, its own pull request, stacked on Phase 0. Covered by the suite (471 tests, no network or GPU) including a replay of the first run's failures, and re-run on the owner's RTX 5090 with gpt-oss:20b against Rooforyou's exact idea; the pull request has the before-and-after numbers. Differences from this design that the code settled: questions must name the decision and may not ask the owner for work the team can do; fetched pages are searchable (scope `pages`) and readable as `page:<url>`; founding stages must leave their deliverable; the charter source check covers only sections about the world.
 
 This phase fixes what the first two real runs showed, and gives every agent easy access to everything Holdco
 knows: its files, the owner's context files, memory, tasks, emails, decisions, past sessions and the real state
