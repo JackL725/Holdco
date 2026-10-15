@@ -7,18 +7,23 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import io
+import json
 import os
+import re
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-watchdog-")
 
-from holdco import actions, agents, bus, db, doctor, llm, roles, tools, watchdog, workspace  # noqa: E402
+from holdco import (actions, agents, backup, bus, db, doctor, llm, notify, roles, scheduler, tools,  # noqa: E402
+                    watchdog, web, workspace)
+from tests.fake_ollama import FakeModelServer  # noqa: E402
 
 db.init()
 
@@ -65,6 +70,34 @@ def ago(minutes: float) -> str:
 
 def auto_entry(text: str, minutes_ago: float = 5) -> str:
     return f"--- [auto] {ago(minutes_ago)} ---\n{text}"
+
+
+@contextlib.contextmanager
+def scheduler_sandbox(started: list | None = None, found: list | None = None, refreshed: list | None = None):
+    """A Scheduler whose tick has every side effect caught: no run starts, no founding restarts and the Doctor
+    never runs; the lists record what the tick asked for."""
+    started = started if started is not None else []
+    found = found if found is not None else []
+    refreshed = refreshed if refreshed is not None else []
+    def refresh(max_age_minutes=60):
+        refreshed.append(max_age_minutes)
+
+    with mock.patch.object(agents, "start", lambda aid, kind, **kw: started.append((aid, kind)) or True), \
+            mock.patch.object(agents, "found", lambda cid: found.append(cid) or True), \
+            mock.patch.object(doctor, "refresh_if_stale", refresh), \
+            mock.patch.object(watchdog, "tick", lambda: None), \
+            mock.patch.object(backup, "maybe_run", lambda: None), \
+            mock.patch.object(notify, "ensure_poller", lambda: None):
+        yield scheduler.Scheduler()
+
+
+def global_events(message_prefix: str, after_id: int) -> list[dict]:
+    return db.q("SELECT * FROM events WHERE company_id IS NULL AND message LIKE ? AND id>? ORDER BY id",
+                (message_prefix + "%", after_id))
+
+
+def last_event_id() -> int:
+    return db.scalar("SELECT COALESCE(MAX(id), 0) FROM events") or 0
 
 
 class TestNotes(unittest.TestCase):
@@ -167,6 +200,19 @@ class TestRetryGuidance(unittest.TestCase):
     def test_attempt_number_comes_from_the_note(self):
         self.assertTrue(self.guidance(auto_entry("Attempt 4 ended: out_of_steps"), attempts=5).startswith("Attempt 4 "))
 
+    def test_a_stopped_attempt_does_not_hide_the_real_failure(self):
+        # The kill switch (or a pause, or a model outage) stopped attempt 2: that is not the agent's failure, so
+        # the guidance still comes from attempt 1, which really failed.
+        notes = (auto_entry("Attempt 1 ended: partial\nLast tool calls: web_search({\"query\": \"x\"})\n"
+                            "Last error: ERROR: web search is unavailable right now (duckduckgo: blocked)", 30)
+                 + "\n\n" + auto_entry("Attempt 2 ended: stopped (Kill switch: the owner stopped all agents.)", 5))
+        text = self.guidance(notes)
+        self.assertTrue(text.startswith("Attempt 1 failed because web search was unavailable"), text)
+        self.assertIn("fetch_url", text)
+        # Only stopped entries: nothing to learn from, so the generic guidance applies.
+        text = self.guidance(auto_entry("Attempt 1 ended: stopped (Paused by the owner.)"), attempts=2)
+        self.assertIn("it did not finish", text)
+
 
 class TestTaskFailed(unittest.TestCase):
     def setUp(self):
@@ -190,8 +236,11 @@ class TestTaskFailed(unittest.TestCase):
         self.assertEqual(q["task_id"], t["id"])
         ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (self.c["id"],))
         self.assertEqual(q["agent_id"], ceo["id"])
-        self.assertEqual(set(q["p"]), {"question", "options", "recommended", "context", "pattern", "task_id",
+        # Phase 0 fixes: the payload gained "key", the dedupe key, next to the plain pattern name (the UI badge).
+        self.assertEqual(set(q["p"]), {"question", "options", "recommended", "context", "pattern", "key", "task_id",
                                        "company_id"})
+        self.assertEqual(q["p"]["pattern"], "task_failed_twice")
+        self.assertEqual(q["p"]["key"], f"task_failed_twice:{t['id']}")
         self.assertEqual(q["p"]["options"], ["Skip this task", "Retry once more with my note", "Pause the company"])
         self.assertEqual(q["p"]["recommended"], "Skip this task")
         self.assertEqual(q["p"]["company_id"], self.c["id"])
@@ -335,6 +384,54 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(t["attempts"], 2)
         self.assertIn("Owner answered question", t["description"])
 
+    def test_retry_once_more_then_a_second_failure_asks_again(self):
+        t, aid = self.failed_task()
+        actions.decide(aid, "approve", answer="Retry once more with my note")
+        self.assertEqual(db.get_task(t["id"])["attempts"], 0)
+        self.assertTrue(db.loads(db.one("SELECT payload FROM approvals WHERE id=?", (aid,))["payload"])["retried"])
+        # The extra attempt fails twice inside the 6 h quiet window: the owner must still hear about it.
+        db.update("tasks", t["id"], attempts=2)
+        watchdog.task_failed(db.get_task(t["id"]), "Ran out of steps before finishing.", "out_of_steps")
+        qs = questions(self.c["id"], "task_failed_twice")
+        self.assertEqual(len(qs), 2)
+        self.assertEqual(qs[-1]["status"], "pending")
+        self.assertEqual(qs[-1]["p"]["key"], f"task_failed_twice:{t['id']}")
+        self.assertEqual(db.get_task(t["id"])["status"], "blocked")
+        # Answered any other way, the quiet window applies as before.
+        actions.decide(qs[-1]["id"], "approve", answer="Skip this task")
+        db.update("tasks", t["id"], status="todo", attempts=2)
+        watchdog.task_failed(db.get_task(t["id"]), "Ran out of steps before finishing.", "out_of_steps")
+        self.assertEqual(len(questions(self.c["id"], "task_failed_twice")), 2)
+
+    def test_continue_anyway_writes_the_memory_note(self):
+        db.update("companies", self.c["id"], charter="# Charter")
+        watchdog.founding_ended(db.get_company(self.c["id"]), "partial", "")   # the company is already active
+        aid = questions(self.c["id"], "founding_partial")[0]["id"]
+        actions.decide(aid, "approve", answer="Continue anyway")
+        self.assertEqual(db.get_company(self.c["id"])["status"], "active")
+        note = db.one("SELECT * FROM memory WHERE company_id=? AND content='Founding accepted as is by the owner'",
+                      (self.c["id"],))
+        self.assertTrue(note)
+        self.assertEqual(note["kind"], "decision")
+
+    def test_retry_founding_with_a_busy_ceo_keeps_the_company_active(self):
+        watchdog.founding_ended(db.get_company(self.c["id"]), "partial", "")
+        aid = questions(self.c["id"], "founding_partial")[0]["id"]
+        ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (self.c["id"],))
+        with agents._running_lock:
+            agents._running[ceo["id"]] = "cycle"   # the CEO is mid-run, so no founding can start now
+        try:
+            actions.decide(aid, "approve", answer="Retry founding")
+        finally:
+            with agents._running_lock:
+                agents._running.pop(ceo["id"], None)
+        c = db.get_company(self.c["id"])
+        self.assertEqual(c["status"], "active")   # not stuck in "founding" with nothing running
+        self.assertEqual(c["cycle_requested"], 1)
+        self.assertTrue(db.one("SELECT id FROM events WHERE company_id=? AND message LIKE 'The CEO is busy%'",
+                               (self.c["id"],)))
+        self.assertEqual(db.q("SELECT id FROM runs WHERE company_id=? AND kind='founding'", (self.c["id"],)), [])
+
     def test_resolve_never_raises(self):
         watchdog.resolve({"payload": "not json", "company_id": None, "task_id": None}, "Skip this task")
         watchdog.resolve({"payload": '{"options": ["Skip this task"], "company_id": 999999}', "task_id": None},
@@ -380,12 +477,14 @@ class TestTick(unittest.TestCase):
         watchdog._bad_streak.clear()
         watchdog._last_connector_alert.clear()
         watchdog._last_doctor_seen = None
+        web.SEARCH_FAIL_STREAK = 0
 
     def tearDown(self):
         doctor.LAST = self.saved_last
         watchdog._bad_streak.clear()
         watchdog._last_connector_alert.clear()
         watchdog._last_doctor_seen = None
+        web.SEARCH_FAIL_STREAK = 0
 
     def test_repeated_error(self):
         for n in (600, 601):
@@ -526,6 +625,485 @@ class TestTick(unittest.TestCase):
             watchdog.tick()
         self.assertEqual(err.getvalue(), "")   # rows that are not rows are skipped quietly
 
+    def test_search_outage_asks_each_searching_company_once_a_day(self):
+        other = make_company("QuietCo")
+        bus.emit(self.c["id"], "tool", "searched the web for “dog food prices”")
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "connector_down"), [])   # nothing has failed yet
+        web.SEARCH_FAIL_STREAK = 1
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "connector_down"), [])   # one failed search may be a blip
+        web.SEARCH_FAIL_STREAK = 2
+        watchdog.tick()
+        watchdog.tick()
+        qs = questions(self.c["id"], "connector_down")
+        self.assertEqual(len(qs), 1)
+        p = qs[0]["p"]
+        self.assertEqual(p["pattern"], "connector_down")
+        self.assertEqual(p["key"], "connector_down:search")
+        self.assertEqual(p["options"], ["Keep going without it", "Pause the company"])
+        self.assertEqual(p["recommended"], "Keep going without it")
+        self.assertRegex(p["question"],
+                         r"^Web search for WatchCo has failed on every provider \(.+\)\. What should we do\?$")
+        self.assertIn("ddg_html:", p["question"])   # the reasons come from web.PROVIDER_STATUS, provider by provider
+        self.assertIn("Add a search key", p["context"])
+        self.assertEqual(questions(other["id"], "connector_down"), [])   # QuietCo never searched
+        # Answering does not bring it back the same day, even once the 6 h quiet window has passed.
+        actions.decide(qs[0]["id"], "approve", answer="Keep going without it")
+        db.update("approvals", qs[0]["id"], decided_at=ago(7 * 60))
+        watchdog.tick()
+        self.assertEqual(len(questions(self.c["id"], "connector_down")), 1)
+        # A company that searched itself is asked too (QuietCo did, now).
+        watchdog._last_connector_alert.clear()
+        bus.emit(other["id"], "tool", "searched the web for “cafe pantry software”")
+        watchdog.tick()
+        self.assertEqual(len(questions(other["id"], "connector_down")), 1)
+        # When no company searched in the last day, every active company is asked. (Other test modules leave
+        # search events in the shared database, so every one of them is aged out, not only this company's.)
+        third = make_company("NeverSearchedCo")
+        watchdog._last_connector_alert.clear()
+        db.run("UPDATE events SET created_at=? WHERE kind='tool' AND message LIKE 'searched the web%'",
+               (ago(25 * 60),))
+        watchdog.tick()
+        self.assertEqual(len(questions(third["id"], "connector_down")), 1)
+        # A working search clears the counter and the next day starts clean.
+        web.SEARCH_FAIL_STREAK = 0
+        watchdog._last_connector_alert.clear()
+        watchdog.tick()
+        self.assertEqual(len(questions(other["id"], "connector_down")), 1)
+
+    def test_search_outage_from_two_bad_doctor_runs(self):
+        def rows(status, checked):
+            return [{"key": "model_server", "label": "Model server", "status": "ok", "detail": "", "fix": None,
+                     "checked_at": checked},
+                    {"key": "search", "label": "Web search", "status": status, "fix": None, "checked_at": checked,
+                     "detail": "Every search provider failed its last try: ddg_html: blocked (HTTP 202 challenge)"}]
+        bus.emit(self.c["id"], "tool", "searched the web for “x”")
+        doctor.LAST = rows("bad", "2026-10-14T10:00:00Z")
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "connector_down"), [])
+        doctor.LAST = rows("ok", "2026-10-14T11:00:00Z")
+        watchdog.tick()
+        doctor.LAST = rows("bad", "2026-10-14T12:00:00Z")
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "connector_down"), [])   # the ok run reset the streak
+        doctor.LAST = rows("bad", "2026-10-14T13:00:00Z")
+        watchdog.tick()
+        watchdog.tick()
+        qs = questions(self.c["id"], "connector_down")
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["p"]["key"], "connector_down:search")
+        self.assertIn("Web search for WatchCo has failed on every provider", qs[0]["p"]["question"])
+
+    def test_one_model_outage_is_one_question(self):
+        add_task(self.c, "Anything")
+        for _ in range(3):
+            bus.emit(self.c["id"], "error", "Ava hit an error: Can't reach the model server at "
+                     "http://127.0.0.1:11434/api/chat ([Errno 111] Connection refused). Is Ollama running?")
+        bus.emit(self.c["id"], "error", "Ben hit an error: The model server dropped the connection "
+                 "(RemoteDisconnected: Remote end closed connection without response).")
+        bus.emit(self.c["id"], "error", "Ben hit an error: The model server took longer than 600.0s to reply.")
+        bus.emit(self.c["id"], "error", "Ben hit an error: HTTP 503 from model server: overloaded")
+        doctor.LAST = [{"key": "model_server", "label": "Model server", "status": "bad",
+                        "detail": "connection refused on 127.0.0.1:11434", "fix": None, "checked_at": db.now()}]
+        db.run("INSERT INTO runs(company_id, agent_id, kind, status, started_at) VALUES(?,?,?,?,?)",
+               (self.c["id"], None, "task", "error", ago(3 * 60)))
+        watchdog.tick()
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "repeated_error"), [])   # connection errors belong to "stalled"
+        stalled = questions(self.c["id"], "stalled")
+        self.assertEqual(len(stalled), 1)
+        self.assertEqual(stalled[0]["p"]["key"], f"stalled:{self.c['id']}")
+        self.assertEqual(len(questions(self.c["id"])), 1)
+        # Even with the model server reported fine, connection errors never count as a repeated error.
+        doctor.LAST = []
+        watchdog.tick()
+        self.assertEqual(questions(self.c["id"], "repeated_error"), [])
+
+    def test_a_second_distinct_repeating_error_gets_its_own_question(self):
+        for n in range(3):
+            bus.emit(self.c["id"], "error", f"Ava hit an error: Timed out after {600 + n}s on task #{n}")
+        watchdog.tick()
+        first = questions(self.c["id"], "repeated_error")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["p"]["pattern"], "repeated_error")
+        self.assertEqual(first[0]["p"]["key"],
+                         "repeated_error:" + watchdog.error_hash("Timed out after 600s on task #1"))
+        actions.decide(first[0]["id"], "approve", answer="Keep going")
+        for _ in range(3):
+            bus.emit(self.c["id"], "error", "Ava hit an error: Webhook returned HTTP 500: boom")
+        bus.emit(self.c["id"], "error", "Ava hit an error: Timed out after 603s on task #9")   # the newest error
+        watchdog.tick()
+        qs = questions(self.c["id"], "repeated_error")
+        self.assertEqual(len(qs), 2)   # the answered timeout question does not hide the webhook problem
+        self.assertNotEqual(qs[0]["p"]["key"], qs[1]["p"]["key"])
+        self.assertIn("Webhook returned HTTP 500", qs[1]["p"]["question"])
+        watchdog.tick()
+        self.assertEqual(len(questions(self.c["id"], "repeated_error")), 2)   # neither is asked twice
+
+    def test_task_bouncing_does_not_touch_a_task_in_progress(self):
+        running = add_task(self.c, "Write FAQ", role="marketing", status="in_progress", reassigned=3)
+        queued = add_task(self.c, "Write terms", role="marketing", status="todo", reassigned=3)
+        watchdog.tick()
+        # The running task keeps its status, so agents._finalize can still record how that run ended.
+        self.assertEqual(db.get_task(running["id"])["status"], "in_progress")
+        self.assertEqual(db.get_task(queued["id"])["status"], "blocked")
+        qs = questions(self.c["id"], "task_bouncing")
+        self.assertEqual({q["task_id"] for q in qs}, {running["id"], queued["id"]})
+        self.assertEqual({q["p"]["key"] for q in qs},
+                         {f"task_bouncing:{running['id']}", f"task_bouncing:{queued['id']}"})
+        watchdog.tick()
+        self.assertEqual(len(questions(self.c["id"], "task_bouncing")), 2)
+
+
+class TestModelOutage(unittest.TestCase):
+    """A model server that cannot be reached neither burns task attempts nor floods the owner: the attempt is
+    given back and the scheduler waits for the Doctor to see the server again."""
+
+    def setUp(self):
+        self.c = make_company()
+        db.set_settings({"max_task_attempts": 2, "scheduler_enabled": True, "kill_switch": False})
+        self.agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='marketing'", (self.c["id"],))
+        self.task = add_task(self.c, "Draft positioning", role="marketing", attempts=0)
+        self.saved_last = doctor.LAST
+        doctor.LAST = []
+
+    def tearDown(self):
+        doctor.LAST = self.saved_last
+
+    def run_failing(self, text: str) -> dict:
+        def fake_chat(*a, **kw):
+            raise llm.LLMError(text)
+
+        with mock.patch.object(agents.llm, "chat", fake_chat):
+            agents.run(self.agent["id"], "task", task_id=self.task["id"])
+        return db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.agent["id"],))
+
+    def test_connection_errors_give_the_attempt_back(self):
+        texts = ("Can't reach the model server at http://127.0.0.1:11434/api/chat ([Errno 111] Connection refused). "
+                 "Is Ollama running?",
+                 "The model server dropped the connection (RemoteDisconnected: Remote end closed connection).",
+                 "The model server took longer than 600.0s to reply.",
+                 "HTTP 502 from model server: bad gateway")
+        for text in texts:
+            run = self.run_failing(text)
+            self.assertEqual(run["status"], "error")
+            t = db.get_task(self.task["id"])
+            self.assertEqual((t["status"], t["attempts"]), ("todo", 0), text)
+        self.assertEqual(questions(self.c["id"]), [])   # no task_failed_twice: the watchdog was not told
+        ents = watchdog.entries(db.get_task(self.task["id"])["notes"])
+        self.assertEqual(len(ents), 4)
+        for e in ents:
+            self.assertTrue(e["text"].startswith("Attempt 1 ended: stopped (the model server could not be reached"),
+                            e["text"])
+            self.assertNotIn("\n", e["text"])   # one short line, nothing more
+        self.assertFalse("Run ended:" in (db.get_task(self.task["id"])["result"] or ""))
+        # The errors still reach the feed, where the stalled pattern and the Doctor count them.
+        self.assertEqual(db.scalar("SELECT COUNT(*) FROM events WHERE company_id=? AND kind='error' AND message "
+                                   "LIKE '%hit an error: %'", (self.c["id"],)), 4)
+        # A real model error still counts as a failed attempt, and the guidance skips the stopped entries.
+        run = self.run_failing("HTTP 400 from model server: bad request")
+        self.assertEqual(run["status"], "error")
+        t = db.get_task(self.task["id"])
+        self.assertEqual((t["status"], t["attempts"]), ("todo", 1))
+        self.assertEqual(watchdog.entries(t["notes"])[-1]["text"],
+                         "Attempt 1 ended: error (HTTP 400 from model server: bad request)")
+        self.assertIn("Attempt 1 failed because the model call failed (HTTP 400", watchdog.retry_guidance(t))
+
+    def test_is_model_connection_error(self):
+        for text in ("Can't reach the model server at http://x (refused). Is Ollama running?",
+                     "The model server dropped the connection (ConnectionResetError: reset).",
+                     "The model server took longer than 600s to reply.", "HTTP 503 from model server: busy",
+                     "Ava hit an error: HTTP 500 from model server: internal"):
+            self.assertTrue(watchdog.is_model_connection_error(text), text)
+        for text in ("HTTP 400 from model server: bad request", "HTTP 404 from model server: model not found",
+                     "HTTP 500 from model server: error parsing tool call: invalid JSON",
+                     "Bad response from model server: Expecting value", "", None):
+            self.assertFalse(watchdog.is_model_connection_error(text), text)
+
+    def test_scheduler_waits_for_the_model_server(self):
+        # The newest run is a clean one, so nothing nudges the Doctor beyond the outage logic under test.
+        db.run("INSERT INTO runs(company_id, agent_id, kind, status, started_at, finished_at) VALUES(?,?,?,?,?,?)",
+               (self.c["id"], None, "task", "done", db.now(), db.now()))
+        started, refreshed = [], []
+        before = last_event_id()
+        with scheduler_sandbox(started, refreshed=refreshed) as sched:
+            doctor.LAST = [{"key": "model_server", "label": "Model server", "status": "bad",
+                            "detail": "connection refused", "fix": None, "checked_at": db.now()}]
+            sched.tick()
+            sched.tick()
+            self.assertEqual([s for s in started if s[0] == self.agent["id"]], [])
+            self.assertEqual([m for m in refreshed if m != 60], [5, 5])   # the Doctor looks again every 5 min
+            self.assertEqual(len(global_events("Waiting for the model server", before)), 1)   # one notice per outage
+            self.assertEqual(global_events("The model server is back", before), [])
+            doctor.LAST = [{"key": "model_server", "label": "Model server", "status": "ok",
+                            "detail": "reachable", "fix": None, "checked_at": db.now()}]
+            sched.tick()
+            sched.tick()
+            self.assertIn((self.agent["id"], "task"), started)
+            self.assertEqual(len(global_events("The model server is back", before)), 1)
+            self.assertEqual(len(global_events("Waiting for the model server", before)), 1)
+
+    def test_a_fresh_connection_failure_asks_the_doctor_to_look_now(self):
+        self.run_failing("Can't reach the model server at http://127.0.0.1:1 (refused). Is Ollama running?")
+        refreshed = []
+        with scheduler_sandbox(refreshed=refreshed) as sched:
+            sched.tick()
+        self.assertIn(1, refreshed)   # the hourly check would notice the outage far too late
+
+
+class TestFoundingRuns(unittest.TestCase):
+    """Founding outcomes through agents.run: the charter sync, the partial question, the phone hook and the kill
+    switch."""
+
+    CHARTER = ("# FoundCo\n\n## One-liner\n**Weekly** meal plans for [dogs](https://example.com).\n\n"
+               "## Problem\nOwners guess.\n")
+
+    def setUp(self):
+        self.c = make_company("FoundCo", members=("ceo", "engineering"))
+        db.update("companies", self.c["id"], status="founding", stage="idea", charter="", mission="")
+        db.set_settings({"kill_switch": False, "scheduler_enabled": True})
+        self.ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (self.c["id"],))
+        self.sent: list = []
+        self._notify = mock.patch.object(notify, "send", lambda text, buttons=None, kind="info", **kw:
+                                         self.sent.append((text, kind)) or True)
+        self._notify.start()
+        self.saved_last = doctor.LAST
+        doctor.LAST = []
+
+    def tearDown(self):
+        self._notify.stop()
+        db.set_settings({"kill_switch": False})
+        doctor.LAST = self.saved_last
+
+    def run_script(self, script) -> dict:
+        steps = iter(script)
+
+        def fake_chat(messages, tools_spec=None, *a, **kw):
+            try:
+                name, args = next(steps)
+            except StopIteration:
+                return llm.Reply(content="")
+            return llm.Reply(tool_calls=[llm.ToolCall(name=name, arguments=args)])
+
+        with mock.patch.object(agents.llm, "chat", fake_chat):
+            agents.run(self.ceo["id"], "founding")
+        return db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.ceo["id"],))
+
+    def test_charter_file_becomes_the_charter_and_the_question_sees_it(self):
+        run = self.run_script([("write_file", {"path": "docs/charter.md", "content": self.CHARTER}),
+                               ("finish", {"summary": "Charter drafted; no tasks yet.", "status": "partial"})])
+        self.assertEqual(run["status"], "partial")
+        c = db.get_company(self.c["id"])
+        self.assertEqual(c["status"], "active")
+        self.assertEqual(c["charter"], self.CHARTER.strip())
+        self.assertEqual(c["mission"], "Weekly meal plans for dogs.")
+        self.assertEqual(c["stage"], "building")
+        self.assertTrue(db.one("SELECT id FROM events WHERE company_id=? AND kind='charter' AND message LIKE "
+                               "'took the charter from docs/charter.md%'", (self.c["id"],)))
+        qs = questions(self.c["id"], "founding_partial")
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["p"]["key"], f"founding_partial:{self.c['id']}")
+        self.assertEqual(qs[0]["p"]["recommended"], "Continue anyway")
+        self.assertIn("A charter exists", qs[0]["p"]["question"])
+        self.assertIn("it finished only partially", qs[0]["p"]["question"])
+        # The question itself went to the phone through gate (with buttons), then the founding notice.
+        self.assertEqual([s[1] for s in self.sent], ["escalation", "important"])
+        self.assertEqual(self.sent[-1], ("<b>FoundCo</b>: founding ended partial; see your inbox.", "important"))
+
+    def test_update_charter_wins_and_a_clean_founding_reaches_the_phone(self):
+        run = self.run_script([("update_charter", {"charter": "# Real charter", "one_liner": "Real one-liner",
+                                                   "stage": "building"}),
+                               ("create_task", {"title": "Build landing page", "assign_to": "engineering",
+                                                "deliverable": "site/index.html"}),
+                               ("finish", {"summary": "Founded."})])
+        self.assertEqual(run["status"], "done")
+        c = db.get_company(self.c["id"])
+        self.assertEqual((c["status"], c["charter"], c["mission"]), ("active", "# Real charter", "Real one-liner"))
+        self.assertEqual(questions(self.c["id"]), [])
+        self.assertEqual(self.sent, [("<b>FoundCo</b> is up and running: 1 task queued.", "important")])
+
+    def test_phone_problems_never_touch_the_run(self):
+        def boom(*a, **kw):
+            raise RuntimeError("phone exploded")
+
+        with mock.patch.object(notify, "send", boom), contextlib.redirect_stdout(io.StringIO()):
+            run = self.run_script([("finish", {"summary": "Founded.", "status": "partial"})])
+        self.assertEqual(run["status"], "partial")
+        self.assertEqual(db.get_company(self.c["id"])["status"], "active")
+        self.assertEqual(len(questions(self.c["id"], "founding_partial")), 1)
+
+    def test_founding_stopped_by_the_kill_switch_resumes_on_the_next_tick(self):
+        db.set_settings({"kill_switch": True})
+        run = self.run_script([("finish", {"summary": "never reached"})])
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(db.get_company(self.c["id"])["status"], "founding")
+        self.assertTrue(db.one("SELECT id FROM events WHERE company_id=? AND message LIKE "
+                               "'Founding paused by the kill switch%'", (self.c["id"],)))
+        self.assertEqual(self.sent, [])
+        found: list = []
+        with scheduler_sandbox(found=found) as sched:
+            sched.tick()   # the switch is still on: nothing moves
+            self.assertEqual([x for x in found if x == self.c["id"]], [])
+            db.set_settings({"kill_switch": False})
+            sched.tick()
+            self.assertEqual([x for x in found if x == self.c["id"]], [self.c["id"]])
+            # A founding run in flight, or one that ended in an ordinary error, is left alone.
+            db.run("UPDATE runs SET status='running' WHERE id=?", (run["id"],))
+            sched.tick()
+            db.run("UPDATE runs SET status='error', summary='HTTP 400 from model server: bad request' WHERE id=?",
+                   (run["id"],))
+            sched.tick()
+            self.assertEqual([x for x in found if x == self.c["id"]], [self.c["id"]])
+            # One that could not reach the model is retried once the Doctor says the server answers.
+            db.run("UPDATE runs SET summary=? WHERE id=?",
+                   ("Can't reach the model server at http://127.0.0.1:1 (refused). Is Ollama running?", run["id"]))
+            sched.tick()
+            self.assertEqual([x for x in found if x == self.c["id"]], [self.c["id"]] * 2)
+            # ... but not while the model server is down.
+            doctor.LAST = [{"key": "model_server", "label": "Model server", "status": "bad", "detail": "refused",
+                            "fix": None, "checked_at": db.now()}]
+            sched.tick()
+            self.assertEqual([x for x in found if x == self.c["id"]], [self.c["id"]] * 2)
+
+    def test_found_leaves_the_status_alone_when_the_ceo_is_busy(self):
+        db.update("companies", self.c["id"], status="active")
+        with agents._running_lock:
+            agents._running[self.ceo["id"]] = "cycle"
+        try:
+            self.assertFalse(agents.found(self.c["id"]))
+        finally:
+            with agents._running_lock:
+                agents._running.pop(self.ceo["id"], None)
+        self.assertEqual(db.get_company(self.c["id"])["status"], "active")
+
+
+class TestFoundingWithTheFakeModel(unittest.TestCase):
+    """The scripted "[partial]" founding in tests/fake_ollama.py drives agents.run end to end: the CEO writes
+    docs/charter.md with write_file, never calls update_charter, creates no tasks and finishes partial."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = FakeModelServer(delay=0).start()
+        cls.saved = {k: db.get_settings().get(k) for k in ("llm_backend", "llm_base_url", "default_model")}
+        db.set_settings({"llm_backend": "ollama", "llm_base_url": cls.model.url, "default_model": "gpt-oss:20b",
+                         "kill_switch": False})
+
+    @classmethod
+    def tearDownClass(cls):
+        db.set_settings(cls.saved)
+        cls.model.stop()
+
+    def test_partial_founding_reaches_founding_ended(self):
+        sent: list = []
+        with mock.patch.object(notify, "send", lambda text, buttons=None, kind="info", **kw:
+                               sent.append((text, kind)) or True):
+            c = agents.create_company("Weekly meal plans for dogs [partial]", name="PawPlan", template="minimal")
+            ceo = db.one("SELECT id FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
+            deadline = time.time() + 30
+            while time.time() < deadline and (db.get_company(c["id"])["status"] == "founding"
+                                               or agents.is_running(ceo["id"])):
+                time.sleep(0.1)
+        c = db.get_company(c["id"])
+        self.assertEqual(c["status"], "active")
+        run = db.one("SELECT * FROM runs WHERE company_id=? AND kind='founding'", (c["id"],))
+        self.assertEqual(run["status"], "partial")
+        self.assertTrue(c["charter"].startswith("# PawPlan"), c["charter"])
+        self.assertEqual(c["mission"], "Weekly meal plans for dogs.")
+        self.assertEqual(c["stage"], "building")
+        self.assertEqual(db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=?", (c["id"],)), 0)
+        self.assertFalse(db.one("SELECT id FROM events WHERE company_id=? AND kind='charter' AND message LIKE "
+                                "'updated the company charter%'", (c["id"],)))   # update_charter was never called
+        qs = questions(c["id"], "founding_partial")
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["status"], "pending")
+        self.assertEqual(qs[0]["p"]["recommended"], "Continue anyway")
+        self.assertIn("A charter exists", qs[0]["p"]["question"])
+        self.assertEqual([s[1] for s in sent], ["escalation", "important"])   # one question, one founding notice
+        self.assertIn("Founding PawPlan stopped before it finished", sent[0][0])
+        self.assertEqual(sent[-1], ("<b>PawPlan</b>: founding ended partial; see your inbox.", "important"))
+
+
+class TestCharterSync(unittest.TestCase):
+    def test_mission_from_charter(self):
+        self.assertEqual(agents.mission_from_charter("# X\n\n## One-liner\n\n*Weekly* meal plans for `dogs`.\n\n"
+                                                     "## Problem"), "Weekly meal plans for dogs.")
+        self.assertEqual(agents.mission_from_charter("**One-liner:** Meal plans for dogs"), "Meal plans for dogs")
+        self.assertEqual(agents.mission_from_charter("One-liner: Meal [plans](http://x) for dogs"),
+                         "Meal plans for dogs")
+        self.assertEqual(agents.mission_from_charter("- One liner: Plans"), "Plans")
+        self.assertEqual(agents.mission_from_charter("## One-liner\n\n## Problem\nnothing"), "")
+        self.assertEqual(agents.mission_from_charter("no heading here"), "")
+        self.assertEqual(agents.mission_from_charter(""), "")
+
+    def test_sync_only_fills_empty_columns(self):
+        c = make_company("SyncCo")
+        db.update("companies", c["id"], charter="", mission="", stage="idea")
+        self.assertFalse(agents._sync_charter(db.get_company(c["id"])))   # no file yet
+        workspace.safe_path(c, "docs/charter.md").write_text("# SyncCo\n\n## One-liner\nPlans.\n", encoding="utf-8")
+        self.assertTrue(agents._sync_charter(db.get_company(c["id"])))
+        c2 = db.get_company(c["id"])
+        self.assertEqual((c2["charter"], c2["mission"], c2["stage"]),
+                         ("# SyncCo\n\n## One-liner\nPlans.", "Plans.", "building"))
+        # A charter already in the column is never replaced by the file.
+        workspace.safe_path(c, "docs/charter.md").write_text("# Changed", encoding="utf-8")
+        self.assertFalse(agents._sync_charter(db.get_company(c["id"])))
+        self.assertEqual(db.get_company(c["id"])["charter"], "# SyncCo\n\n## One-liner\nPlans.")
+        # A one-liner the owner set and a later stage stay as they are.
+        d = make_company("KeepCo")
+        db.update("companies", d["id"], charter="", mission="Owner's words", stage="launched")
+        workspace.safe_path(d, "docs/charter.md").write_text("## One-liner\nFile words", encoding="utf-8")
+        self.assertTrue(agents._sync_charter(db.get_company(d["id"])))
+        d2 = db.get_company(d["id"])
+        self.assertEqual((d2["charter"], d2["mission"], d2["stage"]), ("## One-liner\nFile words", "Owner's words",
+                                                                        "launched"))
+
+
+class TestPromptRules(unittest.TestCase):
+    def test_note_progress_rule_only_in_task_runs(self):
+        c = make_company()
+        agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='engineering'", (c["id"],))
+        line = ("If an approach fails or you are running low on steps, save what you learned with note_progress so "
+                "the next attempt continues from it.")
+        self.assertIn("- " + line, agents.system_prompt(c, agent, "task", 14))
+        self.assertNotIn(line, agents.system_prompt(c, agent, "cycle", 18))
+        self.assertNotIn(line, agents.system_prompt(c, agent, "chat", 8))
+
+
+class TestKillSwitchGate(unittest.TestCase):
+    def setUp(self):
+        c = make_company()
+        db.update("companies", c["id"], settings=json.dumps({"policies": {"social_post": "auto"}}))
+        self.c = db.get_company(c["id"])
+        db.set_settings({"kill_switch": True})
+
+    def tearDown(self):
+        db.set_settings({"kill_switch": False})
+
+    def test_gate_queues_auto_actions_with_the_kill_switch_text(self):
+        ctx = ctx_for(self.c, "marketing")
+        out = tools.execute(ctx, "social_post", {"platform": "x", "content": "Hello while stopped"})
+        m = re.match(r"^Kill switch is on: queued for the owner as request #(\d+)\. Don't resubmit it\. Continue "
+                     r"with other work; the decision will appear in your notes\.$", out)
+        self.assertTrue(m, out)
+        aid = int(m.group(1))
+        row = db.one("SELECT * FROM approvals WHERE id=?", (aid,))
+        self.assertEqual((row["status"], row["action"]), ("pending", "social_post"))
+        self.assertEqual(db.scalar("SELECT COUNT(*) FROM audit WHERE company_id=?", (self.c["id"],)), 0)  # nothing ran
+        with self.assertRaises(ValueError):
+            actions.decide(aid, "approve")
+        self.assertEqual(actions.decide(aid, "reject")["status"], "rejected")
+        # Normal policy text is untouched: with the switch off an auto action runs at once.
+        db.set_settings({"kill_switch": False})
+        self.assertTrue(tools.execute(ctx, "social_post", {"platform": "x", "content": "Hello again"})
+                        .startswith("Approved"))
+        # ... and an approve-policy action keeps the usual wording even while the switch is on.
+        db.set_settings({"kill_switch": True})
+        out = actions.gate(self.c, ctx.agent, None, "send_email", {"to": "jo@example.com", "subject": "Hi",
+                                                                   "body": "Hello"})
+        self.assertIn("Queued for the owner's approval", out)
+        self.assertNotIn("Kill switch", out)
+
 
 class TestFailedTwiceThroughTheAgentLoop(unittest.TestCase):
     """A task that fails twice through agents.run leaves auto notes behind and ends as one question in the inbox."""
@@ -593,6 +1171,63 @@ class TestFailedTwiceThroughTheAgentLoop(unittest.TestCase):
         # Pressing the recommended button from the inbox finishes the story.
         actions.decide(qs[0]["id"], "approve", answer="Skip this task")
         self.assertEqual(db.get_task(self.task_id)["status"], "cancelled")
+
+    def test_out_of_steps_leaves_a_note_with_the_last_error(self):
+        search = ("web_search", {"query": "roofers phoenix"})
+        write = ("write_file", {"path": self.DOC, "content": "draft"})
+        db.set_settings({"max_steps_per_run": 3})
+        try:
+            with mock.patch.object(web, "search", side_effect=web.WebError(
+                    "All search providers failed: ddg_html: blocked (HTTP 202 challenge); brave: not set up")):
+                run = self.run_script([search, write, ("read_file", {"path": self.DOC}), write])
+        finally:
+            db.set_settings({"max_steps_per_run": 14})
+        self.assertEqual(run["status"], "out_of_steps")
+        t = db.get_task(self.task_id)
+        self.assertEqual((t["status"], t["attempts"]), ("todo", 1))
+        ents = watchdog.entries(t["notes"])
+        self.assertEqual([e["author"] for e in ents], ["auto"])
+        lines = ents[0]["text"].splitlines()
+        self.assertEqual(lines[0], "Attempt 1 ended: out_of_steps")
+        self.assertIn("Files written: " + self.DOC, lines)
+        self.assertTrue(any(ln.startswith("Last tool calls: web_search(") for ln in lines), lines)
+        self.assertTrue(any(ln.startswith("Last error: ERROR: web search is unavailable right now (ddg_html: blocked")
+                            for ln in lines), lines)
+        self.assertEqual(watchdog.classify_failure(t)[0], "search_failed")
+        self.assertIn("web search was unavailable", watchdog.retry_guidance(t))
+        self.assertEqual(questions(self.c["id"]), [])
+
+    def test_model_error_leaves_a_note_and_counts_the_attempt(self):
+        def fake_chat(*a, **kw):
+            raise llm.LLMError("HTTP 400 from model server: invalid request")
+
+        with mock.patch.object(agents.llm, "chat", fake_chat):
+            agents.run(self.agent["id"], "task", task_id=self.task_id)
+        run = db.one("SELECT * FROM runs WHERE agent_id=? ORDER BY id DESC", (self.agent["id"],))
+        self.assertEqual((run["status"], run["summary"]), ("error", "HTTP 400 from model server: invalid request"))
+        t = db.get_task(self.task_id)
+        self.assertEqual((t["status"], t["attempts"]), ("todo", 1))
+        self.assertEqual(watchdog.entries(t["notes"])[-1]["text"],
+                         "Attempt 1 ended: error (HTTP 400 from model server: invalid request)")
+        self.assertEqual(watchdog.classify_failure(t), ("model_error", "HTTP 400 from model server: invalid request"))
+        self.assertIn("Run ended: HTTP 400", t["result"])
+        self.assertTrue(db.one("SELECT id FROM events WHERE company_id=? AND kind='error' AND message LIKE "
+                               "'%hit an error: HTTP 400 from model server%'", (self.c["id"],)))
+
+    def test_kill_switch_stops_the_run_and_gives_the_attempt_back(self):
+        write = ("write_file", {"path": self.DOC, "content": "draft"})
+        db.set_settings({"kill_switch": True})
+        try:
+            run = self.run_script([write, write])
+        finally:
+            db.set_settings({"kill_switch": False})
+        self.assertEqual((run["status"], run["summary"]), ("stopped", "Kill switch: the owner stopped all agents."))
+        self.assertEqual(self.prompts, [])   # stopped at the first step boundary, before any model call
+        t = db.get_task(self.task_id)
+        self.assertEqual((t["status"], t["attempts"]), ("todo", 0))
+        self.assertEqual(watchdog.entries(t["notes"])[-1]["text"],
+                         "Attempt 1 ended: stopped (Kill switch: the owner stopped all agents.)")
+        self.assertEqual(questions(self.c["id"]), [])
 
 
 if __name__ == "__main__":
