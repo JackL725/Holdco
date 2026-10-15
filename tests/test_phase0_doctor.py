@@ -10,10 +10,12 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -195,6 +197,28 @@ class TestDoctorModel(DoctorBase):
         finally:
             self._note.start()
 
+    def test_nvidia_smi_runs_hidden_with_a_timeout(self):
+        self._note.stop()
+        try:
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append((cmd, kw))
+                return types.SimpleNamespace(stdout="2048, 32768\n", stderr="", returncode=0)
+
+            with patch("shutil.which", return_value="C:/nvidia-smi.exe"), patch("subprocess.run", fake_run):
+                self.assertEqual(doctor._gpu_memory_note(), "; GPU memory 2.0 of 32.0 GB in use (nvidia-smi)")
+            cmd, kw = calls[0]
+            self.assertEqual(cmd[0], "C:/nvidia-smi.exe")
+            self.assertEqual(kw["timeout"], 5)
+            # On Windows the hidden autostart must not flash a console; elsewhere the flag is 0 and accepted.
+            self.assertEqual(kw["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with patch("shutil.which", return_value="C:/nvidia-smi.exe"), \
+                    patch("subprocess.run", side_effect=subprocess.TimeoutExpired("nvidia-smi", 5)):
+                self.assertEqual(doctor._gpu_memory_note(), "")   # a hung tool never fails the check
+        finally:
+            self._note.start()
+
     def test_full_run_rows_cache_and_routes(self):
         with SettingsGuard():
             db.set_settings({"llm_base_url": self.model.url, "default_model": "gpt-oss:20b"})
@@ -206,7 +230,10 @@ class TestDoctorModel(DoctorBase):
         self.assertEqual(keys[:4], ["model_server", "model", "gpu_fit", "search"])
         self.assertEqual(keys[-3:], ["disk", "backup", "errors_24h"])
         for r in rows:
-            self.assertEqual(set(r), {"key", "label", "status", "detail", "fix", "checked_at"})
+            # Phase 0 fix: every row carries its run number; connector rows also carry their company id.
+            self.assertEqual(set(r) - {"company_id"}, {"key", "label", "status", "detail", "fix", "checked_at", "run"})
+            self.assertEqual(r["run"], rows[0]["run"])
+            self.assertEqual("company_id" in r, r["key"].startswith("connector:"), r["key"])
             self.assertIn(r["status"], ("ok", "warn", "bad"))
             self.assertIsNotNone(db.parse_time(r["checked_at"]))
             if r["fix"] is not None:
@@ -216,6 +243,7 @@ class TestDoctorModel(DoctorBase):
         summ = doctor.summary()
         self.assertEqual(summ["ok"] + summ["warn"] + summ["bad"], len(rows))
         self.assertEqual(summ["checked_at"], rows[0]["checked_at"])
+        self.assertEqual(summ["run"], rows[0]["run"])
         self.assertEqual(doctor.row_status("model_server"), "ok")
         self.assertIsNone(doctor.row_status("nope"))
         self.assertEqual(doctor.search_status()["key"], "search")
@@ -374,9 +402,11 @@ class TestConnectors(DoctorBase):
         smtp = rows[f"connector:smtp:{a['id']}"]
         self.assertEqual(smtp["status"], "bad")
         self.assertEqual(smtp["label"], "Email sending (MailCo)")
+        self.assertEqual(smtp["company_id"], a["id"])   # Phase 0 fix: nobody has to parse the key for this
         self.assertEqual(smtp["fix"], {"kind": "link", "label": "Company settings", "href": f"#/c/{a['id']}/settings"})
         self.assertNotIn("hunter2secret", json.dumps(list(rows.values())))
         hook = rows[f"connector:webhook:{a['id']}"]
+        self.assertEqual(hook["company_id"], a["id"])
         self.assertEqual(hook["status"], "bad")
         self.assertIn("malformed", hook["detail"])
         db.update("companies", a["id"], settings=json.dumps({"webhook_url": "https://hooks.zapier.com/abc"}))
@@ -442,7 +472,55 @@ class TestConnectors(DoctorBase):
                                              if j.metas[0][0].startswith("connector:")]))
         self.assertNotIn("connector:telegram", rows)
         self.assertEqual(rows["connector:ntfy"]["status"], "ok")
+        self.assertIsNone(rows["connector:ntfy"]["company_id"])   # global connector: the field is there, as None
         self.assertEqual(doctor._ntfy_row(self.settings(ntfy_topic="t", ntfy_server="ntfy.sh"))["status"], "bad")
+        # Scrubbing (Phase 0 fix): a malformed api base makes urllib quote the whole URL, token included, and a
+        # token pasted with a newline is refused by http.client with the URL in the message. Neither reaches a row.
+        s = self.settings(telegram_bot_token="123:SECRET-TOKEN", telegram_chat_id="42",
+                          telegram_api_base="api.telegram.org")
+        r = doctor._telegram_row(s)
+        self.assertEqual(r["status"], "bad")
+        self.assertNotIn("SECRET-TOKEN", json.dumps(r))
+        self.assertIn("[token]", r["detail"])
+        good = StubHTTP({"ok": True, "result": {"username": "holdco_bot"}})
+        try:
+            s = self.settings(telegram_bot_token="123:SECRET-TOKEN\n", telegram_chat_id="42",
+                              telegram_api_base=good.url)
+            r = doctor._telegram_row(s)
+        finally:
+            good.stop()
+        self.assertEqual(r["status"], "bad")
+        self.assertNotIn("SECRET-TOKEN", json.dumps(r))
+        self.assertIn("[token]", r["detail"])
+
+    def test_crash_and_timeout_rows_carry_company_id_and_no_token(self):
+        secret = "123:SECRET-TOKEN"
+
+        def crash():
+            raise RuntimeError(f"boom at https://api.telegram.org/bot{secret}/getMe")
+
+        def slow():
+            time.sleep(2)
+            return doctor._row("connector:imap:7", "Email receiving (X)", "ok", "late")
+
+        with SettingsGuard():
+            db.set_settings({"telegram_bot_token": secret})
+            rows = self.by_key(doctor._run_jobs([
+                doctor._Job([("connector:smtp:7", "Email sending (X)", None)], crash, company_id=7),
+                doctor._Job([("connector:imap:7", "Email receiving (X)", None)], slow, timeout=0.2, company_id=7),
+                doctor._Job([("connector:telegram", "Telegram bot", None)], crash),
+                doctor._Job([("disk", "Disk space", None)], crash)]))
+        self.assertEqual(rows["connector:smtp:7"]["company_id"], 7)
+        self.assertEqual(rows["connector:imap:7"]["company_id"], 7)
+        self.assertIn("Timed out", rows["connector:imap:7"]["detail"])
+        self.assertIsNone(rows["connector:telegram"]["company_id"])
+        self.assertNotIn("company_id", rows["disk"])
+        self.assertNotIn("SECRET-TOKEN", json.dumps(list(rows.values())))
+        self.assertEqual(rows["connector:smtp:7"]["detail"], "Check failed: boom at [token]/getMe")
+        with SettingsGuard():   # no token in the settings at all: the URL shape alone still hides it
+            db.set_settings({"telegram_bot_token": ""})
+            rows = self.by_key(doctor._run_jobs([doctor._Job([("disk", "Disk space", None)], crash)]))
+        self.assertEqual(rows["disk"]["detail"], "Check failed: boom at [token]/getMe")
 
     def test_stable_login_is_rechecked_every_6_hours(self):
         key, label, fix = "connector:smtp:999", "Email sending (X)", {"kind": "link", "label": "x", "href": "#"}
@@ -559,6 +637,31 @@ class TestPreflight(DoctorBase):
             pf = doctor.preflight()
         self.assertEqual(pf["soft"][0]["status"], "ok")
 
+    def test_merge_keeps_other_rows_and_run_numbers_tell_runs_apart(self):
+        with SettingsGuard(), patch.object(doctor, "NETLIFY_API", self.model.url):
+            db.set_settings({"llm_base_url": self.model.url, "default_model": "gpt-oss:20b"})
+            first = doctor.run()
+            second = doctor.run()
+            self.assertEqual({r["run"] for r in first}, {first[0]["run"]})   # one number per full run
+            self.assertEqual(second[0]["run"], first[0]["run"] + 1)
+            self.assertEqual(doctor.summary()["run"], second[0]["run"])
+            # Age every row a preflight does not touch, then found: those rows keep their stamp and number.
+            old = "2000-01-01T00:00:00Z"
+            for r in doctor.LAST:
+                if r["key"] not in ("model_server", "model", "search"):
+                    r["checked_at"] = old
+            search_at = doctor.search_status()["checked_at"]
+            pf = doctor.preflight()
+        self.assertTrue(pf["ok"])
+        rows = self.by_key(doctor.LAST)
+        self.assertEqual(rows["disk"]["checked_at"], old)
+        self.assertEqual(rows["search"]["checked_at"], search_at)   # cached: younger than an hour
+        self.assertNotEqual(rows["model_server"]["checked_at"], old)
+        self.assertEqual({r["run"] for r in doctor.LAST}, {second[0]["run"]})   # a preflight is not a new run
+        self.assertEqual(pf["checks"][0]["run"], second[0]["run"])
+        self.assertEqual(doctor.summary()["run"], second[0]["run"])
+        self.assertEqual(doctor._row("x", "X", "ok", "y")["run"], 0)   # outside a full run: 0 until merged
+
     def test_company_create_route_answers_409(self):
         with SettingsGuard():
             db.set_settings({"llm_base_url": f"http://127.0.0.1:{closed_port()}"})
@@ -620,6 +723,23 @@ class TestRefresh(DoctorBase):
         while doctor._refreshing and time.time() < deadline:
             time.sleep(0.02)
 
+    def test_merge_does_not_postpone_the_refresh(self):
+        calls = []
+        with patch.object(doctor, "run", lambda deep=False: calls.append(deep) or []):
+            fresh = doctor._row("model_server", "Model server", "ok", "fine")
+            stale = doctor._row("disk", "Disk space", "ok", "fine")
+            stale["checked_at"] = "2000-01-01T00:00:00Z"
+            doctor.LAST[:] = [fresh, stale]   # what a preflight merge leaves behind: first row fresh, rest old
+            doctor.refresh_if_stale()
+            deadline = time.time() + 5
+            while doctor._refreshing and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(calls, [False])   # the oldest row decides, not the first one
+            doctor.LAST[:] = [fresh, doctor._row("disk", "Disk space", "ok", "fine")]
+            doctor.refresh_if_stale()
+            time.sleep(0.05)
+            self.assertEqual(calls, [False])
+
 
 class TestBackup(unittest.TestCase):
     def setUp(self):
@@ -668,6 +788,49 @@ class TestBackup(unittest.TestCase):
         ev = db.one("SELECT * FROM events WHERE kind='info' AND message LIKE 'Backup written:%' ORDER BY id DESC")
         self.assertIn(p.name, ev["message"])
         self.assertFalse(list(self.dir.glob("*.part")))
+
+    def test_symlinks_and_special_files_are_skipped(self):
+        c = make_company("LinkCo")
+        root = workspace.root(c)
+        (root / "docs").mkdir(exist_ok=True)
+        (root / "docs" / "real.md").write_text("keep me\n", encoding="utf-8")
+        outside = Path(tempfile.mkdtemp(prefix="holdco-outside-"))
+        (outside / "id_ed25519").write_text("PRIVATE KEY MATERIAL\n", encoding="utf-8")
+        links = [root / "docs" / "keys", root / "docs" / "elsewhere"]
+        try:
+            os.symlink(outside / "id_ed25519", links[0])            # what a run_code task could leave behind
+            os.symlink(outside, links[1], target_is_directory=True)
+        except (OSError, NotImplementedError) as e:   # Windows without developer mode needs a privilege for this
+            self.skipTest(f"symlinks are not available here: {e}")
+        pipe = root / "docs" / "pipe"
+        try:
+            p = backup.run_backup()
+            with zipfile.ZipFile(p) as z:
+                names = z.namelist()
+                self.assertIn(f"companies/{c['slug']}/docs/real.md", names)
+                self.assertFalse([n for n in names if "/keys" in n or "/elsewhere" in n], names)
+                for n in names:
+                    if n != "holdco.db":
+                        self.assertNotIn(b"PRIVATE KEY MATERIAL", z.read(n), n)
+            ev = db.one("SELECT * FROM events WHERE kind='info' AND message LIKE 'Backup written:%' "
+                        "ORDER BY id DESC")
+            self.assertIn(p.name, ev["message"])
+            self.assertIn("skipped 2 links or special file(s)", ev["message"])
+            self.assertEqual(json.loads(ev["data"])["skipped"], 2)
+            # A pipe (POSIX only) is a special file: the file walk leaves it out, so zipping never waits on it.
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(pipe)
+                skipped: list = []
+                files = [arc for _, arc in backup._company_files(skipped)]
+                self.assertNotIn(f"companies/{c['slug']}/docs/pipe", files)
+                self.assertIn(f"companies/{c['slug']}/docs/real.md", files)
+                self.assertEqual(sorted(skipped), sorted(links + [pipe]))
+        finally:
+            for x in links + [pipe]:
+                try:
+                    x.unlink()
+                except OSError:
+                    pass
 
     def test_retention_last_backup_and_routes(self):
         with SettingsGuard():
@@ -730,6 +893,45 @@ class TestBackup(unittest.TestCase):
         ev = db.one("SELECT * FROM events WHERE kind='error' AND message LIKE 'Backup failed:%' ORDER BY id DESC")
         self.assertIn("disk full", ev["message"])
         db.run("DELETE FROM events WHERE id=?", (ev["id"],))
+
+
+class TestSettingsValidation(unittest.TestCase):
+    """PUT /api/settings refuses what would fail quietly later and clamps the numbers (Phase 0 fix)."""
+
+    def test_bad_chat_id_and_notify_level_answer_400(self):
+        with SettingsGuard():
+            for bad in ("@owner", "42abc", "4 2", "--1"):
+                with self.assertRaises(server.HTTPError) as cm:
+                    server.api_settings_put(Stub(), None, {"telegram_chat_id": bad, "owner_name": "Sam"})
+                self.assertEqual(cm.exception.status, 400, bad)
+                self.assertIn("chat id", cm.exception.message)
+            self.assertNotEqual(db.get_settings()["owner_name"], "Sam")   # nothing from a refused request is saved
+            with self.assertRaises(server.HTTPError) as cm:
+                server.api_settings_put(Stub(), None, {"notify_level": "everything"})
+            self.assertEqual(cm.exception.status, 400)
+            self.assertIn("notify_level", cm.exception.message)
+            out = server.api_settings_put(Stub(), None, {"telegram_chat_id": " -100123456 ", "notify_level": " All "})
+            self.assertEqual(out["settings"]["telegram_chat_id"], "-100123456")
+            self.assertEqual(out["settings"]["notify_level"], "all")
+            out = server.api_settings_put(Stub(), None, {"telegram_chat_id": "", "notify_level": "important"})
+            self.assertEqual(out["settings"]["telegram_chat_id"], "")
+            self.assertEqual(db.set_settings({"telegram_chat_id": 42})["telegram_chat_id"], "42")
+
+    def test_numbers_are_clamped(self):
+        with SettingsGuard():
+            s = db.set_settings({"max_task_attempts": 0, "backup_keep": 500, "num_ctx": 100,
+                                 "max_concurrent_runs": "12"})
+            self.assertEqual((s["max_task_attempts"], s["backup_keep"], s["num_ctx"], s["max_concurrent_runs"]),
+                             (1, 90, 2048, 8))
+            s = db.set_settings({"max_task_attempts": "3", "backup_keep": 7.0, "num_ctx": 65536,
+                                 "max_concurrent_runs": 1})
+            self.assertEqual((s["max_task_attempts"], s["backup_keep"], s["num_ctx"], s["max_concurrent_runs"]),
+                             (3, 7, 65536, 1))
+            with self.assertRaises(ValueError):
+                db.set_settings({"backup_keep": "lots"})
+            with self.assertRaises(server.HTTPError) as cm:
+                server.api_settings_put(Stub(), None, {"max_task_attempts": "two"})
+            self.assertEqual(cm.exception.status, 400)
 
 
 if __name__ == "__main__":

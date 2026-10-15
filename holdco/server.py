@@ -73,7 +73,10 @@ def api_settings(h, m, body):
 
 @route("PUT", "/api/settings")
 def api_settings_put(h, m, body):
-    s = db.set_settings(body or {})
+    try:
+        s = db.set_settings(body or {})
+    except ValueError as e:   # a malformed chat id or an unknown notify level: tell the owner, save nothing
+        raise HTTPError(400, str(e))
     bus.notify("settings")
     return {"settings": s}
 
@@ -143,16 +146,10 @@ class PreflightError(HTTPError):
 
 @route("POST", "/api/kill")
 def api_kill(h, m, body):
-    on = bool((body or {}).get("on", True))
-    db.set_settings({"kill_switch": on})
-    bus.emit(None, "info", "Kill switch ON: all agents stopped and outbound actions frozen." if on
-             else "Kill switch off: agents may work again.", None, {"by": "owner"})
-    bus.notify("settings")
-    try:
-        notify.send("🛑 Kill switch ON. Agents stopped, outbound actions frozen. Send /resume to turn it off." if on
-                    else "✅ Kill switch off. Agents may work again.", kind="important")
-    except (NotImplementedError, Exception):
-        pass
+    # One helper for the dashboard button and the Telegram /stop and /resume commands: it saves the setting,
+    # emits the event and confirms on the phone without the identical-text rule, so a second ON within the
+    # hour is confirmed too (and the send runs in the background, so this answers at once).
+    on = notify.set_kill_switch(bool((body or {}).get("on", True)), by="owner")
     return {"kill_switch": on}
 
 
@@ -679,7 +676,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             try:
-                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                # An unexpected error may quote a URL; the bot token must not travel to the browser in it.
+                self._send(500, {"error": notify.scrub(f"{type(e).__name__}: {e}")})
             except OSError:
                 pass
 
