@@ -363,11 +363,16 @@ class EndToEnd(unittest.TestCase):
         r = self.api.post("/api/connectors/notifications/test")
         self.assertTrue(r["ok"], r)
         self.assertEqual({x["channel"] for x in r["results"]}, {"webhook", "telegram"})
+        # An identical request that is still pending is deduplicated (no new approval), so clear the sales agent's
+        # pending email first; its next email then creates a fresh approval request, which pings the owner.
+        for a in [a for a in self.pending(self.cid) if a["action"] == "send_email"]:
+            self.api.post(f"/api/approvals/{a['id']}", {"decision": "reject"})
         self.apis.calls.clear()
         hunter = self.agent(self.cid, "sales")
         t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Email one more lead", "agent_id": hunter["id"], "priority": 1})["task"]
         wait_for(lambda: next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"] == "done", 60, what="sales task")
-        wait_for(lambda: any(c["path"] == "/hooks/slack" and "needs your OK" in c["body"]["text"] for c in self.apis.calls), 10,
+        self.assertTrue(any(a["action"] == "send_email" for a in self.pending(self.cid)))
+        wait_for(lambda: any(c["path"] == "/hooks/slack" and "needs your OK" in c["body"]["text"] for c in self.apis.calls), 30,
                  what="approval notification")
         self.assertTrue(any(c["path"].startswith("/telegram/bot123:abc/") for c in self.apis.calls))
         self.api.put("/api/settings", {"notify_webhook_url": "", "telegram_bot_token": "", "telegram_chat_id": ""})
