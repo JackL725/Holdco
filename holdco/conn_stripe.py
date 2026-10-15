@@ -19,6 +19,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import secrets
 import socket
 import time
 import urllib.error
@@ -37,6 +38,8 @@ _INTERVAL_WORDS = {"monthly": "month", "months": "month", "mo": "month", "yearly
 # Currencies Stripe counts in whole units (no cents).
 ZERO_DECIMAL = {"bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf",
                 "xof", "xpf"}
+# Currencies Stripe counts in thousandths, with their own rounding rules: Holdco does not handle them.
+THREE_DECIMAL = {"bhd", "jod", "kwd", "omr", "tnd"}
 # Anything shaped like a Stripe key (Stripe itself echoes a masked key in some errors).
 _KEY_RE = re.compile(r"\b(?:sk|rk|pk)_(?:test|live)_[A-Za-z0-9*]+")
 _TRUE = ("1", "true", "yes", "on", "y")
@@ -140,7 +143,7 @@ def _is_loopback(url: str) -> bool:
 
 
 def _request(inst: dict, method: str, path: str, params: dict | None = None, timeout: float = TIMEOUT,
-             idempotent: bool = False) -> dict:
+             idempotent: bool = False, approval_id: int | None = None) -> dict:
     key = _key(inst)
     if not key:
         raise StripeError("No Stripe key is set. Add one on the Stripe card in the company's Settings.")
@@ -156,10 +159,15 @@ def _request(inst: dict, method: str, path: str, params: dict | None = None, tim
                "User-Agent": "Holdco"}
     if idempotent and method == "POST":
         # A retried approval (a lost reply, then a retry) must not refund twice. Stripe keeps an idempotency key
-        # for 24 hours and answers a repeat with the first result. Creating links is not keyed: a repeat there
-        # only adds a duplicate, while a replayed answer could hand back a link the owner has since turned off.
-        digest = hashlib.sha256(f"{inst.get('id')}|{path}|{query}".encode()).hexdigest()[:40]
-        headers["Idempotency-Key"] = f"holdco-{digest}"
+        # for 24 hours and answers a repeat with the first result. The key is the approval's id plus the request,
+        # so a retry of the same approval replays while two approvals for the same amount are two refunds (an edited
+        # retry is a new request too); without an approval the key is random. Creating links is not keyed: a
+        # repeat there only adds a duplicate, while a replayed answer could hand back a link turned off since.
+        if approval_id:
+            digest = hashlib.sha256(f"{inst.get('id')}|{path}|{query}".encode()).hexdigest()[:24]
+            headers["Idempotency-Key"] = f"holdco-approval-{int(approval_id)}-{digest}"
+        else:
+            headers["Idempotency-Key"] = f"holdco-{secrets.token_hex(16)}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     opener = _direct if _is_loopback(url) else _proxied
     try:
@@ -203,7 +211,13 @@ def _list_all(inst: dict, path: str, params: dict | None = None, cap: int = PAGE
 # ---------------------------------------------------------------- money and time
 
 def _to_minor(amount: float, currency: str) -> int:
-    return int(round(amount)) if currency in ZERO_DECIMAL else int(round(amount * 100))
+    """An amount in the currency's main unit as Stripe's integer: whole units for zero-decimal currencies (JPY),
+    cents for the rest. Three-decimal currencies (KWD, BHD, ...) are refused rather than sent ten times too small."""
+    cur = (currency or "").lower()
+    if cur in THREE_DECIMAL:
+        raise ValueError(f"{cur.upper()} uses three decimals, which Holdco does not handle; do this one in the "
+                         "Stripe dashboard")
+    return int(round(amount)) if cur in ZERO_DECIMAL else int(round(amount * 100))
 
 
 def _money(minor, currency: str = "usd") -> str:
@@ -367,7 +381,20 @@ def recent_payments(inst: dict, company: dict, days: int = 7) -> str:
     return "\n".join(lines)
 
 
-def create_refund(inst: dict, company: dict, payment_intent: str, amount_usd: float) -> str:
+def _payment_currency(inst: dict, ref: str, is_charge: bool) -> str:
+    """The currency of the payment a refund is for, looked up in Stripe (lower case)."""
+    kind = "charges" if is_charge else "payment_intents"
+    obj = _request(inst, "GET", f"/v1/{kind}/{urllib.parse.quote(ref, safe='')}")
+    cur = str(obj.get("currency") or "").strip().lower()
+    if not re.fullmatch(r"[a-z]{3}", cur):
+        raise StripeError(f"Stripe did not say which currency {ref} was paid in.")
+    return cur
+
+
+def create_refund(inst: dict, company: dict, payment_intent: str, amount_usd: float,
+                  approval_id: int | None = None) -> str:
+    """Refund part or all of a payment. The amount is in the payment's own currency (looked up first), and the
+    approval's id keys the request so a retried approval cannot refund twice (connectors.execute passes it)."""
     ref = (payment_intent or "").strip()
     if not ref:
         raise ValueError("payment_intent is required (pi_..., or a charge id ch_...)")
@@ -377,9 +404,11 @@ def create_refund(inst: dict, company: dict, payment_intent: str, amount_usd: fl
         raise ValueError("amount_usd must be a number") from None
     if amount <= 0:
         raise ValueError("amount_usd must be more than 0")
-    params = {"charge" if ref.startswith(("ch_", "py_")) else "payment_intent": ref, "amount": _to_minor(amount, "usd")}
-    r = _request(inst, "POST", "/v1/refunds", params, idempotent=True)
-    return (f"Refunded {_money(r.get('amount'), r.get('currency') or 'usd')} on {ref} (refund {r.get('id')}, "
+    is_charge = ref.startswith(("ch_", "py_"))
+    cur = _payment_currency(inst, ref, is_charge)
+    params = {"charge" if is_charge else "payment_intent": ref, "amount": _to_minor(amount, cur)}
+    r = _request(inst, "POST", "/v1/refunds", params, idempotent=True, approval_id=approval_id)
+    return (f"Refunded {_money(r.get('amount'), r.get('currency') or cur)} on {ref} (refund {r.get('id')}, "
             f"status {r.get('status') or 'pending'}, {mode(inst)} mode)")
 
 
@@ -416,11 +445,11 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "days": {"type": "integer", "description": "How many days back (default 7, at most 90)"}},
          "required": []}},
-    {"name": "create_refund", "tag": "irreversible", "fn": create_refund,
+    {"name": "create_refund", "tag": "irreversible", "fn": create_refund, "takes_approval_id": True,
      "description": "Refund a Stripe payment (always waits for the owner's approval).",
      "parameters": {"type": "object", "properties": {
          "payment_intent": _string("The payment to refund: pi_... (or a charge id ch_...)"),
-         "amount_usd": _number("How much to refund, in dollars")},
+         "amount_usd": _number("How much to refund, in the payment's currency (e.g. 5 for $5.00)")},
          "required": ["payment_intent", "amount_usd"]}},
 ]
 
@@ -532,22 +561,30 @@ DEFINITION = {
 
 # ---------------------------------------------------------------- the hosted MCP server (optional)
 
-# The hosted server's tool names (verified Oct 14, 2026). Ordered: the first matching glob wins; a tool no entry
-# matches is unclassified, which asks the owner (connector_publish).
+# The hosted server's tool names (verified Oct 14, 2026). Ordered: the first matching glob wins. A tool no named
+# entry matches is irreversible (the last entry): a payments server's unknown tool may move money, so it is locked
+# to the owner's approval. stripe_api_write is irreversible too unless tag_for_call finds a safe target.
 MCP_CLASSIFY = [
     ("stripe_api_search", "read"), ("stripe_api_details", "read"), ("stripe_api_read", "read"),
     ("get_stripe_account_info", "read"), ("stripe_analytics", "read"), ("search_stripe_documentation", "read"),
     ("stripe_implementation_planner", "read"),
-    ("stripe_api_write", "publish"),
+    ("stripe_api_write", "irreversible"),
     ("send_money", "spend"), ("transfer_money", "spend"), ("convert_currency", "spend"),
     ("setup_recipient", "write"),
     ("atlas_company_formation", "irreversible"), ("send_stripe_feedback", "irreversible"),
+    ("*", "irreversible"),
 ]
 MCP_READ = [g for g, t in MCP_CLASSIFY if t == "read"]
 # Read tools for every role; the rest only for the roles that handle money and the product's checkout.
 MCP_ALLOW = {"*": list(MCP_READ), "ceo": ["*"], "engineering": ["*"], "ops": ["*"], "analyst": ["*"],
              "sales": ["*"]}
-_DESTRUCTIVE = ("refund", "cancel", "delete")
+_DESTRUCTIVE = ("refund", "cancel", "delete", "dispute", "reverse", "void")
+_MONEY_OUT = ("payout", "transfer")
+# The only writes that ask under connector_publish: creating or updating products, prices and payment links
+# (POST /v1/products, POST /v1/prices/price_1, ...). Anything else stripe_api_write can do is irreversible.
+SAFE_WRITE_TARGETS = ("products", "prices", "payment_links")
+_SAFE_PATH = re.compile(r"^/?(?:v1/)?(?:" + "|".join(SAFE_WRITE_TARGETS) + r")(?:/[A-Za-z0-9_]+)?/?$")
+_TARGET_KEYS = ("path", "endpoint", "url", "resource")
 
 
 def classify(tool: str) -> str | None:
@@ -558,17 +595,24 @@ def classify(tool: str) -> str | None:
 
 
 def tag_for_call(tool: str, args: dict | None) -> str | None:
-    """stripe_api_write carries the API method it will call: a refund, cancel or delete is irreversible (locked),
-    a payout moves money out (spend, locked). None keeps the classification map's tag."""
+    """The tag of one stripe_api_write call (the definition lets this answer lower the map's irreversible):
+    publish only for a POST that creates or updates a product, a price or a payment link, named by one path;
+    spend for a payout or a transfer; irreversible for everything else (refunds, cancellations, deletions, and
+    any target Holdco cannot read). None for other tools keeps the map's tag."""
     if tool != "stripe_api_write":
         return None
-    blob = json.dumps(args or {}, sort_keys=True, default=str).lower()
-    method = str((args or {}).get("method") or (args or {}).get("http_method") or "").upper()
-    if method == "DELETE" or any(w in blob for w in _DESTRUCTIVE):
+    args = args if isinstance(args, dict) else {}
+    blob = json.dumps(args, sort_keys=True, default=str).lower()
+    if any(w in blob for w in _DESTRUCTIVE):
         return "irreversible"
-    if "payout" in blob:
+    if any(w in blob for w in _MONEY_OUT):
         return "spend"
-    return None
+    method = str(args.get("method") or args.get("http_method") or "POST").strip().upper()
+    targets = [str(args[k]).strip() for k in _TARGET_KEYS if args.get(k)]
+    if method != "POST" or len(targets) != 1:
+        return "irreversible"
+    path = urllib.parse.urlparse(targets[0]).path if "://" in targets[0] else targets[0].split("?", 1)[0]
+    return "publish" if _SAFE_PATH.match(path) else "irreversible"
 
 
 def _company_of(inst: dict) -> dict | None:
@@ -656,6 +700,7 @@ MCP_DEFINITION = {
     "mcp_headers": mcp_headers,
     "active": mcp_active,
     "tag_for_call": tag_for_call,
+    "tag_for_call_lowers": True,      # tag_for_call decides stripe_api_write's tag outright (see there)
 }
 
 # Both definitions this module provides, by key (connectors.DEFINITIONS merges them).

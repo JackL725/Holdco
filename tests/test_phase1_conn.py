@@ -331,14 +331,17 @@ class TestStripe(unittest.TestCase):
         self.assertEqual(self.fake.refunds, [])   # nothing ran
         # After the owner approves, the executor runs the tool against Stripe.
         self.fake.add_charge(amount=1900)
-        done = self.call("create_refund", payment_intent="pi_1", amount_usd=5)
+        done = self.call("create_refund", payment_intent="pi_1", amount_usd=5, approval_id=41)
         self.assertIn("Refunded $5.00 on pi_1", done)
         self.assertEqual(self.fake.refunds[0]["amount"], 500)
-        self.assertTrue(self.fake.posts("/v1/refunds")[0]["idempotency_key"].startswith("holdco-"))
-        again = self.call("create_refund", payment_intent="pi_1", amount_usd=5)   # the fake has no replay cache
+        self.assertTrue(self.fake.posts("/v1/refunds")[0]["idempotency_key"].startswith("holdco-approval-41-"))
+        # the same approval again (a retry): the fake has no replay cache
+        again = self.call("create_refund", payment_intent="pi_1", amount_usd=5, approval_id=41)
         self.assertNotIn(STRIPE_KEY, again)
         keys = [r["idempotency_key"] for r in self.fake.posts("/v1/refunds")]
-        self.assertEqual(keys[0], keys[1])   # a retried refund carries the same key, so real Stripe replays it
+        # A retried approval carries the same key, so real Stripe replays it. (Independent review: the key comes
+        # from the approval now, so two approvals for the same amount are two refunds; tests/test_phase1_review.py.)
+        self.assertEqual(keys[0], keys[1])
         set_settings(self.company, policies={})
 
     def test_metrics_from_charges_and_subscriptions(self):
@@ -397,20 +400,22 @@ class TestStripe(unittest.TestCase):
         for name in ("stripe_api_search", "stripe_api_read", "get_stripe_account_info", "stripe_analytics",
                      "search_stripe_documentation", "stripe_implementation_planner", "stripe_api_details"):
             self.assertEqual(c(name), "read")
-        self.assertEqual(c("stripe_api_write"), "publish")
+        # Independent review: stripe_api_write is irreversible unless its target is on the safe list, and a tool
+        # the map does not name is irreversible too (it was publish and unclassified before).
+        self.assertEqual(c("stripe_api_write"), "irreversible")
         self.assertEqual(c("send_money"), "spend")
         self.assertEqual(c("convert_currency"), "spend")
         self.assertEqual(c("setup_recipient"), "write")
         self.assertEqual(c("atlas_company_formation"), "irreversible")
         self.assertEqual(c("send_stripe_feedback"), "irreversible")
-        self.assertIsNone(c("brand_new_tool"))   # unclassified: the framework asks
+        self.assertEqual(c("brand_new_tool"), "irreversible")
         t = conn_stripe.tag_for_call
         self.assertEqual(t("stripe_api_write", {"method": "POST", "path": "/v1/refunds"}), "irreversible")
         self.assertEqual(t("stripe_api_write", {"method": "POST", "path": "/v1/subscriptions/sub_1/cancel"}),
                          "irreversible")
         self.assertEqual(t("stripe_api_write", {"method": "DELETE", "path": "/v1/products/prod_1"}), "irreversible")
         self.assertEqual(t("stripe_api_write", {"method": "POST", "path": "/v1/payouts"}), "spend")
-        self.assertIsNone(t("stripe_api_write", {"method": "POST", "path": "/v1/products"}))
+        self.assertEqual(t("stripe_api_write", {"method": "POST", "path": "/v1/products"}), "publish")
         self.assertIsNone(t("stripe_api_read", {"path": "/v1/refunds"}))
         mcp_def = conn_stripe.MCP_DEFINITION
         self.assertEqual(mcp_def["kind"], "mcp-http")
@@ -639,6 +644,8 @@ class TestBuffer(unittest.TestCase):
 
     def test_social_post_goes_through_buffer_when_configured(self):
         company = set_settings(self.company, webhook_url=self.hook.url)
+        # Independent review: only the card's default channels are used (none set falls back to the webhook)
+        self.inst["config"]["default_channels"] = "chan_x, chan_li"
         with patched({"buffer": self.inst}):
             out = actions.execute(company, "social_post", {"platform": "linkedin", "content": "Hello dog owners",
                                                            "link": ""})
@@ -698,8 +705,8 @@ class TestPlaywright(unittest.TestCase):
 
     def test_command_and_override(self):
         self.assertEqual(conn_playwright.launch(self.inst),
-                         ("npx", ["-y", "@playwright/mcp@latest", "--headless", "--isolated", "--browser",
-                                  "chromium"]))
+                         ("npx", ["-y", "@playwright/mcp@0.0.83", "--headless", "--isolated", "--browser",
+                                  "chromium"]))   # pinned, not @latest (independent review)
         d = conn_playwright.DEFINITION["mcp"]
         self.assertEqual((d["command"], d["args"]), conn_playwright.launch(self.inst))
         custom = make_inst("playwright", None, {}, command="node /opt/pw/cli.js --headless --isolated")

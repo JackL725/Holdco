@@ -18,19 +18,26 @@ A definition is a dict (see the design's section 5 table): label, category, kind
 builtin), scope (global | company), setup {where_to_get_key, permissions, fields, test_mode, docs_url, agents_can},
 health(inst) -> (status, detail), optional metrics(inst, company) -> [(name, value, note)], tools(inst) for api
 kinds, mcp {command, args, env | url, headers, classify, allow, blocked} for MCP kinds, optional test_mode(inst).
-Optional extras this module also reads: health_timeout (seconds, default 15), oauth (bool, default true for
-mcp-http), tag_for_call(tool, args) -> tag or None and refuse_call(tool, args) -> str or None (checked by call()),
+Optional extras this module also reads: health_timeout (seconds, default 15; for a stdio server also how long its
+first start may take), oauth (bool, default true for mcp-http), tag_for_call(tool, args) -> tag or None and
+refuse_call(tool, args) -> str or None (checked by call()); tag_for_call may only raise the map's tag unless
+tag_for_call_lowers is true (Stripe's allowlist of safe writes); check_result(tool, args, text) -> str or None
+(checked after every MCP result: a text replaces the result with an error, after reset_call (tool, args) has been
+sent); page_of(text) -> url or None with page_query (tool, args) (a call that is not read is tied to the page the
+browser was on when it was asked for, and refused after approval when the page changed);
 metric_prefix (metric names become "<metric_prefix>.<name>"; default the key), launch(inst) -> (command, args) for a
 stdio server's command line, mcp_url(inst) and mcp_headers(inst) for an HTTP server's address and headers,
 active(inst) -> bool with parent and parent_field (the instance only works while its parent's card has that field
 ticked), enabled_by_default (bool, default true), beta (bool), and on fields: secret, hidden (kept off the card,
-such as api_base), type "bool" (stored as true or false) and setting (see above).
+such as api_base; only accepted from the dashboard API while HOLDCO_ALLOW_LOCAL is set, the test switch), type
+"bool" (stored as true or false) and setting (see above).
 
 Nothing here ever puts a secret in an event, a prompt, a tool result or a row: values come from the vault only
 inside connector code, and every text that leaves this module passes vault.redact as a backstop.
 """
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import importlib
 import json
@@ -64,9 +71,13 @@ DEFINITIONS: dict[str, dict] = {}
 POLICY_OF_TAG = {"write": "connector_write", "publish": "connector_publish", "contact": "connector_contact",
                  "spend": "spend_money", "irreversible": "irreversible"}
 
+CALL_LOCK_WAIT = 300               # seconds a call waits while another one uses the same MCP instance
+
 _lock = threading.Lock()            # guards every cache and flag below
 _clients: dict[int, object] = {}    # instance id -> open mcp.Client
 _client_locks: dict[int, threading.Lock] = {}   # one creator per instance at a time
+_call_locks: dict[int, threading.RLock] = {}    # one call (or one browser_check) per MCP instance at a time
+_pages: dict[int, str] = {}         # instance id -> the page its last result named (page_of definitions)
 _tool_cache: dict[int, tuple[float, list]] = {}  # instance id -> (monotonic time, tools/list result)
 _alerted: dict[int, str] = {}       # instance id -> date (YYYY-MM-DD) of its last phone alert
 _checking = False                   # a background health-check pass is running
@@ -378,10 +389,27 @@ def _drop_client(inst_id: int) -> None:
 
 
 def _forget(inst_id: int) -> None:
-    """Drop everything cached for an instance: its client and its tool list."""
+    """Drop everything cached for an instance: its client, its tool list and the page it was last on."""
     _drop_client(inst_id)
     with _lock:
         _tool_cache.pop(inst_id, None)
+        _pages.pop(inst_id, None)
+
+
+@contextlib.contextmanager
+def call_lock(inst_id):
+    """Hold an MCP instance for one call, or for browser_check's whole sequence: one browser is shared by every
+    run, so two agents must never steer it at the same time. Re-entrant within one thread. Raises RuntimeError
+    when the instance stays busy for CALL_LOCK_WAIT seconds."""
+    iid = to_int(inst_id)
+    with _lock:
+        lk = _call_locks.setdefault(iid, threading.RLock())
+    if not lk.acquire(timeout=CALL_LOCK_WAIT):
+        raise RuntimeError("the connected service is busy with another call; try again in a few minutes")
+    try:
+        yield
+    finally:
+        lk.release()
 
 
 def _fill(v, values: dict):
@@ -429,7 +457,13 @@ def _mcp_settings(d: dict, inst: dict) -> dict:
             command, args = d["launch"](inst)
         else:
             command, args = res("command"), res("args")
-        return {"transport": "stdio", "command": command, "args": list(args or []), "env": res("env") or None}
+        kw = {"transport": "stdio", "command": command, "args": list(args or []), "env": res("env") or None}
+        try:   # the first start may download the server (Playwright: 120 s), longer than the usual 30 s
+            if d.get("health_timeout"):
+                kw["connect_timeout"] = float(d["health_timeout"])
+        except (TypeError, ValueError):
+            pass
+        return kw
     headers = dict(res("headers") or {})
     if callable(d.get("mcp_headers")):
         headers.update(d["mcp_headers"](inst) or {})
@@ -699,13 +733,22 @@ def call(ctx, name: str, args: dict) -> str:
         refusal = str(refusal)
         return refusal if refusal.startswith("ERROR") else f"ERROR: {refusal}"
     tag = entry.get("tag") or UNCLASSIFIED
-    try:   # a hook may raise the risk of one call (a refund through a write tool), never lower it
-        tag = _raise_tag(tag, _hook(d, "tag_for_call", tool, args))
+    try:   # a hook may raise the risk of one call (a refund through a write tool), never lower it, unless the
+        # definition says its hook decides outright (Stripe's MCP write tool: irreversible unless allowlisted)
+        hooked = _hook(d, "tag_for_call", tool, args)
+        if d.get("tag_for_call_lowers") and hooked in _RANK:
+            tag = hooked
+        else:
+            tag = _raise_tag(tag, hooked)
     except Exception:   # a broken rule asks the owner rather than lets the call run freely
         tag = _raise_tag(tag, UNCLASSIFIED)
     payload = {"connector_id": inst["id"], "connector": key, "tool": tool, "args": args, "tag": tag}
     if inst["company_id"] is None and d.get("kind") not in MCP_KINDS:
         payload["company_id"] = ctx.company["id"]   # a global api tool needs to know whose work this is
+    if tag != "read" and _page_bound(d):
+        # A click or a typed field belongs to the page it was asked for on; execute() refuses it after approval
+        # when the shared browser is on another page by then.
+        payload["page_url"] = _current_page(d, inst) or ""
     if tag == "read":
         try:
             text = execute(payload, company=ctx.company)
@@ -718,13 +761,98 @@ def call(ctx, name: str, args: dict) -> str:
     return actions.gate(ctx.company, ctx.agent, task_id, "connector_call", payload, policy_action=policy_for(tag))
 
 
-def execute(payload: dict, company: dict | None = None) -> str:
-    """actions.execute for action 'connector_call' (after approval or an auto policy), and read calls. Errors
-    raise RuntimeError so gate reports FAILED and the approval row records the failure."""
+def _page_bound(d: dict | None) -> bool:
+    """Whether calls of this definition are tied to the page the browser is on (Playwright)."""
+    d = d or {}
+    return callable(d.get("page_of")) and bool(d.get("page_query"))
+
+
+def _norm_page(url) -> str:
+    """A page address for comparing: without the #fragment; no page and about:blank are the same."""
+    u = str(url or "").strip().split("#", 1)[0]
+    return "" if u in ("", "about:blank") else u
+
+
+def _note_page(d: dict, iid: int, text: str) -> None:
+    """Remember the page a result names (the session's last snapshot), for when page_query cannot answer."""
+    fn = d.get("page_of")
+    if not callable(fn):
+        return
+    try:
+        url = fn(text)
+    except Exception:
+        url = None
+    if url is not None:
+        with _lock:
+            _pages[iid] = str(url)
+
+
+def _current_page(d: dict, inst: dict) -> str | None:
+    """The page the instance's browser is on now: asked with the definition's page_query (browser_tabs), else the
+    page its last result named, else None. Holds the instance's call lock."""
+    from . import mcp   # imported here: only MCP connectors need it
+    iid = inst["id"]
+    with call_lock(iid):
+        try:
+            q_tool, q_args = d["page_query"]
+            text = mcp.text_of(client(inst).call_tool(q_tool, dict(q_args or {})))
+            url = d["page_of"](text)
+            url = "" if url is None else str(url)   # it answered and named no page: there is none
+            with _lock:
+                _pages[iid] = url
+            return url
+        except Exception:
+            with _lock:
+                return _pages.get(iid)
+
+
+def _reset_page(d: dict, c) -> None:
+    """Send the definition's reset_call (Playwright: browser_navigate to about:blank). Best effort."""
+    reset = d.get("reset_call")
+    if not reset:
+        return
+    try:
+        c.call_tool(reset[0], dict(reset[1] or {}))
+    except Exception as e:
+        print(f"Connector: could not leave a blocked page: {_error_text(e)}")
+
+
+def _check_landing(d: dict, tool: str, args: dict, text: str) -> str | None:
+    """The definition's check_result for one result; a broken rule blocks rather than lets the page through."""
+    fn = d.get("check_result")
+    if not callable(fn):
+        return None
+    try:
+        refusal = fn(tool, args, text)
+    except Exception as e:
+        refusal = f"ERROR: the page could not be checked ({_error_text(e)}); Holdco blocks it"
+    return str(refusal) if refusal else None
+
+
+def _owner_company_id(payload: dict, company) -> int | None:
+    """The company whose request this is: the approval's (passed by actions.execute), else the payload's."""
+    if company is not None:
+        return _cid(company)
+    return to_int(payload.get("company_id")) or None
+
+
+def execute(payload: dict, company: dict | None = None, approval_id: int | None = None) -> str:
+    """actions.execute for action 'connector_call' (after approval or an auto policy), and read calls. company is
+    the company the request belongs to (actions.execute passes the approval's); approval_id, when the call runs an
+    approval, reaches tools that ask for it (Stripe's refund keys its idempotency on it). Errors raise RuntimeError
+    so gate reports FAILED and the approval row records the failure."""
     inst = get(payload.get("connector_id"))
     key, tool = str(payload.get("connector") or ""), str(payload.get("tool") or "")
     if not inst:
         raise RuntimeError(f"The {key} connector was removed.")
+    # A request names its instance by id, and SQLite gives a deleted row's id to the next one: make sure this is
+    # still the connector, and the company, the request was made for.
+    if key and inst["key"] != key:
+        raise RuntimeError(f"The {key} connector this request was made for was removed; ask again.")
+    owner = _owner_company_id(payload, company)
+    if inst["company_id"] is not None and inst["company_id"] != owner:
+        raise RuntimeError(f"The {key or inst['key']} connector this request was made for belongs to another "
+                           "company now; ask again.")
     d = DEFINITIONS.get(inst["key"])
     if not d:
         raise RuntimeError(GONE_TEXT)
@@ -740,15 +868,29 @@ def execute(payload: dict, company: dict | None = None) -> str:
         if tool in _blocked(d):
             raise RuntimeError(f"{tool} is not available through Holdco")
         from . import mcp   # imported here: only MCP connectors need it
-        try:
-            result = client(inst).call_tool(tool, args)
-        except Exception as e:
-            with _lock:
-                c = _clients.get(inst["id"])
-            if c is not None and (not _alive(c) or isinstance(e, mcp.AuthRequired)):
-                _drop_client(inst["id"])
-            raise RuntimeError(f"{label} {tool} failed: {_error_text(e)}") from None
-        text = _redact(mcp.text_of(result) if isinstance(result, dict) else str(result or ""))
+        with call_lock(inst["id"]):   # one call at a time on a shared browser
+            if _page_bound(d) and str(payload.get("tag") or "") != "read":
+                now = _current_page(d, inst)
+                if now is None or _norm_page(now) != _norm_page(payload.get("page_url")):
+                    raise RuntimeError("the page changed since this was requested; ask again")
+            try:
+                c = client(inst)
+                result = c.call_tool(tool, args)
+            except Exception as e:
+                with _lock:
+                    c = _clients.get(inst["id"])
+                if c is not None and (not _alive(c) or isinstance(e, mcp.AuthRequired)):
+                    _drop_client(inst["id"])
+                raise RuntimeError(f"{label} {tool} failed: {_error_text(e)}") from None
+            raw = mcp.text_of(result) if isinstance(result, dict) else str(result or "")
+            refusal = _check_landing(d, tool, args, raw)
+            if refusal:   # the page ended up on this PC or the home network: leave it, and say so instead
+                _reset_page(d, c)
+                with _lock:
+                    _pages[inst["id"]] = ""
+                raise RuntimeError(refusal.removeprefix("ERROR: ").strip())
+            _note_page(d, inst["id"], raw)
+        text = _redact(raw)
         if isinstance(result, dict) and result.get("isError"):
             raise RuntimeError(text.removeprefix("ERROR: ").strip() or f"{label} {tool} reported an error.")
         return text
@@ -758,6 +900,9 @@ def execute(payload: dict, company: dict | None = None) -> str:
     if company is None:
         cid = inst["company_id"] if inst["company_id"] is not None else payload.get("company_id")
         company = db.get_company(to_int(cid)) if cid else None
+    args = {k: v for k, v in args.items() if k != "approval_id"}   # never from the agent or an edited payload
+    if spec.get("takes_approval_id"):
+        args["approval_id"] = to_int(approval_id) or None
     try:
         out = spec["fn"](inst, company, **args)
     except Exception as e:
@@ -1054,6 +1199,12 @@ def _truthy(v) -> bool:
     return bool(v)
 
 
+def _test_setup() -> bool:
+    """HOLDCO_ALLOW_LOCAL is set: the test-only switch (the end-to-end and integration tests set it). Read at every
+    save, so a test can set it for its own length."""
+    return bool((os.environ.get("HOLDCO_ALLOW_LOCAL") or "").strip())
+
+
 def save(b: dict) -> tuple[dict, tuple[str, str]]:
     """Create or update an instance from the dashboard's body {"id"?, key, company_id, enabled, config} and run
     its health check. Secret fields go to the vault (the mask keeps a secret, an empty value deletes it); only
@@ -1099,6 +1250,10 @@ def save(b: dict) -> tuple[dict, tuple[str, str]]:
         f = fields.get(k) or {}
         if v is not None and not isinstance(v, (str, bool, int, float)):
             raise HTTPError(400, f"{label}: {f.get('label') or k} must be a single value.")
+        if (k == "api_base" or f.get("hidden")) and v not in (None, "") and not _test_setup():
+            # Hidden fields point the connector, and the key it sends as a Bearer header, at another address:
+            # only the test suite's fakes need that (the dashboard never sends them).
+            raise HTTPError(400, f"{k} can only be changed in a test setup")
         if k in setting_keys:   # Brave's key: the global setting, never a copy under this instance
             if v is None or (f.get("secret") and v == MASK):
                 continue
@@ -1208,6 +1363,8 @@ def remove(inst_id: int) -> None:
     with _lock:
         _alerted.pop(iid, None)
         _client_locks.pop(iid, None)
+        _call_locks.pop(iid, None)
+        _pages.pop(iid, None)
     _sync_doctor(removed=iid)
     _changed(inst.get("company_id"))
 

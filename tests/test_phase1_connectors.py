@@ -277,7 +277,9 @@ class Base(unittest.TestCase):
                                                                                  "redact")]
         patches += [mock.patch.object(connectors, "client", lambda inst: self.stub),
                     mock.patch.object(mcp, "text_of", fake_text_of),
-                    mock.patch.object(notify, "send", side_effect=lambda text, *a, **kw: self.alerts.append(text))]
+                    mock.patch.object(notify, "send", side_effect=lambda text, *a, **kw: self.alerts.append(text)),
+                    # the test switch: only with it may a card's hidden api_base be set through the API
+                    mock.patch.dict(os.environ, {"HOLDCO_ALLOW_LOCAL": "127.0.0.1:*"})]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)

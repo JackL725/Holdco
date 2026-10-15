@@ -3,7 +3,7 @@
 Speaks the 2026-07-28 stateless generation (server/discover, namespaced _meta keys, Mcp-Method and Mcp-Name
 headers) and falls back to the 2025-11-25 initialize handshake, over stdio (a child process) or Streamable HTTP.
 
-    client = mcp.Client("playwright", "stdio", command="npx", args=["-y", "@playwright/mcp@latest"]).connect()
+    client = mcp.Client("playwright", "stdio", command="npx", args=["-y", "@playwright/mcp@0.0.83"]).connect()
     tools = client.list_tools()
     text = mcp.text_of(client.call_tool("browser_navigate", {"url": "https://example.com"}))
     client.close()
@@ -54,6 +54,12 @@ CONNECT_TIMEOUT = 30.0
 CALL_TIMEOUT = 120.0
 KILL_AFTER = 5.0           # close(): seconds between terminate and kill
 STDERR_KEEP = 4000         # characters of a stdio server's stderr kept for error messages
+MAX_REPLY = 5_000_000      # bytes: the most an HTTP reply, or one event of a reply stream, may hold
+READ_CHUNK = 65536         # bytes per read, so the call's deadline is checked while a reply arrives
+ERROR_BODY_KEEP = 65536    # bytes of an HTTP error's body read for its message
+# Holdco's own settings (HOLDCO_VAULT_PASSPHRASE, HOLDCO_PASSWORD, ...) and the model server's never reach a stdio
+# server's environment, unless its definition sets one on purpose.
+PRIVATE_ENV_PREFIXES = ("HOLDCO", "OLLAMA")
 
 INPUT_REQUIRED = "the server needs input Holdco cannot provide"
 CLIENT_INFO = {"name": "holdco", "version": __version__}
@@ -167,9 +173,11 @@ def _auth_required(url: str, header: str | None) -> AuthRequired:
     return AuthRequired(meta_url, _www_authenticate_param(header or "", "scope"))
 
 
-def _parse_sse(lines):
-    """Messages from a text/event-stream: data lines are joined per event and parsed as JSON (others skipped)."""
+def _parse_sse(lines, limit: int | None = None, too_big=None):
+    """Messages from a text/event-stream: data lines are joined per event and parsed as JSON (others skipped).
+    With limit, an event whose data grows past that many characters raises too_big() (an MCPError)."""
     data: list[str] = []
+    size = 0
     for raw in lines:
         line = raw.rstrip("\r\n")
         if not line:
@@ -178,7 +186,7 @@ def _parse_sse(lines):
                     yield json.loads("\n".join(data))
                 except ValueError:
                     pass
-                data = []
+                data, size = [], 0
             continue
         if line.startswith(":"):
             continue   # a comment (keep-alive)
@@ -187,6 +195,9 @@ def _parse_sse(lines):
             value = value[1:]
         if field == "data":
             data.append(value)
+            size += len(value) + 1
+            if limit is not None and size > limit:
+                raise too_big() if too_big else MCPError("an event in the reply stream is too large")
     if data:   # the stream ended without the blank line that closes an event: use it if it is whole
         try:
             yield json.loads("\n".join(data))
@@ -205,11 +216,30 @@ _direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedire
 _proxied = urllib.request.build_opener(_NoRedirect)
 
 
+def _read_timeout(resp, seconds: float) -> None:
+    """Let the next read on an HTTP reply wait at most `seconds` (the time left before the call's deadline). The
+    socket sits inside http.client's reader; when it cannot be reached the timeout set at connect stays."""
+    try:
+        sock = resp.fp.raw._sock
+        sock.settimeout(max(0.05, seconds))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def _open(req: urllib.request.Request, timeout: float):
     # Local servers (and the test fakes) never go through a proxy; remote ones use the system proxy settings.
     host = urllib.parse.urlsplit(req.full_url).hostname or ""
     opener = _direct if host in ("127.0.0.1", "localhost", "::1") else _proxied
     return opener.open(req, timeout=timeout)
+
+
+def child_env(extra: dict | None = None) -> dict:
+    """The environment of a stdio server: Holdco's own, without HOLDCO_* and OLLAMA_* variables (the vault
+    passphrase and the dashboard password among them), with the definition's env on top (which may set one of
+    those on purpose)."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(PRIVATE_ENV_PREFIXES)}
+    env.update({str(k): str(v) for k, v in (extra or {}).items()})
+    return env
 
 
 # ---------------- transports ----------------
@@ -224,7 +254,7 @@ class _StdioTransport:
         self.name = name
         self.command = command
         self.args = [str(a) for a in (args or ())]
-        self.env = {**os.environ, **{str(k): str(v) for k, v in (env or {}).items()}}
+        self.env = child_env(env)
         self.proc: subprocess.Popen | None = None
         self._pending: dict = {}
         self._pending_lock = threading.Lock()
@@ -560,7 +590,7 @@ class _HttpTransport:
             try:
                 if resp.headers.get_content_type() == "text/event-stream":
                     return self._read_sse(resp, msg["id"], deadline, method, timeout)
-                body = resp.read()
+                body = b"".join(self._chunks(resp, deadline, method, timeout, "reply"))
             except (TimeoutError, socket.timeout):
                 raise MCPError(f"{self.name}: no reply to {method} within {timeout:g} s") from None
             except (OSError, http.client.HTTPException) as e:
@@ -575,17 +605,44 @@ class _HttpTransport:
                 return candidate
         return None
 
+    def _too_big(self, what: str) -> MCPError:
+        return MCPError(f"{self.name}: the {what} from {self.shown} is larger than {MAX_REPLY / 1_000_000:g} MB; "
+                        "Holdco stopped reading it")
+
+    def _chunks(self, resp, deadline: float, method, timeout: float, what: str):
+        """The body in pieces of at most READ_CHUNK bytes. Each read may wait only until the call's deadline (not a
+        fresh timeout per read, so a server that trickles bytes cannot hold the call open), and a plain reply over
+        MAX_REPLY bytes raises (what="reply"; a reply stream is capped per event by its reader instead)."""
+        total = 0
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise MCPError(f"{self.name}: no reply to {method} within {timeout:g} s")
+            _read_timeout(resp, left)
+            chunk = resp.read1(READ_CHUNK) if hasattr(resp, "read1") else resp.read(READ_CHUNK)
+            if not chunk:
+                return
+            total += len(chunk)
+            if what == "reply" and total > MAX_REPLY:
+                raise self._too_big("reply")
+            yield chunk
+
     def _read_sse(self, resp, want_id, deadline: float, method, timeout: float):
         def lines():
-            while True:
-                line = resp.readline()
-                if not line:
-                    return
-                yield line.decode("utf-8", "replace")
-                if time.monotonic() > deadline:
-                    raise MCPError(f"{self.name}: no reply to {method} within {timeout:g} s")
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            pending = ""
+            for chunk in self._chunks(resp, deadline, method, timeout, "stream"):
+                pending += decoder.decode(chunk)
+                *whole, pending = pending.split("\n")
+                for line in whole:
+                    yield line + "\n"
+                if len(pending) > MAX_REPLY:   # one line (one event's data) that never ends
+                    raise self._too_big("reply stream event")
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                yield pending
         try:
-            for message in _parse_sse(lines()):
+            for message in _parse_sse(lines(), limit=MAX_REPLY, too_big=lambda: self._too_big("reply stream event")):
                 if isinstance(message, list):
                     message = next((m for m in message if isinstance(m, dict) and m.get("id") == want_id), None)
                 if isinstance(message, dict) and message.get("id") == want_id and "method" not in message:
@@ -598,7 +655,7 @@ class _HttpTransport:
 
     def _http_error(self, e: urllib.error.HTTPError) -> MCPError:
         try:
-            body = e.read() or b""
+            body = e.read(ERROR_BODY_KEEP) or b""
         except (OSError, http.client.HTTPException):
             body = b""
         finally:
@@ -643,7 +700,8 @@ class Client:
     """One MCP server. Thread-safe: several agents may call tools at the same time."""
 
     def __init__(self, name: str, transport: str, command: str | None = None, args=(), env: dict | None = None,
-                 url: str | None = None, headers: dict | None = None, auth=None):
+                 url: str | None = None, headers: dict | None = None, auth=None,
+                 connect_timeout: float | None = None):
         if transport not in ("stdio", "http"):
             raise MCPError(f"{name}: unknown transport {transport!r} (use stdio or http)")
         if transport == "stdio" and not command:
@@ -656,6 +714,9 @@ class Client:
         self.transport = transport
         self.command, self.args, self.env = command, list(args or ()), dict(env or {})
         self.url, self.headers, self.auth = url, dict(headers or {}), auth
+        # Seconds the protocol negotiation may take; None means CONNECT_TIMEOUT. A stdio server whose first start
+        # downloads itself (Playwright) needs longer.
+        self.connect_timeout = connect_timeout
         self.protocol: str | None = None       # "2026-07-28", or the version the server returned on initialize
         self.server_info: dict = {}
         self.server_capabilities: dict = {}
@@ -707,9 +768,16 @@ class Client:
 
     # -- negotiation --
 
+    def _connect_timeout(self) -> float:
+        """This client's negotiation time limit (read at use, so tests can patch CONNECT_TIMEOUT)."""
+        try:
+            return float(self.connect_timeout) if self.connect_timeout else CONNECT_TIMEOUT
+        except (TypeError, ValueError):
+            return CONNECT_TIMEOUT
+
     def _negotiate(self) -> None:
         try:
-            result = self._send("server/discover", {}, CONNECT_TIMEOUT, "new")
+            result = self._send("server/discover", {}, self._connect_timeout(), "new")
         except AuthRequired:
             raise
         except RPCError as e:
@@ -734,7 +802,7 @@ class Client:
             self._t.session_id = None
             self._t.protocol_header = None
         params = {"protocolVersion": FALLBACK, "capabilities": {}, "clientInfo": dict(CLIENT_INFO)}
-        result = self._send("initialize", params, CONNECT_TIMEOUT, "old")
+        result = self._send("initialize", params, self._connect_timeout(), "old")
         version = result.get("protocolVersion")
         if version not in OLDER_ACCEPTED:
             raise MCPError("unsupported protocol version")
@@ -744,7 +812,7 @@ class Client:
         self.server_capabilities = result.get("capabilities") or {}
         if isinstance(self._t, _HttpTransport):
             self._t.protocol_header = version
-        self._t.notify({"jsonrpc": "2.0", "method": "notifications/initialized"}, CONNECT_TIMEOUT, "old")
+        self._t.notify({"jsonrpc": "2.0", "method": "notifications/initialized"}, self._connect_timeout(), "old")
 
     # -- requests --
 

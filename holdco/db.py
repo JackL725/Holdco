@@ -240,16 +240,20 @@ def get_settings() -> dict:
     for k in config.LOCKED_POLICIES:
         pol[k] = "approve"
     s["policies"] = pol
-    return _resolve_secrets(s)
+    return _resolve_secrets(s, config.SECRET_SETTINGS)
 
 
 _secret_warned: set[str] = set()   # vault names whose read failure was already printed
 
 
-def _resolve_secrets(s: dict) -> dict:
+def _resolve_secrets(s: dict, keys=None) -> dict:
     """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing).
-    The result holds real secrets: never write it back to a table (update_company_settings does that safely)."""
-    names = [k for k, v in s.items() if isinstance(v, str) and v.startswith("vault:")]
+    Only the secret keys are resolved (keys: config.SECRET_SETTINGS or config.SECRET_COMPANY_SETTINGS; both when
+    None): any other setting that happens to read "vault:..." (a directive an agent or the owner typed) stays text,
+    so it can never pull a secret out of the vault. The result holds real secrets: never write it back to a table
+    (update_company_settings does that safely)."""
+    allowed = set(keys) if keys is not None else set(config.SECRET_SETTINGS) | set(config.SECRET_COMPANY_SETTINGS)
+    names = [k for k, v in s.items() if k in allowed and isinstance(v, str) and v.startswith("vault:")]
     if names:
         from . import vault   # imported here: vault imports db
         for k in names:
@@ -326,7 +330,7 @@ def company_settings(company: dict) -> dict:
         s.update(json.loads(company.get("settings") or "{}"))
     except ValueError:
         pass
-    return _resolve_secrets(s)
+    return _resolve_secrets(s, config.SECRET_COMPANY_SETTINGS)
 
 
 def update_company_settings(company_id: int, **changes) -> dict:
