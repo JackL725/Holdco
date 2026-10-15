@@ -32,14 +32,34 @@ class WebError(Exception):
 
 # ---------------- safety ----------------
 
+# Relay services fetch another site on an agent's behalf (a test company read a 403 page through r.jina.ai). They
+# hide where requests really go and break the sites' terms, so they are refused. Exact hosts (and their
+# subdomains), host suffixes, and host prefixes, kept in one place.
+RELAY_HOSTS = ("r.jina.ai", "s.jina.ai", "12ft.io", "allorigins.win", "corsproxy.io", "thingproxy.freeboard.io")
+RELAY_SUFFIXES = (".translate.goog",)
+RELAY_PREFIXES = ("cors-anywhere",)
+RELAY_HINT = "Use the search result's snippet, or find another source for the same information."
+BLOCKED_HINT = ("The site refuses automated readers. Use the search result's snippet or another source; do not use "
+                "relay services such as r.jina.ai (Holdco blocks them).")
+
+
+def is_relay(host: str) -> bool:
+    h = (host or "").lower().rstrip(".")
+    return (any(h == r or h.endswith("." + r) for r in RELAY_HOSTS) or h.endswith(RELAY_SUFFIXES)
+            or h.startswith(RELAY_PREFIXES))
+
+
 def check_public_url(url: str) -> str:
-    """Agents may only reach the public internet, never this PC or your home network."""
+    """Agents may only reach the public internet, never this PC or your home network, and never through a relay."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise WebError("Only http(s) URLs are allowed.")
     host = parsed.hostname
     if not host:
         raise WebError("URL has no host.")
+    if is_relay(host):
+        raise WebError(f"{host} is a relay that fetches other sites for you. Relays hide where requests go and break "
+                       f"the site's terms, so Holdco blocks them. {RELAY_HINT}")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
@@ -166,7 +186,8 @@ def fetch_page(url: str, max_chars: int = 9000, include_links: bool = False) -> 
     status, ctype, body, final = http_get(url)
     text = _decode(body, ctype)
     if status >= 400:
-        return f"HTTP {status} fetching {url}\n{text[:500]}"
+        hint = f"{BLOCKED_HINT}\n" if status == 403 else ""
+        return f"HTTP {status} fetching {url}\n{hint}{text[:500]}"
     if "html" in ctype or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
         title, content, links = html_to_text(text, final)
         out = f"Title: {title}\nURL: {final}\n\n{content[:max_chars]}"
