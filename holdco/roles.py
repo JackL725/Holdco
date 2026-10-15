@@ -6,6 +6,8 @@ from . import presets
 FOUNDING_TOOLS = ["web_search", "fetch_url", "write_file", "read_file", "update_charter", "create_task", "remember",
                   "report_to_owner", "finish"]
 CHAT_EXTRA = ["list_tasks", "create_task", "update_task", "report_to_owner"]
+# Tools every role gets in task runs, on top of its preset's belt (Phase 0: working notes).
+TASK_EXTRA = ["note_progress"]
 
 
 def preset_key(agent: dict) -> str:
@@ -30,6 +32,8 @@ def tools_for(agent: dict, kind: str) -> list[str]:
         names.append("finish")
     if kind == "chat":
         names = [n for n in names if n != "finish"] + CHAT_EXTRA
+    elif kind == "task":
+        names = [n for n in names if n != "finish"] + TASK_EXTRA + ["finish"]
     seen, out = set(), []
     for n in names:
         if n not in seen:

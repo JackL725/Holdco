@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, name TEXT, value REAL, note TEXT DEFAULT '',
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY, created_at TEXT, company_id INTEGER, action TEXT, proposed_by TEXT DEFAULT '',
+    approved_by TEXT DEFAULT '', payload TEXT DEFAULT '{}', result TEXT DEFAULT '', approval_id INTEGER
+);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
+CREATE INDEX IF NOT EXISTS ix_audit_company ON audit(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_tasks_company ON tasks(company_id, status);
 CREATE INDEX IF NOT EXISTS ix_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS ix_memory_company ON memory(company_id);
@@ -105,7 +110,9 @@ def minutes_since(s: str | None) -> float:
 # Columns added after the first release; added to older databases on start.
 MIGRATIONS = {
     "agents": {"preset": "TEXT DEFAULT ''", "reasoning": "TEXT DEFAULT ''", "routines_on": "INTEGER DEFAULT 1"},
-    "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''"},
+    "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''",
+              # Phase 0: working notes that survive retries, and how often a task changed hands (watchdog)
+              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0"},
 }
 
 

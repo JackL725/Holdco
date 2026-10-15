@@ -6,7 +6,7 @@ import json
 import threading
 import traceback
 
-from . import bus, config, db, llm, presets, roles, tools, workspace
+from . import bus, config, db, llm, presets, roles, tools, watchdog, workspace
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
@@ -178,8 +178,16 @@ def cycle_prompt(company: dict) -> str:
 
 def task_prompt(company: dict, task: dict) -> str:
     prior = f"\nNotes from earlier attempts or reviews:\n{task['result'][-1500:]}\n" if task.get("result") else ""
-    retry = (f"\n(This is attempt {task['attempts']}. Earlier attempts didn't finish, so keep the scope tight and "
-             f"save progress early.)\n") if task.get("attempts", 0) > 1 else ""
+    notes = f"\nWorking notes from earlier attempts (continue from here):\n{task['notes'][-3000:]}\n" \
+        if task.get("notes") else ""
+    retry = ""
+    if task.get("attempts", 0) > 1:
+        try:
+            retry = "\n" + watchdog.retry_guidance(task) + "\n"
+        except NotImplementedError:
+            retry = (f"\n(This is attempt {task['attempts']}. Earlier attempts didn't finish, so keep the scope tight "
+                     f"and save progress early.)\n")
+    prior += notes
     deliverable = task.get("deliverable") or "(not specified: choose a sensible file path and name it in finish)"
     acceptance = task.get("acceptance") or "(none given: use your role's definition of done)"
     routine = "\nThis is one of your recurring duties.\n" if task.get("routine") else ""
@@ -345,6 +353,9 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     try:
         with slot:
             for step in range(max_steps):
+                if kind != "chat" and db.get_settings().get("kill_switch"):
+                    status, error = "stopped", "Kill switch: the owner stopped all agents."
+                    break
                 if kind in ("task", "cycle"):
                     c = db.get_company(company["id"])
                     a = db.get_agent(agent_id)
@@ -416,6 +427,22 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, tokens, steps)
 
 
+def _auto_note(agent: dict, task: dict, ctx, messages: list[dict], status: str, error: str) -> str:
+    """What an attempt that did not finish cleanly leaves behind for the next one."""
+    how = ctx.finish_status if ctx.finished else (status or "unknown")
+    calls = [tc for m in messages if m.get("role") == "assistant" for tc in (m.get("tool_calls") or [])]
+    last = "; ".join(f"{c['name']}({json.dumps(c.get('arguments') or {}, default=str)[:80]})" for c in calls[-3:])
+    parts = [f"Attempt {task.get('attempts') or 1} ended: {how}" + (f" ({error})" if error else "")]
+    if ctx.written:
+        parts.append("Files written: " + ", ".join(sorted(ctx.written)[:12]))
+    if last:
+        parts.append("Last tool calls: " + last)
+    errors = [m["content"][:160] for m in messages if m.get("role") == "tool" and str(m.get("content", "")).startswith(("ERROR", "FAILED"))]
+    if errors:
+        parts.append("Last error: " + errors[-1])
+    return "\n".join(parts)
+
+
 def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, tokens, steps) -> None:
     ts = db.now()
     cid, aid = company["id"], agent["id"]
@@ -444,12 +471,26 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
                 if ctx.deliverable and not t.get("deliverable"):
                     fields["deliverable"] = ctx.deliverable[:200]
                 db.update("tasks", t["id"], **fields)
+                clean = ctx.finished and ctx.finish_status in ("done", "waiting", "blocked")
+                if not clean:
+                    # Phase 0: keep what this attempt learned, and let the watchdog decide whether to retry
+                    # differently or ask the owner.
+                    try:
+                        watchdog.add_note(t["id"], _auto_note(agent, t, ctx, messages, status, error), "auto")
+                        watchdog.task_failed(db.get_task(t["id"]), note, status if not ctx.finished else ctx.finish_status)
+                    except NotImplementedError:
+                        pass
             bus.notify("tasks", company_id=cid)
         if kind == "founding":
             c = db.get_company(cid)
             if status in ("done", "out_of_steps") and c["status"] == "founding":
                 db.update("companies", cid, status="active", last_cycle_at=ts)
                 bus.emit(cid, "founding", f"{c['name']} is up and running. The team is starting on the first tasks.", aid)
+                if status == "out_of_steps" or (ctx.finished and ctx.finish_status != "done"):
+                    try:
+                        watchdog.founding_ended(db.get_company(cid), ctx.finish_status if ctx.finished else status, summary)
+                    except NotImplementedError:
+                        pass
             elif status == "error":
                 bus.emit(cid, "error", f"Founding stopped: {error}. Fix the model connection in Settings, then press "
                          "“Retry founding”.", aid)

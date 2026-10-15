@@ -660,3 +660,8 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
 
 def role_tools(agent: dict, kind: str) -> list[dict]:
     return specs(roles.tools_for(agent, kind))
+
+
+# Feature modules register extra tools with @tool when imported. Keep this at the very end so `tool`, `S`,
+# `I`, `Ctx` and `ToolError` exist before they run.
+from . import watchdog  # noqa: E402,F401  (note_progress lives with the working-notes logic)

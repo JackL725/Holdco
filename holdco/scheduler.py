@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 
-from . import agents, bus, db, emailer, roles
+from . import agents, backup, bus, db, doctor, emailer, notify, roles, watchdog
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -41,6 +41,9 @@ class Scheduler(threading.Thread):
         companies = db.q("SELECT * FROM companies WHERE status='active' ORDER BY id")
         for c in companies:
             self._check_inbox(c)
+        self._housekeeping(s)
+        if s.get("kill_switch"):
+            return   # the kill switch stops every dispatch until the owner turns it off
         if not s.get("scheduler_enabled", True):
             return
         capacity = max(1, int(s.get("max_concurrent_runs", 2)))
@@ -71,6 +74,16 @@ class Scheduler(threading.Thread):
             if agents.is_running(agent["id"]):
                 continue
             agents.start(agent["id"], "task", task_id=t["id"])
+
+    def _housekeeping(self, s: dict) -> None:
+        """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller."""
+        for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller):
+            try:
+                step()
+            except NotImplementedError:
+                pass
+            except Exception:
+                traceback.print_exc()
 
     def _maybe_cycle(self, c: dict) -> None:
         ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
