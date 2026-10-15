@@ -62,8 +62,19 @@ No cloud AI, no API bills, no pip installs.
   experiments with real customers, metrics and traps.
 - **Search that keeps working.** Brave, SearXNG, the `ddgs` package and DuckDuckGo's HTML pages are tried in
   order; a provider that fails or is blocked is skipped for ten minutes while the others carry on.
-- **Integrations:** company email (SMTP/IMAP; inbound mail becomes support tasks), website publishing (Netlify),
-  and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
+- **Connected services.** Stripe (payment links, payments, revenue), Resend (sending email), a Playwright browser,
+  Buffer (social posting, beta) and Brave search connect through setup cards, plus any MCP server. Agents load a
+  service's tools only when they need them with `find_tool`, so their tool lists stay short. Every tool carries a
+  risk tag: reading runs freely, while changing, publishing, contacting people, spending and anything irreversible
+  follow your approval policies, and spending and irreversible actions always ask you.
+- **Numbers nobody typed.** Connected services report metrics on their own every hour: Stripe revenue, payments,
+  customers and MRR, emails sent and replies. Each number shows where it came from.
+- **Keys in a vault.** Passwords, API keys and tokens live in Windows DPAPI, the Linux keyring or an encrypted file,
+  never in the database, and are scrubbed from the feed, transcripts, the audit log and `records/`.
+- **A browser check.** `browser_check` renders a page in a real browser (Playwright) with console errors, links,
+  forms and phone-size screenshots, or runs a labelled static check when Playwright isn't installed.
+- **Also built in:** company email over SMTP/IMAP (inbound mail becomes support tasks), website publishing
+  (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
 
 ## Quick start
 
@@ -205,7 +216,22 @@ Settings and subscribe to it in the app. The same messages arrive as plain text,
 Nothing on your PC is exposed to the network: Holdco asks Telegram for new messages (long polling), so no port
 is opened and no address is published. Messages from any chat other than yours are ignored.
 
-## Connecting the outside world (per company, in its Settings tab)
+## Connecting the outside world
+
+Services live on **connector cards**: per company in its Settings tab (Stripe, Resend, Buffer) and for every company
+on the Settings page (Playwright, Brave). Each card says where to get the key, which permissions to tick, what agents
+will be able to do and in which mode (Stripe starts in test mode with a test key). *Save and test* runs a health
+check; the card then shows the result and the latest numbers it reported. A connector that breaks turns red on the
+Doctor page, sends one phone message a day and is listed to the agents as down so they plan around it. Hosted MCP
+servers that use OAuth get a *Sign in* button.
+
+- **Stripe**: a test key (or, for live use, a restricted key with the Agent tag, which Stripe's MCP server requires
+  from December 2026). Agents can create payment links and read payments; refunds always ask you.
+- **Resend**: an API key and a verified sending domain. Set *Send email with* to auto or Resend in the Email section.
+- **Playwright**: needs Node.js. The first test downloads a browser, so allow a minute.
+- **Buffer**: beta; saved turned off until you switch it on.
+
+The older settings still work:
 
 | What | How | Without it |
 |---|---|---|
@@ -264,8 +290,13 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
   your postal address and an opt-out line, which Holdco adds when missing. Set the postal address in company
   Settings. Pages with placeholders (an analytics id like G-XXXX, lorem ipsum, example.com) can't be deployed.
 - **Relay services blocked.** Agents can't fetch pages through services that hide where requests go.
-- Passwords and tokens you enter, including the Telegram bot token, are stored in plain text in `data/holdco.db`
-  (and in the backups under `data/backups/`). Protect that folder; a credential vault arrives in Phase 1.
+- **Secrets** (mailbox passwords, API keys, the Telegram token, OAuth tokens) are kept in the vault: Windows DPAPI,
+  the Linux keyring via `secret-tool`, or `data/vault.json` encrypted with `data/vault.key` (or with a passphrase in
+  `HOLDCO_VAULT_PASSPHRASE`). Existing plain-text keys move there on the first start. Back up `data/vault.key`
+  with your data; on another computer, DPAPI and keyring secrets have to be entered again.
+- **Connected services** follow the same approval policies as email and posts, by risk tag. A service tool Holdco
+  doesn't know asks you first. The agents' browser runs with its own profile and can't open addresses on your PC
+  or home network.
 - You are the owner of these companies. Laws about marketing email (CAN-SPAM, GDPR), business registration,
   taxes and refunds apply to you, not the AI. Review outreach before you approve it.
 
@@ -304,8 +335,10 @@ python -m unittest discover -s tests -t . -v
 ```
 
 No GPU, model or network needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the
-OpenAI-compatible API) and `tests/fake_telegram.py` for the Telegram Bot API and ntfy, so the whole app runs end
-to end. The suite has about 400 tests: unit suites for the quality checks, the model client, preset integrity,
+OpenAI-compatible API), `tests/fake_telegram.py` for the Telegram Bot API and ntfy, and fakes for Stripe, Resend,
+Buffer, an MCP server (stdio and HTTP, both protocol generations) and an OAuth server, so the whole app runs end
+to end, including an agent creating a Stripe payment link and the revenue arriving by itself. The suite has about
+630 tests: unit suites for the quality checks, the model client, preset integrity,
 file and network safety, tools and approvals, and each Phase 0 module (Doctor, search chain, watchdog and working
 notes, Telegram and ntfy) and each Phase 0.5 module (facts and claims, context and search, planning and
 staged founding), a replay of the first real run's failures through the real agent loop; and a full run of the real server: founding from a template, the 24/7 scheduler,
@@ -323,11 +356,12 @@ request. Each phase document under `docs/phases/` says what was built and how to
 
 1. **Phase 0: Stabilize** (built): Doctor and founding preflight, the search fallback chain,
    the watchdog, working notes, Telegram and ntfy, the kill switch, nightly backups and the audit log.
-2. **Phase 0.5: Ground truth and context** (built in this pull request): facts and records agents can't
+2. **Phase 0.5: Ground truth and context** (built): facts and records agents can't
    edit, a claims gate, one question per topic, change-driven planning, staged founding, charter validation,
    business playbooks, verified research facts, and one search over everything including your own context files.
-3. **Phase 1: Connect** (planned): an MCP client, a credential vault, risk tags on every tool, connector health
-   checks, and the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave).
+3. **Phase 1: Connect** (built in this pull request): an MCP client for both protocol generations, OAuth, a
+   credential vault, risk tags on every tool, connector cards with health checks and metric pipes, `find_tool`,
+   the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave) and `browser_check`.
 4. **Phase 2: Organize** (planned): the company brain with measured goals, task contracts with dependencies,
    daily and weekly rhythms, a daily brief and a decisions queue.
 5. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
@@ -355,6 +389,11 @@ holdco/
   context.py        search index, unified search, line reads, edit_file, your context library
   planning.py       one question per topic, change-driven cycles, budgets, staged founding, charter checks
   playbooks.py      business-type playbooks
+  vault.py          the credential vault (DPAPI, keyring, encrypted file) and redaction
+  mcp.py, oauth.py  MCP client (stdio and Streamable HTTP, both protocol generations) and OAuth with PKCE
+  connectors.py     connector cards, health checks, metric pipes, find_tool, risk-gated calls
+  conn_*.py         Stripe, Resend, Playwright, Buffer and Brave
+  browser.py        browser_check
   llm.py            Ollama / OpenAI-compatible client with tool-call fallbacks
   roles.py          maps agents to presets and tool belts
   web.py            search fallback chain and page fetching
