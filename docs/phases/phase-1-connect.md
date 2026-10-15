@@ -8,10 +8,13 @@ belts stay small, five connectors (Stripe, Resend, Playwright MCP, Buffer, Brave
 with a static fallback. The reasons are in [../plan.md](../plan.md) ("Connectors and MCP") and
 [../connectors.md](../connectors.md); the safety rules in [../safety.md](../safety.md). This document is the "how".
 
-Status: in progress. Branch `claude/phase-1-connect`, PR based on Phase 0.5 (see
+Status: built. Branch `claude/phase-1-connect`, PR based on Phase 0.5 (see
 [phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md), itself based on
-[phase-0-stabilize.md](phase-0-stabilize.md)); this phase uses Phase 0's routing scaffold, audit log, Doctor rows,
-watchdog `connector_down` pattern and `notify.send`, and Phase 0.5's facts block and claims gate.
+[phase-0-stabilize.md](phase-0-stabilize.md)). Covered by about 650 tests on Python 3.10, 3.12 and 3.13, including
+the Stripe gate end to end with the scripted model, and re-run on the owner's RTX 5090: gpt-oss:20b, given a plain
+task with no tool named, used `find_tool` to load Stripe's tools, created the $19/month payment link and finished;
+a test charge then appeared as revenue with source `stripe`, typed by nobody. The model skipped `browser_check`
+although the acceptance asked for it, which the Phase 3 verification gate addresses.
 
 Changes Phase 0.5 makes to this design: `find_tool` reaches every role through `roles.CONTEXT_EXTRA` instead of every
 preset's list; the Phase 0.5 tools carry risk tags (search, grep, company_status, check_sources read; edit_file,
