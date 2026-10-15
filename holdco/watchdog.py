@@ -502,8 +502,10 @@ def _check_connectors(companies: dict[int, dict]) -> None:
         _bad_streak[key] = _bad_streak.get(key, 0) + 1
         if _bad_streak[key] < CONNECTOR_BAD_STREAK or _last_connector_alert.get(key) == today:
             continue
+        # Doctor keys are "connector:<name>:<company id>" (global ones have no id); accept "conn:<id>:<name>" too.
         parts = key.split(":")
-        cid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else r.get("company_id")
+        digits = [x for x in parts[1:] if x.isdigit()]
+        cid = int(digits[0]) if digits else r.get("company_id")
         c = companies.get(cid) if cid is not None else None
         if not c:
             continue

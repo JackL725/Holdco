@@ -14,10 +14,16 @@ async function api(method, path, body) {
   const r = await fetch(path, opt);
   let data = {};
   try { data = await r.json(); } catch (_) { /* empty */ }
-  if (!r.ok) throw new Error(data.error || `${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    const err = new Error(data.error || `${r.status} ${r.statusText}`);
+    err.status = r.status;
+    err.data = data;   // the founding preflight needs the body's checks, not only the message
+    throw err;
+  }
   return data;
 }
 const GET = (p) => api('GET', p);
+const fmtBytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
 
 function rel(iso) {
   if (!iso) return '';
@@ -160,6 +166,7 @@ const refreshState = async () => {
     S.st = await GET('/api/state');
     S.agents = Object.fromEntries(S.st.agents.map((a) => [a.id, a]));
     renderSide();
+    renderKillBanner();
     if (S.view && S.view.onState) S.view.onState();
   } catch (e) { /* server restarting */ }
 };
@@ -195,6 +202,7 @@ function renderSide() {
       <a href="#/" class="${at(!p.length)}">Portfolio</a>
       <a href="#/inbox" class="${at(p[0] === 'inbox')}">Inbox ${st.approvals ? `<span class="count">${st.approvals}</span>` : ''}</a>
       <a href="#/library" class="${at(p[0] === 'library')}">Agent library</a>
+      <a href="#/doctor" class="${at(p[0] === 'doctor')}">Doctor${healthDot(st.doctor)}</a>
     </nav>
     <div class="side-label">Companies</div>
     <nav class="nav" aria-label="Companies">
@@ -208,7 +216,44 @@ function renderSide() {
         <span class="pulse"></span>
         <span>${S.offline ? 'Reconnecting to Holdco…' : st.scheduler_enabled ? `Autopilot on<br><span class="faint">${working ? plural(working, 'agent') + ' working' : 'Agents idle'}</span>` : 'Autopilot off<br><span class="faint">Agents only work when you run them</span>'}</span>
       </button>
+      ${st.kill_switch ? '<button class="btn primary kill" data-act="kill-off" title="Turn the kill switch off">Resume agents</button>'
+        : '<button class="btn danger kill" data-act="kill-on" title="Stop every agent and freeze outbound actions">Stop everything</button>'}
     </div>`;
+}
+
+// Doctor summary from /api/state: green when all checks pass, amber for warnings, red when something fails.
+function healthDot(d) {
+  if (!d || !d.checked_at) return '';
+  const level = d.bad > 0 ? 'bad' : d.warn > 0 ? 'warn' : 'ok';
+  const title = d.bad > 0 ? `${plural(d.bad, 'check')} failing` : d.warn > 0 ? plural(d.warn, 'warning') : 'All checks pass';
+  return ` <span class="health ${level}" title="${esc(title)}" aria-label="${esc(title)}"></span>`;
+}
+
+// ---------------------------------------------------------------- kill switch
+// render() adds the #kill-banner holder above every page; refreshState repaints it from /api/state.
+function renderKillBanner() {
+  const box = $('#kill-banner');
+  if (!box) return;
+  box.innerHTML = S.st && S.st.kill_switch
+    ? `<div class="banner bad"><div class="grow"><b>Kill switch is on.</b> All agents are stopped and outbound actions are frozen.</div><button class="btn primary" data-act="kill-off">Resume</button></div>`
+    : '';
+}
+function confirmKill() {
+  modal({
+    title: 'Stop everything?',
+    body: `<p>The kill switch stops every agent at its next step and freezes outbound actions: nothing is sent, published, run or bought until you resume. Requests keep waiting in your Inbox and cannot be approved while it is on; questions can still be answered.</p>
+      <p class="muted small">Autopilot is not changed. Your phone bot keeps working, so /resume from Telegram also turns it off.</p>`,
+    foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn danger" data-act="kill-confirm">Stop everything</button>`,
+  });
+}
+async function setKill(on, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api('POST', '/api/kill', { on });
+    closeModal();
+    toast(on ? 'Kill switch on. Agents stop at their next step.' : 'Kill switch off. Agents may work again.');
+    await refreshState();
+  } catch (e) { fail(e); if (btn) btn.disabled = false; }
 }
 
 // ---------------------------------------------------------------- live feed
@@ -329,11 +374,14 @@ async function render() {
   else if (p[0] === 'inbox') view = Inbox();
   else if (p[0] === 'settings') view = Settings();
   else if (p[0] === 'library') view = Library();
+  else if (p[0] === 'doctor') view = Doctor();
   else if (p[0] === 'c' && p[1]) view = CompanyView(+p[1], p[2] || 'overview', p[3]);
   else { location.hash = '#/'; return; }
   S.view = view;
   main.innerHTML = '';
   if (window.innerWidth <= 760) main.insertAdjacentHTML('beforeend', `<div class="mobile-bar" style="margin:-18px -16px 16px"><button class="btn sm" data-act="menu">Menu</button><b>Holdco</b></div>`);
+  main.insertAdjacentHTML('beforeend', '<div id="kill-banner"></div>');
+  renderKillBanner();
   const holder = document.createElement('div');
   main.appendChild(holder);
   try { await view.mount(holder); } catch (e) { holder.innerHTML = `<div class="panel empty"><h2>Something went wrong</h2><p>${esc(e.message)}</p></div>`; }
@@ -352,6 +400,10 @@ function Portfolio() {
     $('#pf-sub', el).textContent = cos.length
       ? `${plural(cos.length, 'company', 'companies')}, ${plural(working, 'agent')} working right now.`
       : 'Companies run by your local AI team.';
+    const bad = (st.doctor && st.doctor.bad) || 0;
+    $('#pf-doctor', el).innerHTML = bad > 0
+      ? `<div class="banner bad"><div class="grow"><b>${plural(bad, 'check')} failing.</b> Something your agents depend on is not working.</div><a class="btn" href="#/doctor">Open Doctor</a></div>`
+      : '';
     const list = $('#pf-list', el);
     if (!cos.length) return;
     list.innerHTML = cos.map((c) => {
@@ -370,6 +422,7 @@ function Portfolio() {
       const hasCos = S.st && S.st.companies.some((c) => c.status !== 'archived');
       el.innerHTML = `<div class="page-head"><div><h1>Portfolio</h1><p class="sub" id="pf-sub"></p></div>
         <div class="actions"><a class="btn primary" href="#/new">Start a company</a></div></div>
+        <div id="pf-doctor"></div>
         ${hasCos ? `<div class="cols"><section class="panel" id="pf-list"></section>
           <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="pf-feed"></div></section></div>`
         : `<section class="panel empty"><h2>Start your first company</h2>
@@ -404,8 +457,25 @@ async function checkModel(box) {
 
 // ---------------------------------------------------------------- new company
 function NewCompany() {
-  let el, mode = 'idea', about = '', presetsData = null;
+  let el, mode = 'idea', about = '', presetsData = null, lastBody = null;
   const chosenTemplate = () => (el && $('input[name=template]:checked', el)?.value) || presetsData?.default_template || 'launch';
+  // POST /api/companies answers 409 with the failing Doctor rows when a dependency is down; "Found anyway" forces it.
+  const showPreflight = (err) => {
+    const box = $('#preflight', el);
+    if (!box) return;
+    const checks = (err.data && err.data.checks) || [];
+    const fix = (f) => (!f ? '' : f.kind === 'link' ? ` <a class="small" href="${esc(f.href || '#/doctor')}">${esc(f.label)}</a>` : ` <span class="small mono muted">${esc(f.label)}</span>`);
+    box.innerHTML = `<div style="padding:18px 22px 0"><div class="banner bad" style="margin:0;align-items:flex-start"><div class="grow"><b>Holdco found a problem that would stop founding.</b>
+      <ul class="rows preflight">${checks.map((r) => { const s = CHECK_STATUS[r.status] || ['', esc(r.status)]; return `<li><span class="badge ${s[0]}">${s[1]}</span><div class="grow"><b>${esc(r.label)}</b> <span class="small muted">${esc(r.detail)}</span>${fix(r.fix)}</div></li>`; }).join('')}</ul></div>
+      <div class="actions"><a class="btn" href="#/doctor">Open Doctor</a><button class="btn danger" type="button" data-act="found-anyway">Found anyway</button></div></div></div>`;
+    box.scrollIntoView({ block: 'nearest' });
+  };
+  const found = async (body) => {
+    lastBody = body;
+    const r = await api('POST', '/api/companies', body);
+    await refreshState();
+    location.hash = `#/c/${r.company.id}`;
+  };
   const ideaForm = () => `
     <form class="form-stack panel-body" data-form="found" style="padding:20px 22px">
       <label class="field">The idea<span class="hint">What you'd sell, to whom. A sentence or a page, both work.</span>
@@ -437,11 +507,18 @@ function NewCompany() {
       <section class="panel"><div class="choice" role="tablist">
         <button role="tab" aria-selected="${mode === 'idea'}" class="${mode === 'idea' ? 'on' : ''}" data-act="mode" data-mode="idea"><b>I have an idea</b>Describe it and the team starts building.</button>
         <button role="tab" aria-selected="${mode === 'find'}" class="${mode === 'find' ? 'on' : ''}" data-act="mode" data-mode="find"><b>Suggest ideas for me</b>Tell the AI about you and pick from three.</button>
-      </div>${mode === 'idea' ? ideaForm() : findForm()}</section>`;
+      </div><div id="preflight"></div>${mode === 'idea' ? ideaForm() : findForm()}</section>`;
   };
   return {
     async mount(holder) { el = holder; presetsData = await loadPresets().catch(() => null); draw(); },
-    act(name, t) { if (name === 'mode') { mode = t.dataset.mode; draw(); } },
+    async act(name, t) {
+      if (name === 'mode') { mode = t.dataset.mode; draw(); }
+      if (name === 'found-anyway' && lastBody) {
+        t.disabled = true;
+        t.innerHTML = '<span class="spinner"></span> Founding…';
+        try { await found({ ...lastBody, force: true }); } catch (e) { fail(e); t.disabled = false; t.textContent = 'Found anyway'; }
+      }
+    },
     async submit(name, form) {
       const f = Object.fromEntries(new FormData(form));
       const btn = $('button[type=submit]', form);
@@ -449,10 +526,11 @@ function NewCompany() {
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner"></span> Founding…';
         try {
-          const r = await api('POST', '/api/companies', { idea: f.idea, name: f.name || '', context: f.context || '', template: chosenTemplate() });
-          await refreshState();
-          location.hash = `#/c/${r.company.id}`;
-        } catch (e) { fail(e); btn.disabled = false; btn.textContent = 'Found this company'; }
+          await found({ idea: f.idea, name: f.name || '', context: f.context || '', template: chosenTemplate() });
+        } catch (e) {
+          if (e.data && e.data.checks) showPreflight(e); else fail(e);
+          btn.disabled = false; btn.textContent = 'Found this company';
+        }
       }
       if (name === 'ideas') {
         btn.disabled = true;
@@ -479,10 +557,11 @@ function NewCompany() {
       t.innerHTML = '<span class="spinner"></span> Founding…';
       try {
         const idea = `${i.name}: ${i.one_liner}\nCustomer: ${i.customer}\nOffer: ${i.offer}\nFirst week: ${i.first_week}`;
-        const r = await api('POST', '/api/companies', { idea, name: i.name, context: about, template: chosenTemplate() });
-        await refreshState();
-        location.hash = `#/c/${r.company.id}`;
-      } catch (e) { fail(e); t.disabled = false; }
+        await found({ idea, name: i.name, context: about, template: chosenTemplate() });
+      } catch (e) {
+        if (e.data && e.data.checks) showPreflight(e); else fail(e);
+        t.disabled = false; t.textContent = `Found ${i.name}`;
+      }
     },
   };
 }
@@ -492,6 +571,11 @@ const ACTION_VERB = {
   send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
   http_post: 'wants to send data to an outside service', run_code: 'wants to run code on this PC',
   spend_money: 'wants you to buy something', question: 'has a question',
+};
+
+const ACTION_LABEL = {
+  send_email: 'Send email', social_post: 'Social post', deploy_site: 'Deploy website', http_post: 'Outside request',
+  run_code: 'Run code', spend_money: 'Purchase', question: 'Question',
 };
 
 const platformName = (p) => ({ x: 'X', twitter: 'X', linkedin: 'LinkedIn', reddit: 'Reddit', instagram: 'Instagram', facebook: 'Facebook', threads: 'Threads', bluesky: 'Bluesky', tiktok: 'TikTok', youtube: 'YouTube' }[(p || '').toLowerCase()] || p || 'social media');
@@ -517,8 +601,16 @@ function requestFields(a) {
       return `<div class="form-grid">${ro('Item', p.item)}${ro('Cost', `$${p.amount_usd}`)}${p.vendor ? ro('Vendor', p.vendor) : ''}</div>
         ${p.url ? `<p><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.url)}</a></p>` : ''}${ro('Why', p.reason)}
         <p class="faint small">Holdco never spends money. Approving tells the agent you'll make the purchase yourself.</p>`;
-    case 'question':
-      return `<div class="box md">${md(p.question)}</div><label class="field">Your answer<textarea data-k="answer" rows="3"></textarea></label>`;
+    case 'question': {
+      // Watchdog escalations carry options (one button each, the recommended one first in line), context and a pattern.
+      const opts = Array.isArray(p.options) ? p.options.map((o) => String(o)).filter((o) => o.trim()) : [];
+      const rec = String(p.recommended || '');
+      return `${p.pattern ? '<div><span class="badge accent">Holdco watchdog</span></div>' : ''}
+        <div class="box md">${md(p.question)}</div>
+        ${p.context ? `<p class="muted small" style="margin:0;white-space:pre-wrap">${esc(p.context)}</p>` : ''}
+        ${opts.length ? `<div class="opts">${opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('')}</div>` : ''}
+        <label class="field">${opts.length ? 'Or answer in your own words' : 'Your answer'}<textarea data-k="answer" rows="3"></textarea></label>`;
+    }
     default:
       return `<pre class="box">${esc(JSON.stringify(p, null, 2))}</pre>`;
   }
@@ -539,12 +631,13 @@ function requestCard(a) {
   </article>`;
 }
 
-async function decideRequest(card, decision) {
+async function decideRequest(card, decision, preset = '') {
   const id = +card.dataset.req;
   const payload = {};
   $$('[data-k]', card).forEach((f) => { payload[f.dataset.k] = f.value; });
-  const { feedback = '', answer = '' } = payload;
+  const { feedback = '', answer: typed = '' } = payload;
   delete payload.feedback; delete payload.answer;
+  const answer = preset || typed;   // an option button answers with its exact text
   if (decision === 'answer' && !answer.trim()) { toast('Write an answer first.', true); return; }
   $$('button', card).forEach((b) => { b.disabled = true; });
   try {
@@ -558,9 +651,33 @@ async function decideRequest(card, decision) {
   } catch (e) { fail(e); $$('button', card).forEach((b) => { b.disabled = false; }); }
 }
 
+// The one-line summary the server stores for an approval, rebuilt from an audit row's payload.
+function auditSummary(a) {
+  const p = a.payload || {};
+  switch (a.action) {
+    case 'send_email': return `Email to ${p.to || '?'}: ${p.subject || ''}`;
+    case 'social_post': return `${platformName(p.platform)} post: ${String(p.content || '').slice(0, 90)}`;
+    case 'deploy_site': return 'Published the website from site/';
+    case 'http_post': return `${p.method || 'POST'} ${p.url || ''}`;
+    case 'run_code': return `Ran ${p.language || 'python'}: ${String(p.code || '').trim().split('\n')[0].slice(0, 90)}`;
+    case 'spend_money': return `Buy ${p.item || '?'} for $${p.amount_usd}${p.vendor ? ` (${p.vendor})` : ''}`;
+    default: return a.action;
+  }
+}
+
 function Inbox() {
   let el;
   const slugOf = (cid) => (S.st?.companies.find((c) => c.id === cid) || {}).slug || '';
+  const loadAudit = async () => {
+    const r = await GET('/api/audit?limit=50');
+    const who = (by) => (by === 'owner' ? 'you' : by === 'policy:auto' ? 'the auto policy' : by || '?');
+    $('#audit', el).innerHTML = r.audit.length ? r.audit.map((a) => `
+      <li><span class="badge ${/^FAILED/.test(a.result || '') ? 'bad' : 'good'}">${esc(ACTION_LABEL[a.action] || a.action)}</span><div class="grow">
+        <div>${esc(auditSummary(a))}</div>
+        <div class="faint small">${esc(a.company_name || 'Holdco')}, ${when(a.created_at)}. Proposed by ${esc(a.proposed_by || 'an agent')}, allowed by ${esc(who(a.approved_by))}.</div>
+        ${a.result ? `<div class="small muted" style="margin-top:4px">${esc(String(a.result).slice(0, 120))}</div>` : ''}</div></li>`).join('')
+      : '<li class="faint">Nothing has run yet. Approved and automatic actions are listed here.</li>';
+  };
   const loadPending = async () => {
     const r = await GET('/api/approvals');
     const list = $('#req-list', el);
@@ -590,11 +707,12 @@ function Inbox() {
       el.innerHTML = `<div class="page-head"><div><h1>Inbox</h1><p class="sub">Everything your companies want to send, publish, run or buy waits here. Edit anything before you approve it.</p></div></div>
         <div class="stack"><section class="panel"><div id="req-list"></div>
           <div id="req-empty" class="empty hidden"><h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code or spend money, it shows up here first.</p></div></section>
-          <section class="panel"><div class="panel-head"><h2>Recent decisions</h2></div><ul class="decided" id="decided" style="padding-top:8px"></ul></section></div>`;
-      await Promise.all([loadPending(), loadDecided()]);
+          <section class="panel"><div class="panel-head"><h2>Recent decisions</h2></div><ul class="decided" id="decided" style="padding-top:8px"></ul></section>
+          <section class="panel"><div class="panel-head"><h2>Audit log</h2><span class="small faint">Every outbound action that ran, and who allowed it.</span></div><ul class="rows" id="audit" style="padding-top:8px"></ul></section></div>`;
+      await Promise.all([loadPending(), loadDecided(), loadAudit()]);
     },
-    live(ev) { if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); } },
-    reloadDecided: () => loadDecided().catch(() => {}),
+    live(ev) { if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); loadAudit().catch(() => {}); } },
+    reloadDecided: () => { loadDecided().catch(() => {}); loadAudit().catch(() => {}); },
     async act(name, t) {
       if (name === 'retry') {
         try { await api('POST', `/api/approvals/${t.dataset.id}/retry`); toast('Back in your inbox.'); await Promise.all([loadPending(), loadDecided()]); refreshState(); } catch (e) { fail(e); }
@@ -616,6 +734,98 @@ function Library() {
     },
     act(name, t) { if (name === 'preset-info') showPreset(t.dataset.key); },
   };
+}
+
+// ---------------------------------------------------------------- doctor
+const CHECK_STATUS = { ok: ['good', 'OK'], warn: ['warn', 'Warning'], bad: ['bad', 'Failing'] };
+
+function Doctor() {
+  let el, checks = [], backups = null, timer = 0;
+  const view = {};
+  const fixHtml = (f) => {
+    if (!f) return '';
+    if (f.kind === 'link') return `<a class="btn sm" href="${esc(f.href || '#/')}">${esc(f.label)}</a>`;
+    if (f.kind === 'action') return `<button class="btn sm" type="button" data-act="fix" data-fix="${esc(f.action || '')}">${esc(f.label)}</button>`;
+    return `<span class="muted small mono">${esc(f.label)}</span>`;
+  };
+  const drawChecks = () => {
+    const newest = checks.map((r) => r.checked_at).filter(Boolean).sort().pop();
+    $('#doc-when', el).innerHTML = newest ? `Checked ${when(newest)}` : '';
+    const n = { ok: 0, warn: 0, bad: 0 };
+    checks.forEach((r) => { n[r.status] = (n[r.status] || 0) + 1; });
+    $('#doc-sum', el).innerHTML = checks.length ? `<span class="badge good">${n.ok} ok</span> <span class="badge warn">${n.warn} warn</span> <span class="badge bad">${n.bad} failing</span>` : '';
+    $('#doc-list', el).innerHTML = checks.length ? checks.map((r) => {
+      const s = CHECK_STATUS[r.status] || ['', esc(r.status)];
+      return `<li><span class="badge ${s[0]}" style="min-width:74px;justify-content:center">${s[1]}</span>
+        <div class="grow"><b>${esc(r.label)}</b><div class="small muted">${esc(r.detail)}</div></div>
+        <div class="fix">${fixHtml(r.fix)}</div></li>`;
+    }).join('') : '<li class="faint">No checks have run yet.</li>';
+  };
+  const drawBackups = () => {
+    const box = $('#doc-backups', el);
+    if (!backups) { box.innerHTML = '<li class="faint">Loading…</li>'; return; }
+    box.innerHTML = backups.backups.length ? backups.backups.slice(0, 10).map((b) => `<li><div class="grow"><code class="small">${esc(b.name)}</code></div><span class="small muted num">${fmtBytes(b.size)}</span><span class="small faint">${when(b.created_at)}</span></li>`).join('')
+      : '<li class="faint">No backups yet. One is written daily, or press Back up now.</li>';
+    $('#doc-keep', el).innerHTML = `Keeping the newest ${plural(backups.keep, 'backup')} in <code class="small" style="overflow-wrap:anywhere">${esc(backups.dir || backups.folder || '')}</code>. To restore: stop Holdco, unzip one over the data folder, start again.`;
+  };
+  const load = async () => {
+    const [d, b] = await Promise.all([GET('/api/doctor'), GET('/api/backups').catch(() => null)]);
+    if (!el || S.view !== view) return;
+    checks = d.checks || [];
+    if (b) backups = b;
+    drawChecks();
+    drawBackups();
+  };
+  const run = async (deep, btn) => {
+    const buttons = $$('.doc-actions button', el);
+    buttons.forEach((b) => { b.disabled = true; });
+    const label = btn.innerHTML;
+    btn.innerHTML = `<span class="spinner"></span> ${deep ? 'Checking, up to a minute…' : 'Checking…'}`;
+    try {
+      const d = await api('POST', '/api/doctor/run', { deep });
+      checks = d.checks || [];
+      drawChecks();
+      refreshState();
+    } catch (e) { fail(e); }
+    btn.innerHTML = label;
+    buttons.forEach((b) => { b.disabled = false; });
+  };
+  const backupNow = async (btn) => {
+    btn.disabled = true;
+    const label = btn.innerHTML;
+    btn.innerHTML = '<span class="spinner"></span> Backing up…';
+    try {
+      const r = await api('POST', '/api/backup', {});
+      toast(`Backup written: ${r.name} (${fmtBytes(r.size)}).`);
+      backups = await GET('/api/backups');
+      drawBackups();
+      const d = await api('POST', '/api/doctor/run', { deep: false });
+      checks = d.checks || [];
+      drawChecks();
+      refreshState();
+    } catch (e) { fail(e); }
+    btn.innerHTML = label;
+    btn.disabled = false;
+  };
+  Object.assign(view, {
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<div class="page-head"><div><h1>Doctor</h1><p class="sub">Everything your agents depend on, checked every hour. Fix what is failing first.</p></div>
+        <div class="actions doc-actions"><span id="doc-when" class="small faint"></span><button class="btn" data-act="run">Run checks</button><button class="btn" data-act="deep">Deep check (model + live search)</button><button class="btn" data-act="backup">Back up now</button></div></div>
+        <div class="cols"><section class="panel"><div class="panel-head"><h2>Checks</h2><span id="doc-sum"></span></div><ul class="rows" id="doc-list" style="padding-top:8px"><li class="faint"><span class="spinner"></span> Running checks…</li></ul></section>
+        <section class="panel"><div class="panel-head"><h2>Backups</h2></div><ul class="rows" id="doc-backups" style="padding-top:8px"></ul><p class="small muted" id="doc-keep" style="padding:0 18px 14px"></p></section></div>`;
+      await load();
+      timer = setInterval(() => { if (S.view !== view) { clearInterval(timer); return; } load().catch(() => {}); }, 60000);
+    },
+    live(ev) { if (ev.type === 'settings') load().catch(() => {}); },
+    async act(name, t) {
+      if (name === 'run') return run(false, t);
+      if (name === 'deep') return run(true, t);
+      if (name === 'backup' || (name === 'fix' && t.dataset.fix === 'backup')) return backupNow(t);
+      return undefined;
+    },
+  });
+  return view;
 }
 
 // ---------------------------------------------------------------- settings
@@ -656,6 +866,31 @@ function Settings() {
         <label class="check"><input type="checkbox" name="scheduler_enabled" ${s.scheduler_enabled ? 'checked' : ''}><span>Keep agents working around the clock<br><span class="faint small">When off, agents only work when you press Run or chat with them.</span></span></label>
         <div class="form-grid" style="margin-top:14px"><label class="field">What agents call you<input type="text" name="owner_name" value="${esc(s.owner_name)}"></label></div>
       </div>
+      <div class="section"><h2>Phone notifications</h2><p class="muted">Approve requests and answer questions from your phone. A Telegram bot gives you buttons; ntfy only notifies.</p>
+        <div class="form-grid">
+          <label class="field">Telegram bot token<input type="password" name="telegram_bot_token" value="${esc(s.telegram_bot_token)}" autocomplete="off"></label>
+          <label class="field">Telegram chat id<input type="text" name="telegram_chat_id" value="${esc(s.telegram_chat_id)}" inputmode="numeric" autocomplete="off"></label>
+          <label class="field">Notify me about${sel('notify_level', s.notify_level || 'important', [['important', 'Requests, questions and errors'], ['all', 'Everything, including finished tasks']])}</label>
+        </div>
+        <div class="form-grid" style="margin-top:14px">
+          <label class="field">ntfy topic<span class="hint">Optional. Subscribe to the same topic in the ntfy app; pick a name nobody would guess.</span><input type="text" name="ntfy_topic" value="${esc(s.ntfy_topic)}" autocomplete="off"></label>
+          <label class="field">ntfy server<input type="text" name="ntfy_server" value="${esc(s.ntfy_server)}" placeholder="https://ntfy.sh"></label>
+        </div>
+        <details style="margin-top:12px"><summary class="small muted" style="cursor:pointer">How to set up the Telegram bot</summary>
+          <ol class="steps small" style="margin-top:8px">
+            <li>In Telegram, open <b>@BotFather</b>, send <code>/newbot</code>, follow the prompts and paste the token it gives you above.</li>
+            <li>Open your new bot and send it any message, so Telegram lets it reply to you.</li>
+            <li>Find your chat id: message <b>@userinfobot</b>, or open <code>https://api.telegram.org/bot&lt;token&gt;/getUpdates</code> in a browser and read <code>chat.id</code>. Or leave the chat id empty, save, and press Send test message: Holdco reads it from your message.</li>
+            <li>Paste the chat id, save, and press Send test message. A message with an OK button should arrive.</li>
+          </ol></details>
+        <div class="actions" style="margin-top:14px"><button class="btn" type="button" data-act="test-notify">Send test message</button><span id="notify-result" class="small"></span></div>
+      </div>
+      <div class="section"><h2>Reliability</h2><p class="muted">What happens when work keeps failing, and how many daily backups to keep. The Doctor page shows the current state.</p>
+        <div class="form-grid">
+          <label class="field">Attempts before a task is escalated<span class="hint">After this many failed attempts the task is blocked and you get one question.</span><input type="number" name="max_task_attempts" min="1" max="5" value="${esc(s.max_task_attempts)}"></label>
+          <label class="field">Backups to keep<span class="hint">Older backups are deleted; each holds the database and every company folder.</span><input type="number" name="backup_keep" min="1" max="90" value="${esc(s.backup_keep)}"></label>
+        </div>
+      </div>
       <div class="section"><h2>Approvals</h2><p class="muted">What happens when an agent tries something that leaves your computer.</p>
         <div class="form-grid">${Object.entries(data.policy_actions).map(([k, label]) => `
           <label class="field">${esc(label)}${data.locked.includes(k) ? `<div class="box small">Always asks you</div>`
@@ -681,8 +916,13 @@ function Settings() {
       const f = new FormData(form);
       const body = {};
       for (const [k, v] of f.entries()) if (!k.startsWith('policy_')) body[k] = v;
-      ['num_ctx', 'max_concurrent_runs', 'max_steps_per_run'].forEach((k) => { body[k] = parseInt(body[k], 10); });
+      ['num_ctx', 'max_concurrent_runs', 'max_steps_per_run', 'max_task_attempts', 'backup_keep'].forEach((k) => {
+        const n = parseInt(body[k], 10);
+        if (Number.isFinite(n)) body[k] = n; else delete body[k];   // an empty box keeps the stored value
+      });
       body.temperature = parseFloat(body.temperature);
+      if (!Number.isFinite(body.temperature)) delete body.temperature;
+      if (typeof body.telegram_chat_id === 'string') body.telegram_chat_id = body.telegram_chat_id.trim();
       body.scheduler_enabled = !!form.scheduler_enabled.checked;
       body.policies = {};
       Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
@@ -703,6 +943,20 @@ function Settings() {
           const r = await api('POST', '/api/llm/test', {});
           out.innerHTML = `<span class="badge ${r.ok ? 'good' : 'bad'}">${r.ok ? 'OK' : 'Failed'}</span> ${esc(r.message)}`;
           if (r.ok) { const models = await loadModels(true); data = await GET('/api/settings'); draw(models); $('#llm-result', el).innerHTML = `<span class="badge good">OK</span> ${esc(r.message)}`; }
+        } catch (e) { out.textContent = e.message; }
+      }
+      if (name === 'test-notify') {
+        const form = $('form', el);
+        await this.submit('settings', form);
+        const out = $('#notify-result', el);
+        out.innerHTML = '<span class="spinner"></span> Sending…';
+        try {
+          const r = await api('POST', '/api/notify/test', {});
+          out.innerHTML = `<span class="badge ${r.ok ? 'good' : 'warn'}">${r.ok ? 'Sent' : 'Not yet'}</span> ${esc(r.detail || r.message || '')}`;
+          // With a token but no chat id the server reports the chat ids that messaged the bot: offer the first one.
+          if (!r.ok && Array.isArray(r.chat_ids) && r.chat_ids.length && form.telegram_chat_id && !form.telegram_chat_id.value.trim()) {
+            form.telegram_chat_id.value = String(r.chat_ids[0]);
+          }
         } catch (e) { out.textContent = e.message; }
       }
     },
@@ -1413,7 +1667,10 @@ document.addEventListener('click', async (e) => {
     try { await api('PUT', '/api/settings', { scheduler_enabled: on }); toast(on ? 'Autopilot on. Agents keep working on their own.' : 'Autopilot off. Running sessions finish, then agents wait.'); refreshState(); } catch (err) { fail(err); }
     return;
   }
-  if (name === 'decide') { e.preventDefault(); decideRequest(t.closest('[data-req]'), t.dataset.d); return; }
+  if (name === 'decide') { e.preventDefault(); decideRequest(t.closest('[data-req]'), t.dataset.d, t.dataset.answer || ''); return; }
+  if (name === 'kill-on') { confirmKill(); return; }
+  if (name === 'kill-confirm') { setKill(true, t); return; }
+  if (name === 'kill-off') { setKill(false, t); return; }
   if (name === 'pick' && S.view?.actPick) { S.view.actPick(t); return; }
   if (S.view?.act) { e.preventDefault(); S.view.act(name, t, e); }
 });

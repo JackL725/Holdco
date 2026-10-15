@@ -435,3 +435,17 @@ details[open] > summary h2::after { content: " −"; }
 .mind .m-more { text-align: center; }
 .mind details.think summary::before, .turn details.think summary::before { content: "▸ "; }
 .mind details.think[open] summary::before, .turn details.think[open] summary::before { content: "▾ "; }
+
+/* ---------- phase 0: doctor, kill switch, escalations ---------- */
+.nav .health { width: 8px; height: 8px; border-radius: 50%; margin-left: auto; flex: none; }
+.nav .health.ok { background: var(--good); }
+.nav .health.warn { background: var(--warn); }
+.nav .health.bad { background: var(--bad); }
+.side-foot .btn.kill { margin: 10px 4px 0; justify-content: center; }
+.side-foot .btn.danger.kill { background: var(--bad-soft); border-color: transparent; font-weight: 600; }
+.side-foot .btn.danger.kill:hover { filter: brightness(.96); }
+.rows .fix { flex: none; display: flex; align-items: center; min-height: 24px; }
+.opts { display: flex; gap: 8px; flex-wrap: wrap; }
+.preflight { margin-top: 8px; }
+.preflight li { padding: 8px 0; border-top-color: color-mix(in srgb, var(--bad) 25%, transparent); }
+.preflight li:first-child { border-top: 0; }
