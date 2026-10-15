@@ -355,6 +355,11 @@ class TestOneQuestionPerTopic(Replay):
 class TestNoPlanningWhileNothingChanges(Replay):
     def setUp(self):
         super().setUp()
+        # The scheduler ticks over every active company in the shared test database: companies left active by
+        # other test modules would get their own cycles and "still waiting" notices. Pause them for this test.
+        self.paused = [r["id"] for r in db.q("SELECT id FROM companies WHERE status='active'")]
+        if self.paused:
+            db.run(f"UPDATE companies SET status='paused' WHERE id IN ({','.join('?' * len(self.paused))})", self.paused)
         self.c = make_company("WaitCo", members=("ceo", "engineering"))
         self.ceo = agent_of(self.c)
         make_task(self.c, "engineering", "Deploy the landing page", kind="deploy", status="waiting")
@@ -377,6 +382,8 @@ class TestNoPlanningWhileNothingChanges(Replay):
         for p in reversed(self._p):
             p.stop()
         db.update("companies", self.c["id"], status="archived")
+        if self.paused:
+            db.run(f"UPDATE companies SET status='active' WHERE id IN ({','.join('?' * len(self.paused))})", self.paused)
         super().tearDown()
 
     def cycles(self) -> int:

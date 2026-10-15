@@ -1684,5 +1684,23 @@ class TestAskStateAndChat(Quiet):
                                              "chat"))
 
 
+
+class TestRealRunFalsePositives(unittest.TestCase):
+    """From the re-run on the owner's GPU: a competitor's pricing line was refused as a purchase."""
+
+    def setUp(self):
+        self.c = make_company("PriceCo", ("ceo",))
+
+    def test_pricing_language_is_not_a_purchase(self):
+        for line in ("- Paid per appointment: $180 minimum, no monthly retainer",
+                     "RainyLeads is paid per appointment ($180) and Thumbtack is paid by the lead.",
+                     "Contractors are paid monthly by the platform."):
+            self.assertEqual(truth.check_claims(self.c, line), [], line)
+
+    def test_real_purchases_are_still_claims(self):
+        for line in ("We paid $12 for the domain.", "Paid for the Netlify Pro plan today.", "Bought the domain rooflead.com."):
+            self.assertTrue(truth.check_claims(self.c, line), line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1046,7 +1046,10 @@ _fam("posted", r"\bwent\s+out\s+on\s+(?:x|twitter|linkedin|reddit|facebook|insta
 _NOT_MONEY = (r"(?!\s+(?:close\s+)?(?:attention|off|heed|tribute|respect|a\s+visit|ads?|advertising|plans?|tiers?|"
               r"search|social|media|traffic|versions?|users?|customers?|subscribers?|subscriptions?|newsletters?|"
               r"options?|products?|courses?|campaigns?|channels?|placements?|listings?|memberships?|acquisition|"
-              r"accounts?|leads?|features?|apps?|tools?|members?|content|promotions?)\b)")
+              r"accounts?|leads?|features?|apps?|tools?|members?|content|promotions?)\b)"
+              # Pricing language, not a purchase: "Paid per appointment: $180", "paid by the lead", "paid monthly".
+              r"(?!\s+(?:per|by\s+the|each|monthly|weekly|yearly|annually|upfront|up\s+front|on\s+results?|"
+              r"on\s+delivery|only\s+for|after|when|if)\b)")
 # (?!-): "Bought-in roofers" is an adjective, not a purchase.
 _fam("purchase", _US + r"(?:paid|purchased|bought)\b(?!-)" + _NOT_MONEY)
 _fam("purchase", _START + r"(?:paid|purchased|bought)\b(?!-)" + _NOT_MONEY)
@@ -1743,7 +1746,8 @@ _SITE_NAMES = {"robots.txt", "humans.txt", "ads.txt", "security.txt", "llms.txt"
                "manifest.json"}
 _CODE_DIR_EXT = _SITE_EXT | {".json", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".lock", ".properties"}
 _CODE_NAMES = {"dockerfile", "makefile", "procfile", "requirements.txt", ".gitignore", ".env.example"}
-RECORDS_REFUSAL = "ERROR: records/ is written by Holdco from what really happened. Write plans and notes elsewhere."
+RECORDS_REFUSAL = ("ERROR: records/ is written by Holdco from what really happened. Read it any time; write your "
+                   "own plans, trackers and notes elsewhere, for example docs/ or ops/ (ops/cost-per-lead.md).")
 CONTEXT_REFUSAL = "ERROR: context/ is the owner's. Save your notes elsewhere, for example docs/."
 LOG_REFUSAL = ("ERROR: Holdco keeps the real record of what happened in records/. If this is a plan, name it as a "
                "plan, for example docs/outreach-plan.md.")
