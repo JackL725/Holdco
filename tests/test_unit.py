@@ -440,5 +440,29 @@ class TestLoopGuard(unittest.TestCase):
         self.assertIn(self.NUDGE, [r for n, r in results if n == "review_text"][1])
 
 
+
+class TestTreeSurvivesVanishingFiles(unittest.TestCase):
+    """Windows CI: a records/ temp file vanished between listing the folder and resolving its path, and the
+    ValueError from relative_to crashed an agent run. A file that disappears mid-walk is skipped."""
+
+    def test_vanishing_file_is_skipped(self):
+        from unittest import mock
+        c = make_company("VanishCo", members=("ceo",))
+        root = workspace.root(c)
+        (root / "docs" / "keep.md").write_text("x", encoding="utf-8")
+        (root / "docs" / ".gone.tmp").write_text("x", encoding="utf-8")
+        real_rel = workspace.rel
+
+        def flaky_rel(company, p):
+            if p.name == ".gone.tmp":
+                raise ValueError("is not in the subpath")
+            return real_rel(company, p)
+
+        with mock.patch.object(workspace, "rel", flaky_rel):
+            paths = [i["path"] for i in workspace.tree(c, ".", 3, 100)]
+        self.assertIn("docs/keep.md", paths)
+        self.assertNotIn("docs/.gone.tmp", paths)
+
+
 if __name__ == "__main__":
     unittest.main()
