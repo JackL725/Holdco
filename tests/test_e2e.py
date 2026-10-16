@@ -327,6 +327,8 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn(c["id"], [x["id"] for x in self.api.get("/api/state")["companies"]])
 
     def test_18_kill_switch(self):
+        # Whatever fails below, the switch goes back off: left on, it would fail every later test that needs a run.
+        self.addCleanup(lambda: self.api.post("/api/kill", {"on": False}))
         self.assertTrue(self.api.post("/api/kill", {"on": True})["kill_switch"])
         self.assertTrue(self.api.get("/api/state")["kill_switch"])
         # sessions already running end at their next step; wait for that so the run count is stable
@@ -338,7 +340,8 @@ class EndToEnd(unittest.TestCase):
         time.sleep(4)
         self.assertEqual(len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"]), before)
         self.assertEqual(next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"], "todo")
-        requests = [a for a in self.pending() if a["action"] != "question"]
+        # Questions and decisions (Phase 2) can still be answered while stopped; only requests are frozen.
+        requests = [a for a in self.pending() if a["action"] not in ("question", "decision")]
         if requests:
             r = self.api.post(f"/api/approvals/{requests[0]['id']}", {"decision": "approve"}, expect=400)
             self.assertIn("kill switch", r["error"].lower())

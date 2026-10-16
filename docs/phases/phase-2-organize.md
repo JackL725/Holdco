@@ -7,9 +7,12 @@ this phase the CEO plans top down (goal, bets, tasks), every open task names the
 review is built from connector data instead of agents' own summaries. This document is the implementation spec:
 an engineer builds from it, and the design rationale lives in [operating-model.md](../operating-model.md).
 
-Status: in progress. Branch `claude/phase-2-organize`, based on the code of Phases 0, 0.5 and 1 (pull request
-JackL725/Holdco#4 brings 0.5 and 1 into `main`). Depends on Phase 0 ([phase-0-stabilize.md](phase-0-stabilize.md)),
-Phase 0.5 ([phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md)) and Phase 1
+Status: built. Branch `claude/phase-2-organize`, based on the code of Phases 0, 0.5 and 1 (pull request
+JackL725/Holdco#4 brings 0.5 and 1 into `main`). Gate on the owner's GPU (gpt-oss:20b, a sandbox with a fake Stripe in
+test mode): after the weekly review no open agent task lacked a goal, and the weekly memo's numbers came from Stripe
+rows, with the hand-typed waitlist number listed under self-reported only. Depends on Phase 0
+([phase-0-stabilize.md](phase-0-stabilize.md)), Phase 0.5
+([phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md)) and Phase 1
 ([phase-1-connect.md](phase-1-connect.md)). See also [architecture.md](../architecture.md),
 [owner-experience.md](../owner-experience.md) and [testing.md](../testing.md).
 
