@@ -2,6 +2,8 @@
 2, 3 and 6). Scaffold: every seam answers "no contract, nothing blocks, no budget"."""
 from __future__ import annotations
 
+import datetime as _dt
+
 from . import db  # noqa: F401
 
 
@@ -33,6 +35,18 @@ def start_problem(task: dict) -> str | None:
 def after_run(task: dict | None, tokens: int) -> None:
     """Add the run's tokens to the task's tokens_used."""
     return None
+
+
+def gpu_hours(company_id: int, since: str) -> float:
+    """Hours of model time used by runs that started at or after since (an ISO UTC string from db.now()); running
+    runs count up to now. Shared by the GPU budget, the Overview and the weekly brief data."""
+    total = 0.0
+    for r in db.q("SELECT started_at, finished_at FROM runs WHERE company_id=? AND started_at >= ?", (company_id, since)):
+        start = db.parse_time(r["started_at"])
+        end = db.parse_time(r["finished_at"]) or _dt.datetime.now(_dt.timezone.utc)
+        if start:
+            total += max(0.0, (end - start).total_seconds()) / 3600
+    return total
 
 
 def over_gpu_budget(company: dict) -> bool:
