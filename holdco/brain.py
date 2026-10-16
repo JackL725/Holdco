@@ -27,3 +27,9 @@ def digest(company: dict) -> str:
 def active_goals(company_id: int) -> list[dict]:
     """Active goals with current refreshed from the metrics table (used by contracts and rhythms)."""
     return []
+
+
+def on_owner_decision(company_id: int, origin: dict, answer: str) -> None:
+    """decisions.on_decided calls this for origin kinds "brain_change" (answer "Accept the change" applies the
+    proposal, "Reject it" rejects it) and "goals" ("Revert" restores the previous active goals)."""
+    return None
