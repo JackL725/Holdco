@@ -1,6 +1,7 @@
 """Each company gets its own folder on disk. Agents can't read or write outside it."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 
 from . import config
 
-SKIP = {".trash", ".runs", "__pycache__", "node_modules", ".git"}
+SKIP = {".trash", ".runs", ".cache", "__pycache__", "node_modules", ".git"}   # .cache: fetched pages (truth.py)
 
 
 def slugify(name: str) -> str:
@@ -44,7 +45,13 @@ def safe_path(company: dict, rel: str) -> Path:
 
 
 def rel(company: dict, p: Path) -> str:
-    return p.resolve().relative_to(root(company).resolve()).as_posix()
+    base = root(company).resolve()
+    try:
+        return p.resolve().relative_to(base).as_posix()
+    except ValueError:
+        # Windows: resolving a file that vanished a moment ago (an atomic rewrite's temp file, for example) can
+        # return a \\?\ path that no longer matches the folder; the plain absolute path still does.
+        return Path(os.path.abspath(p)).relative_to(Path(os.path.abspath(base))).as_posix()
 
 
 def tree(company: dict, sub: str = ".", depth: int = 3, limit: int = 200) -> list[dict]:
@@ -67,9 +74,10 @@ def tree(company: dict, sub: str = ".", depth: int = 3, limit: int = 200) -> lis
                 return
             try:
                 st = e.stat()
-            except OSError:
+                path = rel(company, e)
+            except (OSError, ValueError):   # gone or renamed while we looked (records are rewritten atomically)
                 continue
-            out.append({"path": rel(company, e), "dir": e.is_dir(), "size": st.st_size if e.is_file() else 0,
+            out.append({"path": path, "dir": e.is_dir(), "size": st.st_size if e.is_file() else 0,
                         "modified": st.st_mtime})
             if e.is_dir():
                 walk(e, level + 1)

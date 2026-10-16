@@ -15,10 +15,13 @@ No cloud AI, no API bills, no pip installs.
   playbook, hard rules, KPIs, a focused tool belt, recurring duties and model settings, built from primary
   sources (Google Search Central, web.dev, W3C, the FTC, the ICO, the IRS…) and research on why multi-agent
   systems fail. Start from a team template or hire roles one by one.
-- **Founding from scratch.** The CEO researches the market on the web, writes a charter (offer, pricing,
-  go-to-market, 30-day plan, KPIs), names the company and hands out the first week of tasks.
-- **24/7 autopilot.** The CEO re-plans on a schedule (hourly by default, or sooner when the team runs out of
-  work). Idle agents pick up tasks automatically. Interrupted work resumes after a restart.
+- **Founding from scratch, in stages.** The CEO researches the market (saving verified facts with their
+  sources), writes a charter that must include a price, named competitors, how customers will be reached and a
+  riskiest assumption with a pass threshold, has a "skeptical investor" pass attack it, then plans the first week
+  around the strongest objections. Each stage has its own step budget, so research can't eat the whole founding.
+- **24/7 autopilot that doesn't spin.** The CEO re-plans when something has changed (an answer from you, a
+  finished task, an email, new settings) or on its hourly schedule, and backs off while nothing changes and the
+  work waits on you. Idle agents pick up tasks automatically. A daily token budget per company caps the effort.
 - **Real output.** Agents write real files: a website in `site/` (previewable instantly), research,
   marketing drafts, lead lists, an FAQ, a ledger. Every file is a normal file you can open.
 - **Inbox (you're the layer on top).** Emails, social posts, website deploys, outside API calls, code
@@ -42,6 +45,21 @@ No cloud AI, no API bills, no pip installs.
   resume, from the sidebar or by sending `/stop` to the bot.
 - **Nightly backups and an audit log.** Once a day Holdco zips the database and every company folder and keeps
   the newest 14. Every outbound action that ran is recorded with who proposed it and who allowed it.
+- **Agents see the truth.** Every prompt carries a facts block built from Holdco's own records: whether the
+  site is deployed, how many emails really went out, which accounts the company has, what waits on you, what is
+  down. A read-only `records/` folder holds the same history. When an agent writes a file, messages you or
+  finishes a task claiming a deploy, a sent email, a signup or a payment that the records don't show, Holdco
+  refuses it and tells the agent what really happened. Tasks to send or deploy are done only when that happened.
+- **One question per topic.** An agent can't ask you something that is already waiting; questions come with
+  options and a recommendation as buttons, and at most three from the team wait at once.
+- **Your context, everywhere.** Drop text files about you (skills, budget, brand rules) in *Your context*, or
+  about one company in its *Context* tab, and mark the essential ones "Always include". Agents find everything
+  else with one search over files, your context, memory, tasks, emails, chat, decisions, past sessions, verified
+  facts and pages they already fetched, and read long files by line range or outline. You can use the same
+  search from the dashboard.
+- **Business playbooks.** Holdco recognises the type of business (lead generation, newsletter, SaaS, services,
+  digital products, e-commerce, local services) and gives the CEO that model's riskiest assumptions, first
+  experiments with real customers, metrics and traps.
 - **Search that keeps working.** Brave, SearXNG, the `ddgs` package and DuckDuckGo's HTML pages are tried in
   order; a provider that fails or is blocked is skipped for ten minutes while the others carry on.
 - **Integrations:** company email (SMTP/IMAP; inbound mail becomes support tasks), website publishing (Netlify),
@@ -206,7 +224,8 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
              idle agents pick up tasks ◄───────────────────┘
                       │
                       ▼
-   agent session: system prompt (role, charter, standing orders, memory, metrics)
+   agent session: system prompt (role, standing orders, facts, charter core, playbook, your pinned context,
+                  what changed, what waits on you, relevant memory, what can be opened)
                   → model calls tools → results → … → finish
                       │
      files in the company folder · memory · new tasks · requests in your inbox
@@ -222,6 +241,12 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - **Watchdog**: a task that fails twice is blocked and becomes a question in your Inbox and on your phone (skip
   it, retry once with your note, or pause the company). The second attempt is told what failed the first time
   and must try something else. It also catches repeated errors, bouncing tasks, dead connectors and stalled agents.
+- **Facts and records**: before every session Holdco rewrites `records/` and the facts block from its database.
+  Agents can read them but not write them, and claims that contradict them are refused before they reach a file,
+  your chat or a task handoff. Charters are validated whichever tool writes them.
+- **Context and search**: an incremental full-text index (SQLite FTS5) covers files, your context library,
+  memory, tasks, emails, chat, decisions, sessions, facts and fetched pages. Optional meaning-based search uses an
+  Ollama embedding model (set it in Settings).
 - **Working notes**: agents save what they tried, what failed and what is left with `note_progress`, and Holdco
   adds a note of its own when a run ends badly. The next attempt starts from those notes instead of from scratch.
 
@@ -234,6 +259,11 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - **Audit log** (Inbox page): every outbound action that ran, with who proposed it, who allowed it (you, or a
   *Let agents do it* policy), the exact payload and the result, failures included. Nothing in Holdco edits it.
 - **Kill switch.** One press (sidebar, or `/stop` from your phone) stops every agent and freezes outbound actions.
+- **Outreach rules.** An email to a prospect is queued only with a real-looking address (no placeholder or
+  reserved domains), not on the suppression list (anyone who replied "stop" to any of your companies), and with
+  your postal address and an opt-out line, which Holdco adds when missing. Set the postal address in company
+  Settings. Pages with placeholders (an analytics id like G-XXXX, lorem ipsum, example.com) can't be deployed.
+- **Relay services blocked.** Agents can't fetch pages through services that hide where requests go.
 - Passwords and tokens you enter, including the Telegram bot token, are stored in plain text in `data/holdco.db`
   (and in the backups under `data/backups/`). Protect that folder; a credential vault arrives in Phase 1.
 - You are the owner of these companies. Laws about marketing email (CAN-SPAM, GDPR), business registration,
@@ -275,9 +305,10 @@ python -m unittest discover -s tests -t . -v
 
 No GPU, model or network needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the
 OpenAI-compatible API) and `tests/fake_telegram.py` for the Telegram Bot API and ntfy, so the whole app runs end
-to end. The suite has about 170 tests: unit suites for the quality checks, the model client, preset integrity,
+to end. The suite has about 400 tests: unit suites for the quality checks, the model client, preset integrity,
 file and network safety, tools and approvals, and each Phase 0 module (Doctor, search chain, watchdog and working
-notes, Telegram and ntfy); and a full run of the real server: founding from a template, the 24/7 scheduler,
+notes, Telegram and ntfy) and each Phase 0.5 module (facts and claims, context and search, planning and
+staged founding), a replay of the first real run's failures through the real agent loop; and a full run of the real server: founding from a template, the 24/7 scheduler,
 approvals, chat, QA review with the deliverable check, recurring duties, restart recovery, the prompt-based tool
 fallback, the OpenAI-compatible backend, pausing and deletion, the founding preflight, the kill switch, phone
 notifications and the audit log. GitHub Actions runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
@@ -287,18 +318,21 @@ server address in Settings to `http://127.0.0.1:11999`.
 
 ## Roadmap
 
-Holdco is being built against the plan in [docs/plan.md](docs/plan.md), in five phases, each its own pull
+Holdco is being built against the plan in [docs/plan.md](docs/plan.md), in six phases, each its own pull
 request. Each phase document under `docs/phases/` says what was built and how to try it on your PC.
 
-1. **Phase 0: Stabilize** (built in this pull request): Doctor and founding preflight, the search fallback chain,
+1. **Phase 0: Stabilize** (built): Doctor and founding preflight, the search fallback chain,
    the watchdog, working notes, Telegram and ntfy, the kill switch, nightly backups and the audit log.
-2. **Phase 1: Connect** (planned): an MCP client, a credential vault, risk tags on every tool, connector health
+2. **Phase 0.5: Ground truth and context** (built in this pull request): facts and records agents can't
+   edit, a claims gate, one question per topic, change-driven planning, staged founding, charter validation,
+   business playbooks, verified research facts, and one search over everything including your own context files.
+3. **Phase 1: Connect** (planned): an MCP client, a credential vault, risk tags on every tool, connector health
    checks, and the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave).
-3. **Phase 2: Organize** (planned): the company brain with measured goals, task contracts with dependencies,
+4. **Phase 2: Organize** (planned): the company brain with measured goals, task contracts with dependencies,
    daily and weekly rhythms, a daily brief and a decisions queue.
-4. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
+5. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
    structured tool calls, a code sandbox, taint tracking and a trust ladder for approvals.
-5. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
+6. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
 
 ## Project layout
 
@@ -317,6 +351,10 @@ holdco/
   notify.py         Telegram bot (long polling, buttons, commands) and ntfy
   backup.py         nightly zip backups of the data folder
   routing.py        route registry shared by server.py and the feature modules
+  truth.py          facts block, records/, claims gate, action tasks, outreach checks, verified facts
+  context.py        search index, unified search, line reads, edit_file, your context library
+  planning.py       one question per topic, change-driven cycles, budgets, staged founding, charter checks
+  playbooks.py      business-type playbooks
   llm.py            Ollama / OpenAI-compatible client with tool-call fallbacks
   roles.py          maps agents to presets and tool belts
   web.py            search fallback chain and page fetching

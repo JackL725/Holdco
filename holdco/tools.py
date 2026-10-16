@@ -34,6 +34,14 @@ class Ctx:
     finish_warned: bool = False
     deliverable: str = ""
     written: set = field(default_factory=set)   # files written in this session
+    claims_warned: bool = False                  # Phase 0.5: finish() warned once about unsupported claims
+    # Phase 0.5: the pending question or request this run waits on, when ask_owner refused a question as a
+    # duplicate of it (truth.action_state and finish(status='waiting') read it).
+    waiting_on: int | None = None
+    waiting_warned: bool = False                 # finish() said once that nothing waits on the owner
+    founding_stage: str = ""                     # research, charter, critic or plan in a founding run
+    stage_warned: bool = False                   # finish() said once what the founding stage has not left
+    refused_finish: dict | None = None           # the finish call that stage check refused (agents.run)
 
 
 @dataclass
@@ -71,7 +79,12 @@ def specs(names: list[str]) -> list[dict]:
 # gpt-oss and other models sometimes call the tools they were trained with; map the obvious ones.
 ALIASES = {"browser.search": "web_search", "search": "web_search", "browser.open": "fetch_url", "open": "fetch_url",
            "open_url": "fetch_url", "browse": "fetch_url", "read": "read_file", "write": "write_file",
-           "python": "run_code", "container.exec": "run_code", "ls": "list_files"}
+           "python": "run_code", "container.exec": "run_code", "ls": "list_files",
+           # Phase 0.5: names local models invent for finding and changing things
+           "search_file": "search", "search_files": "search", "search_text": "search", "find_in_files": "search",
+           "grep_files": "search", "find": "search", "cat": "read_file", "open_file": "read_file",
+           "view_file": "read_file", "replace": "edit_file", "patch": "edit_file", "str_replace": "edit_file",
+           "status": "company_status"}
 ARG_RENAMES = {"fetch_url": {"id": "url", "link": "url"}, "web_search": {"q": "query", "topn": "max_results"},
                "run_code": {"script": "code", "cmd": "code"},
                "read_file": {"file": "path", "filename": "path", "file_path": "path"},
@@ -82,6 +95,10 @@ ARG_RENAMES = {"fetch_url": {"id": "url", "link": "url"}, "web_search": {"q": "q
 
 def resolve(ctx: Ctx, name: str, args: dict) -> tuple[str, dict]:
     if name not in REGISTRY and name in ALIASES:
+        name = ALIASES[name]
+    elif name in REGISTRY and ctx.allowed and name not in ctx.allowed and ALIASES.get(name) in ctx.allowed:
+        # A real tool this agent does not have, whose older alias it does have. 'search' meant web_search before
+        # it became Holdco's own search, and gpt-oss still calls its built-in browser search that way.
         name = ALIASES[name]
     renames = ARG_RENAMES.get(name, {})
     args = {renames.get(k, k): v for k, v in (args or {}).items()}
@@ -94,7 +111,10 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
     name, args = resolve(ctx, name, args)
     t = REGISTRY.get(name)
     if not t or (ctx.allowed and name not in ctx.allowed):
-        return (f"ERROR: there's no tool called '{name}' available to you. Your tools are: "
+        import difflib
+        close = difflib.get_close_matches(name, sorted(ctx.allowed), n=3, cutoff=0.5)
+        hint = f" Did you mean {' or '.join(close)}?" if close else ""
+        return (f"ERROR: there's no tool called '{name}' available to you.{hint} Your tools are: "
                 f"{', '.join(sorted(ctx.allowed))}.")
     try:
         out = t.fn(ctx, **_clean_args(t, args))
@@ -176,36 +196,29 @@ def web_search(ctx: Ctx, query: str, max_results: int = 6) -> str:
       ("url",))
 def fetch_url(ctx: Ctx, url: str, include_links: bool = False) -> str:
     _log(ctx, "tool", f"read {url[:120]}")
-    return web.fetch_page(url, include_links=include_links)
+    text = web.fetch_page(url, include_links=include_links)
+    truth.cache_page(ctx, url, text)   # record_fact and check_sources verify against what was really fetched
+    return text
 
 
 # ======================= files =======================
 
-@tool("list_files", "List files in the company folder.", {"path": S("Sub-folder (default: everything)")})
+@tool("list_files", "List files in the company folder, each with a one-line summary.",
+      {"path": S("Sub-folder (default: everything)")})
 def list_files(ctx: Ctx, path: str = ".") -> str:
-    items = workspace.tree(ctx.company, path or ".", depth=4, limit=300)
-    if not items:
-        return "(empty)"
-    return "\n".join(f"{i['path']}/" if i["dir"] else f"{i['path']} ({i['size']} bytes)" for i in items)
+    return context.list_files(ctx, path)
 
 
-@tool("read_file", "Read a text file from the company folder.",
+@tool("read_file", "Read a text file: the company folder, the owner's context (context:<path>, global:<path>), or "
+      "a web page your team already fetched (page:<url>). Reads by line range; outline=true lists the headings "
+      "with line numbers.",
       {"path": S("Path relative to the company folder, e.g. research/market.md"),
-       "offset": I("Character offset to start from (for long files)")}, ("path",))
-def read_file(ctx: Ctx, path: str, offset: int = 0) -> str:
-    p = workspace.safe_path(ctx.company, path)
-    if not p.exists() or not p.is_file():
-        raise ToolError(f"{path} doesn't exist. Use list_files to see what's there.")
-    if p.stat().st_size > 2_000_000:
-        raise ToolError("File is too large to read.")
-    raw = p.read_bytes()
-    if b"\x00" in raw[:2000]:
-        raise ToolError("That's a binary file.")
-    text = raw.decode("utf-8", "replace")
-    chunk = text[offset:offset + 12000]
-    more = f"\n[{len(text) - offset - 12000} more characters: read again with offset={offset + 12000}]" \
-        if len(text) > offset + 12000 else ""
-    return chunk + more
+       "start_line": I("First line to read (default 1)"), "end_line": I("Last line to read (default: 200 lines)"),
+       "outline": {"type": "boolean", "description": "Only list the headings with their line numbers"},
+       "offset": I("Old style: character offset to start from")}, ("path",))
+def read_file(ctx: Ctx, path: str, start_line: int = 0, end_line: int = 0, outline: bool = False,
+              offset: int = 0) -> str:
+    return context.read_file(ctx, path, offset=offset, start_line=start_line, end_line=end_line, outline=outline)
 
 
 @tool("write_file", "Create or overwrite a text file in the company folder (website, docs, code, drafts...).",
@@ -218,6 +231,14 @@ def write_file(ctx: Ctx, path: str, content: str, append: bool = False) -> str:
         raise ToolError(f"{path} is a folder.")
     if len(content) > 500_000:
         raise ToolError("Content too large (max 500 KB per file).")
+    r = workspace.rel(ctx.company, p)
+    # Phase 0.5 guards: records/ and context/ protection, log-like names, future dates, unsupported claims,
+    # and the one charter path. Each returns the full refusal text or None.
+    full = (p.read_text(encoding="utf-8", errors="replace") + content) if append and p.exists() else content
+    for guard in (truth.write_guard, planning.charter_write_hook):
+        refusal = guard(ctx, r, full)
+        if refusal:
+            return refusal
     p.parent.mkdir(parents=True, exist_ok=True)
     existed = p.exists()
     if append and existed:
@@ -225,10 +246,12 @@ def write_file(ctx: Ctx, path: str, content: str, append: bool = False) -> str:
             f.write(content)
     else:
         p.write_text(content, encoding="utf-8", newline="")
-    r = workspace.rel(ctx.company, p)
     ctx.written.add(r)
     _log(ctx, "file", f"{'updated' if existed else 'created'} {r}", path=r, task_id=_task_id(ctx))
-    return f"Saved {r} ({len(content)} characters)."
+    context.after_write(ctx, r)
+    return f"Saved {r} ({len(content)} characters)." + (
+        " For big files, write a first section, then add the rest with append=true or change parts with edit_file."
+        if len(content) > 8000 else "")
 
 
 @tool("delete_file", "Move a file to the company's trash folder.", {"path": S("Path relative to the company folder")},
@@ -237,6 +260,22 @@ def delete_file(ctx: Ctx, path: str) -> str:
     p = workspace.safe_path(ctx.company, path)
     if not p.exists() or p == workspace.root(ctx.company).resolve():
         raise ToolError(f"{path} doesn't exist.")
+    # Phase 0.5: records/ is Holdco's account of what happened and context/ is the owner's library; agents may
+    # not delete them (or their folders) any more than overwrite them. Same refusals as truth.write_guard, on the
+    # resolved path, so "docs/../records" or "Records" cannot get round it.
+    first = workspace.rel(ctx.company, p).lower().split("/", 1)[0].rstrip(". ")
+    if first in ("records", "context"):
+        msg = (getattr(truth, "RECORDS_REFUSAL", "") or "ERROR: records/ is written by Holdco from what really "
+               "happened. Write plans and notes elsewhere.") if first == "records" else \
+            (getattr(truth, "CONTEXT_REFUSAL", "") or "ERROR: context/ is the owner's. Save your notes elsewhere, "
+             "for example docs/.")
+        refused = getattr(truth, "_refused", None)
+        if refused:
+            try:
+                refused(ctx, "delete_file", first, msg, path=workspace.rel(ctx.company, p))
+            except Exception:
+                pass
+        return msg
     dest = workspace.trash(ctx.company, p)
     _log(ctx, "file", f"moved {path} to trash")
     return f"Moved to {dest}."
@@ -254,9 +293,14 @@ def _team_roles(ctx: Ctx) -> dict[str, dict]:
        "assign_to": S("Role of the teammate (see the Team list)"),
        "deliverable": S("Where the result will be: a file path like site/index.html, or an action like 'email queued'"),
        "acceptance": S("3-5 checkable acceptance criteria, one per line"),
-       "priority": I("1 = urgent, 2 = normal, 3 = later")}, ("title", "assign_to"))
+       "priority": I("1 = urgent, 2 = normal, 3 = later"),
+       "kind": S("Optional: outreach, deploy, post, purchase, ask, research, build or write")}, ("title", "assign_to"))
 def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", deliverable: str = "",
-                acceptance: str = "", priority: int = 2) -> str:
+                acceptance: str = "", priority: int = 2, kind: str = "") -> str:
+    kind = truth.classify_task(title, description, deliverable, kind)
+    refusal = truth.task_guard(ctx, kind, title)
+    if refusal:
+        return refusal
     team = _team_roles(ctx)
     role = assign_to.strip().lower()
     if role not in team:
@@ -283,10 +327,10 @@ def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", del
         raise ToolError("There are already 40 open tasks. Finish or cancel some first.")
     ts = db.now()
     tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 " deliverable, acceptance, kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (ctx.company["id"], title.strip()[:200], description, role, team[role]["id"], "todo",
                   max(1, min(int(priority or 2), 3)), ctx.agent["name"], deliverable.strip()[:200],
-                  acceptance.strip()[:2000], ts, ts))
+                  acceptance.strip()[:2000], kind, ts, ts))
     _log(ctx, "task", f"created task #{tid} for {team[role]['name']}: {title}", task_id=tid)
     bus.notify("tasks", company_id=ctx.company["id"])
     tip = "" if deliverable.strip() and acceptance.strip() else \
@@ -354,23 +398,11 @@ def remember(ctx: Ctx, content: str, kind: str = "note", pin: bool = False) -> s
     return f"Saved to memory (#{mid})."
 
 
-@tool("recall", "Search the company's shared memory.", {"query": S("Words to look for")}, ("query",))
+@tool("recall", "Search the company's shared memory (notes, decisions, owner answers).",
+      {"query": S("Words to look for")}, ("query",))
 def recall(ctx: Ctx, query: str) -> str:
-    rows = []
-    if db.HAS_FTS:
-        terms = " OR ".join(f'"{w}"' for w in re.findall(r"\w+", query)[:8])
-        if terms:
-            try:
-                rows = db.q("SELECT m.* FROM memory_fts f JOIN memory m ON m.id=f.rowid WHERE memory_fts MATCH ? "
-                            "AND m.company_id=? ORDER BY rank LIMIT 15", (terms, ctx.company["id"]))
-            except Exception:
-                rows = []
-    if not rows:
-        rows = db.q("SELECT * FROM memory WHERE company_id=? AND content LIKE ? ORDER BY id DESC LIMIT 15",
-                    (ctx.company["id"], f"%{query}%"))
-    if not rows:
-        return "Nothing found."
-    return "\n".join(f"- [{m['kind']}] {m['content']}" for m in rows)
+    # One search for everything since Phase 0.5; recall stays for agents and transcripts that know the old name.
+    return context.search(ctx, query, scope="memory", limit=15)
 
 
 @tool("record_metric", "Record a KPI value (e.g. visitors, signups, revenue_usd, emails_sent, leads).",
@@ -389,6 +421,9 @@ def record_metric(ctx: Ctx, name: str, value: float, note: str = "") -> str:
 @tool("report_to_owner", "Send the owner a message in the dashboard chat. Use for meaningful updates or when they asked you something.",
       {"message": S("The message (concise, Markdown allowed)")}, ("message",))
 def report_to_owner(ctx: Ctx, message: str) -> str:
+    refusal = truth.claims_guard(ctx, message, "report")
+    if refusal:
+        return refusal
     db.run("INSERT INTO messages(company_id, agent_id, sender, content, created_at) VALUES(?,?,?,?,?)",
            (ctx.company["id"], ctx.agent["id"], "agent", message, db.now()))
     _log(ctx, "message", f"messaged the owner: {message[:160]}")
@@ -400,10 +435,16 @@ def report_to_owner(ctx: Ctx, message: str) -> str:
     return "Delivered to the owner."
 
 
-@tool("ask_owner", "Ask the owner a question only they can answer (a decision, an account, a preference).",
-      {"question": S("The question, with the options you see")}, ("question",))
-def ask_owner(ctx: Ctx, question: str) -> str:
-    return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "question", {"question": question})
+@tool("ask_owner", "Ask the owner a question only they can answer (a decision, an account, a preference). Give "
+      "options and your recommendation whenever there is a choice; they become buttons for the owner.",
+      {"question": S("The question"), "options": S("The choices, one per line (optional)"),
+       "recommended": S("The option you recommend, copied exactly (optional)"),
+       "context": S("Why you are asking and what happens with each option (optional)")}, ("question",))
+def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "", context: str = "") -> str:
+    refusal = truth.claims_guard(ctx, "\n".join((question, context)), "ask")
+    if refusal:
+        return refusal
+    return planning.ask_owner(ctx, question, options, recommended, context)
 
 
 # ======================= outbound =======================
@@ -425,6 +466,9 @@ def send_email(ctx: Ctx, to: str, subject: str, body: str, reply_to_email_id: in
     limit = int(db.company_settings(ctx.company).get("daily_email_limit", 25))
     if _emails_today(ctx.company["id"]) >= limit:
         return f"Daily email limit ({limit}) reached. Try again tomorrow."
+    refusal, body = truth.outreach_guard(ctx, to.strip(), subject, body)
+    if refusal:
+        return refusal
     payload = {"to": to.strip(), "subject": subject, "body": body}
     if reply_to_email_id:
         payload["reply_to_email_id"] = int(reply_to_email_id)
@@ -465,6 +509,9 @@ def social_post(ctx: Ctx, platform: str, content: str, link: str = "") -> str:
 def deploy_site(ctx: Ctx) -> str:
     if not workspace.safe_path(ctx.company, "site/index.html").exists():
         raise ToolError("Create site/index.html first.")
+    refusal = truth.deploy_guard(ctx)
+    if refusal:
+        return refusal
     return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "deploy_site", {"folder": "site"})
 
 
@@ -516,6 +563,10 @@ def request_purchase(ctx: Ctx, item: str, amount_usd: float, reason: str, vendor
        "one_liner": S("One sentence: what we do and for whom"),
        "stage": S("idea, building, launched or revenue")}, ("charter",))
 def update_charter(ctx: Ctx, charter: str, company_name: str = "", one_liner: str = "", stage: str = "") -> str:
+    missing = planning.validate_charter(charter)
+    if missing:
+        return ("ERROR: the charter is missing these sections, or they are empty: " + "; ".join(missing)
+                + ". Add them (an estimate labelled as an estimate is fine) and call update_charter again.")
     fields: dict = {"charter": charter}
     if company_name.strip() and not db.company_settings(ctx.company).get("name_locked"):
         fields["name"] = company_name.strip()[:80]
@@ -634,6 +685,25 @@ def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     return None
 
 
+WAITING_REFUSAL = ("Not finished yet: nothing is waiting on the owner for this task. Ask with ask_owner (one question "
+                   "with options and your recommendation), or finish with status 'blocked' and say what blocks you.")
+WAITING_ON_LABEL = "Waiting on the owner: "
+
+
+def _waiting_for(ctx: Ctx) -> int | None:
+    """The pending approval this task waits on: its own question or request, else the pending one ask_owner
+    folded its duplicate question into (ctx.waiting_on). None when nothing waits on the owner for it."""
+    cid = ctx.company["id"]
+    own = db.one("SELECT id FROM approvals WHERE company_id=? AND task_id=? AND status IN ('pending','running') "
+                 "ORDER BY id DESC LIMIT 1", (cid, ctx.task["id"]))
+    if own:
+        return own["id"]
+    if ctx.waiting_on and db.one("SELECT id FROM approvals WHERE id=? AND company_id=? AND status='pending'",
+                                 (ctx.waiting_on, cid)):
+        return int(ctx.waiting_on)
+    return None
+
+
 @tool("finish", "End your work session with a handoff for the team.",
       {"summary": S("What you did, in up to 5 short bullets"),
        "status": S("done, partial (some progress, more needed), blocked (can't proceed) or waiting (on the owner)"),
@@ -647,6 +717,28 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     if status not in ("done", "partial", "blocked", "waiting"):
         status = "done"
     target = deliverable or (ctx.task or {}).get("deliverable", "")
+    if ctx.kind == "founding" and ctx.founding_stage:
+        # Phase 0.5: founding runs have no task, so each stage's own deliverable is checked instead, whatever the
+        # status. Once: the stage gets one more chance to save it, then its finish is accepted with a note.
+        problem = planning.stage_problem(ctx.company, ctx.founding_stage)
+        if problem and not ctx.stage_warned:
+            ctx.stage_warned = True
+            ctx.refused_finish = {"summary": summary, "status": status, "deliverable": deliverable,
+                                  "evidence": evidence, "open_issues": open_issues, "next_step": next_step}
+            return f"Not finished yet: {problem}"
+        if problem:
+            open_issues = (open_issues + f"\nStage check: {problem.split('. ', 1)[0]}.").strip()
+    waiting_on = None
+    if status == "waiting" and ctx.task:
+        # Phase 0.5: 'waiting' means the owner has something to answer for this task: its own question or
+        # request, or the pending one its duplicate question was folded into. Otherwise it would wait forever.
+        waiting_on = _waiting_for(ctx)
+        if waiting_on is None and not ctx.waiting_warned:
+            ctx.waiting_warned = True
+            return WAITING_REFUSAL
+        if waiting_on is None:
+            status = "blocked"
+            open_issues = (open_issues + "\nNothing was waiting on the owner for this task.").strip()
     if status == "done" and ctx.task:
         problem = _deliverable_ok(ctx, target)
         if problem and not ctx.finish_warned:
@@ -656,6 +748,17 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         if problem:
             status = "partial"
             open_issues = (open_issues + f"\nDeliverable check failed: {problem}.").strip()
+    if status == "done":
+        problem = truth.finish_guard(ctx, status, target, summary, evidence)
+        if problem and not ctx.claims_warned:
+            ctx.claims_warned = True
+            return f"Not finished yet: {problem}"
+        if problem:
+            # The action this task exists for is queued for the owner: the task waits for the decision instead
+            # of being retried; otherwise the check failed and the task is only partly done.
+            kind = (ctx.task or {}).get("kind") or truth.classify_task((ctx.task or {}).get("title", ""))
+            status = "waiting" if ctx.task and truth.action_state(ctx, kind) == "waiting" else "partial"
+            open_issues = (open_issues + f"\nCheck failed: {problem}").strip()
     parts = [f"Status: {status}"]
     if target:
         parts.append(f"Deliverable: {target}")
@@ -663,6 +766,9 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     for label, val in (("Evidence", evidence), ("Open issues", open_issues), ("Suggested next", next_step)):
         if val and val.strip():
             parts.append(f"{label}: {val.strip()}")
+    if status == "waiting" and waiting_on:
+        # actions.decide reads this line: the task reopens once #N is decided, not on unrelated answers.
+        parts.append(f"{WAITING_ON_LABEL}#{waiting_on}")
     ctx.finished = True
     ctx.finish_status = status
     ctx.finish_summary = "\n".join(parts)
@@ -677,3 +783,4 @@ def role_tools(agent: dict, kind: str) -> list[dict]:
 # Feature modules register extra tools with @tool when imported. Keep this at the very end so `tool`, `S`,
 # `I`, `Ctx` and `ToolError` exist before they run.
 from . import watchdog  # noqa: E402,F401  (note_progress lives with the working-notes logic)
+from . import context, planning, truth  # noqa: E402,F401  (Phase 0.5: search, guards, owner questions)

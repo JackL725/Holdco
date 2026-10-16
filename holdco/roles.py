@@ -3,11 +3,26 @@ from __future__ import annotations
 
 from . import presets
 
-FOUNDING_TOOLS = ["web_search", "fetch_url", "write_file", "read_file", "update_charter", "create_task", "remember",
-                  "report_to_owner", "finish"]
+# Phase 0.5: founding runs in stages, each with a small belt of its own (design 4.1). Research cannot create tasks
+# or write the charter, so it cannot eat the whole founding; the critic may only write docs/critique.md (enforced
+# by planning.charter_write_hook). Research gets remember instead of the design's note_progress: founding runs
+# have no task, and note_progress only writes a task's working notes.
+FOUNDING_STAGE_TOOLS = {
+    "research": ["web_search", "fetch_url", "search", "read_file", "write_file", "record_fact", "remember", "finish"],
+    "charter": ["read_file", "search", "update_charter", "record_fact", "finish"],
+    "critic": ["read_file", "search", "web_search", "fetch_url", "write_file", "finish"],
+    "plan": ["read_file", "search", "create_task", "ask_owner", "report_to_owner", "finish"],
+}
+# Every founding tool, for callers that ask without a stage.
+FOUNDING_TOOLS = list(dict.fromkeys(n for names in FOUNDING_STAGE_TOOLS.values() for n in names if n != "finish")) \
+    + ["finish"]
 CHAT_EXTRA = ["list_tasks", "create_task", "update_task", "report_to_owner"]
 # Tools every role gets in task runs, on top of its preset's belt (Phase 0: working notes).
 TASK_EXTRA = ["note_progress"]
+# Phase 0.5: finding things and the real state of the company, for every role and run kind.
+CONTEXT_EXTRA = ["search", "grep", "edit_file", "company_status"]
+# Phase 0.5: verified facts and the source check, for roles that research (they have web_search).
+RESEARCH_EXTRA = ["record_fact", "check_sources"]
 
 
 def preset_key(agent: dict) -> str:
@@ -24,6 +39,11 @@ def role_info(agent_or_role) -> dict:
             "reasoning": "medium", "creativity": "balanced"}
 
 
+def founding_tools(stage: str) -> list[str]:
+    """The tool belt of one founding stage (research, charter, critic or plan)."""
+    return list(FOUNDING_STAGE_TOOLS.get(stage) or FOUNDING_STAGE_TOOLS["research"])
+
+
 def tools_for(agent: dict, kind: str) -> list[str]:
     if kind == "founding":
         return list(FOUNDING_TOOLS)
@@ -34,6 +54,8 @@ def tools_for(agent: dict, kind: str) -> list[str]:
         names = [n for n in names if n != "finish"] + CHAT_EXTRA
     elif kind == "task":
         names = [n for n in names if n != "finish"] + TASK_EXTRA + ["finish"]
+    research = RESEARCH_EXTRA if "web_search" in names else []
+    names = [n for n in names if n != "finish"] + CONTEXT_EXTRA + research + (["finish"] if "finish" in names else [])
     seen, out = set(), []
     for n in names:
         if n not in seen:

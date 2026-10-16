@@ -13,7 +13,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, backup, bus, config, db, doctor, emailer, llm, notify, presets, roles, watchdog, workspace  # noqa: F401
+from . import actions, agents, backup, bus, config, context, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, watchdog, workspace  # noqa: F401
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -182,11 +182,18 @@ def api_company(h, m, body):
             "folder": str(workspace.root(c))}
 
 
+# Company settings Holdco manages itself (staged founding, notices, the one-time truth check). The dashboard never
+# sends them; refusing them here keeps any other client from moving a founding stage by hand.
+INTERNAL_COMPANY_SETTINGS = {"founding_stage", "founding_retry", "founding_research_note", "founding_context",
+                             "last_waiting_notice", "budget_notice", "truth_scan_done", "name_locked", "template"}
+
+
 @route("PATCH", r"/api/companies/(\d+)")
 def api_company_patch(h, m, body):
     c = _company_or_404(m.group(1))
     b = body or {}
     fields = {}
+    caps_before = planning.capability_hash(db.company_settings(c))
     if "status" in b and b["status"] in ("active", "paused", "archived"):
         fields["status"] = b["status"]
         bus.emit(c["id"], "info", {"active": "resumed the company", "paused": "paused the company",
@@ -201,18 +208,28 @@ def api_company_patch(h, m, body):
     if "settings" in b and isinstance(b["settings"], dict):
         cs = db.company_settings(c)
         for k, v in b["settings"].items():
-            if k not in config.DEFAULT_COMPANY_SETTINGS:
+            if k not in config.DEFAULT_COMPANY_SETTINGS or k in INTERNAL_COMPANY_SETTINGS:
                 continue
             if isinstance(v, str) and v == "••••••••":
                 continue  # unchanged secret
             if k in ("cycle_minutes", "daily_email_limit", "smtp_port", "imap_port"):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
+            if k == "daily_token_budget":
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # 0 = no limit
+            if k == "pinned_context":
+                v = [str(x)[:300] for x in v][:40] if isinstance(v, list) else []
             if k == "policies" and isinstance(v, dict):
                 v = {a: p for a, p in v.items() if a in config.POLICY_ACTIONS and p in ("approve", "auto", "off", "")
                      and a not in config.LOCKED_POLICIES}
                 v = {a: p for a, p in v.items() if p}
             cs[k] = v
         fields["settings"] = json.dumps(cs)
+        # Phase 0.5: a new mailbox, token, site address, postal address, standing orders or business type
+        # changes what the team can do, so the CEO plans with it at the next tick.
+        if planning.capability_hash(cs) != caps_before:
+            fields["cycle_requested"] = 1
+    if "charter" in fields and (fields["charter"] or "") != (c.get("charter") or ""):
+        fields["cycle_requested"] = 1   # the owner rewrote the charter: plan against the new one
     if fields:
         db.update("companies", c["id"], **fields)
     bus.notify("company", company_id=c["id"])
@@ -239,7 +256,13 @@ def api_cycle(h, m, body):
     ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
     if not ceo:
         raise HTTPError(400, "This company has no CEO agent.")
-    if not agents.start(ceo["id"], "cycle"):
+    if agents.is_running(ceo["id"]):
+        db.update("companies", c["id"], cycle_requested=1)   # the scheduler plans as soon as the CEO is free
+        return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
+    # The owner asked: the baseline is recorded and the cycle's header never says "Nothing has changed".
+    planning.cycle_started(c, requested=True)
+    if not agents.start(ceo["id"], "cycle", requested=True):
+        db.update("companies", c["id"], cycle_requested=1)
         return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
     return {"ok": True, "message": f"{ceo['name']} is planning now."}
 
@@ -309,7 +332,7 @@ def api_agent_run(h, m, body):
     if not a:
         raise HTTPError(404, "Agent not found")
     if a["role"] == "ceo" and not (body or {}).get("task_id"):
-        ok = agents.start(a["id"], "cycle")
+        ok = agents.start(a["id"], "cycle", requested=True)   # the owner started it from the Team tab
     else:
         t = db.one("SELECT * FROM tasks WHERE company_id=? AND agent_id=? AND status='todo' ORDER BY priority, id LIMIT 1",
                    (a["company_id"], a["id"]))
@@ -366,11 +389,12 @@ def api_task_create(h, m, body):
     if not agent or agent["company_id"] != c["id"]:
         agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
     ts = db.now()
+    kind = truth.classify_task(title, b.get("description", ""), b.get("deliverable") or "", b.get("kind") or "")
     tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 " deliverable, acceptance, kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (c["id"], title[:200], b.get("description", ""), agent["role"], agent["id"], "todo",
                   max(1, min(_int(b.get("priority"), 1), 3)), "owner", (b.get("deliverable") or "").strip()[:200],
-                  (b.get("acceptance") or "").strip()[:2000], ts, ts))
+                  (b.get("acceptance") or "").strip()[:2000], kind, ts, ts))
     bus.emit(c["id"], "task", f"created task #{tid} for {agent['name']}: {title}", None, {"task_id": tid, "by": "owner"})
     return {"task": db.get_task(tid)}
 
