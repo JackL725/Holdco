@@ -1,13 +1,15 @@
 """Each company gets its own folder on disk. Agents can't read or write outside it."""
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
-from . import config
+from . import config, db
 
 SKIP = {".trash", ".runs", ".cache", ".qa", "__pycache__", "node_modules", ".git"}   # .cache: fetched pages (truth.py)
 
@@ -114,12 +116,65 @@ def remove_company_folder(company: dict) -> None:
 
 # ---------------- Phase 2: file leases (two agents never edit the same file at once)
 
+LEASE_MINUTES = 30
+_lease_lock = threading.Lock()
+
+
+def _lease_key(rel_path: str) -> str:
+    # Windows paths are case-insensitive: Site/index.html and site/index.html are one file.
+    return rel_path.lower() if os.name == "nt" else rel_path
+
+
+def _lease_live(row: dict, now: str) -> bool:
+    """A lease holds until it expires, unless its run already ended (a run that crashed before releasing it)."""
+    if (row.get("expires_at") or "") <= now:
+        return False
+    run = db.one("SELECT status FROM runs WHERE id=?", (row["run_id"],)) if row.get("run_id") else None
+    return not (run and run["status"] != "running")
+
+
 def lease(company: dict, rel_path: str, ctx) -> str | None:
     """Take or renew this run's lease on a file before writing it; the refusal text when another live run holds it.
-    Scaffold: no leases yet."""
+
+    No lease, this run's own lease, or one that expired (or whose run ended): take it for LEASE_MINUTES and go on.
+    A context without a run (run_id 0: tests and tools called outside a session) takes no lease, because nothing
+    would release it, but it still respects the leases of real runs. Chat, cycle and founding runs have no task;
+    their leases carry none."""
+    run_id = int(getattr(ctx, "run_id", 0) or 0)
+    task = getattr(ctx, "task", None) or {}
+    agent = getattr(ctx, "agent", None) or {}
+    key = _lease_key(rel_path)
+    now_dt = _dt.datetime.now(_dt.timezone.utc)
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _lease_lock:
+        row = db.one("SELECT * FROM leases WHERE company_id=? AND path=?", (company["id"], key))
+        if row and row["run_id"] != run_id and _lease_live(row, now):
+            holder = (db.get_agent(row["agent_id"]) or {}).get("name") if row.get("agent_id") else None
+            until = (db.parse_time(row["expires_at"]) or now_dt).strftime("%H:%M")
+            what = f" (task #{row['task_id']})" if row.get("task_id") else ""
+            return (f"ERROR: {rel_path} is being edited by {holder or 'another agent'}{what} until {until} UTC; "
+                    f"work on something else or wait.")
+        if not run_id:
+            return None
+        expires = (now_dt + _dt.timedelta(minutes=LEASE_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        db.run("INSERT OR REPLACE INTO leases(company_id, path, task_id, agent_id, run_id, expires_at) "
+               "VALUES(?,?,?,?,?,?)", (company["id"], key, task.get("id"), agent.get("id"), run_id, expires))
     return None
 
 
 def release(run_id: int) -> None:
     """Free every lease a run holds (agents._finalize)."""
-    return None
+    if run_id:
+        db.run("DELETE FROM leases WHERE run_id=?", (int(run_id),))
+
+
+def leases(company: dict) -> list[dict]:
+    """The live leases of a company for the Files tab ("editing: Forge"): path, agent, task and expiry."""
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = []
+    for r in db.q("SELECT l.*, a.name AS agent_name FROM leases l LEFT JOIN agents a ON a.id=l.agent_id "
+                  "WHERE l.company_id=? AND l.expires_at>? ORDER BY l.path", (company["id"], now)):
+        if _lease_live(r, now):
+            out.append({"path": r["path"], "agent_id": r["agent_id"], "agent_name": r["agent_name"] or "",
+                        "task_id": r["task_id"], "run_id": r["run_id"], "expires_at": r["expires_at"]})
+    return out
