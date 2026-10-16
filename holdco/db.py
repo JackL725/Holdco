@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, task_id INTEGER, claim TEXT, url TEXT,
     quote TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS connectors (
+    id INTEGER PRIMARY KEY, company_id INTEGER, key TEXT, enabled INTEGER DEFAULT 1, config TEXT DEFAULT '{}',
+    status TEXT DEFAULT '', detail TEXT DEFAULT '', last_check TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_connectors_key ON connectors(key, company_id);
 CREATE INDEX IF NOT EXISTS ix_fetched_company ON fetched(company_id, url);
 CREATE INDEX IF NOT EXISTS ix_facts_company ON facts(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
@@ -136,6 +141,10 @@ MIGRATIONS = {
               "kind": "TEXT DEFAULT ''"},
     # Phase 0.5: the change stamp and backoff that stop idle re-planning
     "companies": {"last_cycle_stamp": "TEXT DEFAULT ''", "cycle_backoff": "INTEGER DEFAULT 0"},
+    # Phase 1: where a number came from (a connector key, or 'manual' when an agent typed it)
+    "metrics": {"source": "TEXT DEFAULT 'manual'"},
+    # Phase 1: the Message-ID an inbound email answers, so replies to outreach can be counted
+    "emails": {"in_reply_to": "TEXT DEFAULT ''"},
 }
 
 
@@ -164,6 +173,11 @@ def init() -> None:
         except sqlite3.OperationalError:
             HAS_FTS = False
         _conn.commit()
+    try:   # Phase 1: plain-text secrets move into the vault (a no-op once done)
+        from . import vault
+        vault.migrate()
+    except Exception as e:   # a vault problem must not stop Holdco from starting; the Doctor reports it
+        print(f"Vault migration failed: {e}")
 
 
 def q(sql: str, params: tuple | list = ()) -> list[dict]:
@@ -226,6 +240,31 @@ def get_settings() -> dict:
     for k in config.LOCKED_POLICIES:
         pol[k] = "approve"
     s["policies"] = pol
+    return _resolve_secrets(s, config.SECRET_SETTINGS)
+
+
+_secret_warned: set[str] = set()   # vault names whose read failure was already printed
+
+
+def _resolve_secrets(s: dict, keys=None) -> dict:
+    """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing).
+    Only the secret keys are resolved (keys: config.SECRET_SETTINGS or config.SECRET_COMPANY_SETTINGS; both when
+    None): any other setting that happens to read "vault:..." (a directive an agent or the owner typed) stays text,
+    so it can never pull a secret out of the vault. The result holds real secrets: never write it back to a table
+    (update_company_settings does that safely)."""
+    allowed = set(keys) if keys is not None else set(config.SECRET_SETTINGS) | set(config.SECRET_COMPANY_SETTINGS)
+    names = [k for k, v in s.items() if k in allowed and isinstance(v, str) and v.startswith("vault:")]
+    if names:
+        from . import vault   # imported here: vault imports db
+        for k in names:
+            name = s[k][len("vault:"):]
+            try:
+                s[k] = vault.get(name) or ""
+            except Exception as e:   # a foreign-machine secret: treat as unset, the Doctor's vault row says why
+                if name not in _secret_warned:   # once per secret: settings are read many times a minute
+                    _secret_warned.add(name)
+                    print(f"Vault: {k}: {e}")
+                s[k] = ""
     return s
 
 
@@ -284,12 +323,44 @@ def set_settings(values: dict) -> dict:
 # ---------- companies ----------
 
 def company_settings(company: dict) -> dict:
+    """A company's settings over the defaults, with vault markers resolved to the secrets themselves. For reading
+    only: writing this back would put the secrets in the table in plain text (use update_company_settings)."""
     s = dict(config.DEFAULT_COMPANY_SETTINGS)
     try:
         s.update(json.loads(company.get("settings") or "{}"))
     except ValueError:
         pass
-    return s
+    return _resolve_secrets(s, config.SECRET_COMPANY_SETTINGS)
+
+
+def update_company_settings(company_id: int, **changes) -> dict:
+    """Merge changes into a company's stored settings JSON and write it back. The stored JSON is loaded as it is
+    (vault markers stay markers, defaults are not added), so no resolved secret is ever written. A secret key among
+    the changes (config.SECRET_COMPANY_SETTINGS) goes to the vault and only its marker is stored; an empty value
+    deletes it. Returns the stored settings."""
+    marker = "vault:"
+    if any(k in config.SECRET_COMPANY_SETTINGS for k in changes):
+        from . import vault   # imported here: vault imports db. Before the lock: vault.migrate locks vault, then db
+        for k in config.SECRET_COMPANY_SETTINGS:
+            v = changes.get(k)
+            if not isinstance(v, str) or v.startswith(marker):
+                continue
+            name = f"company.{company_id}.{k}"
+            if v:
+                vault.put(name, v)
+                changes[k] = marker + name
+            else:
+                vault.delete(name)
+    with _lock:   # read, merge and write in one go, so a change made meanwhile is not lost
+        row = one("SELECT settings FROM companies WHERE id=?", (company_id,))
+        if not row:
+            return {}
+        stored = loads(row.get("settings"), {}) or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored.update(changes)
+        run("UPDATE companies SET settings=? WHERE id=?", (json.dumps(stored), company_id))
+        return stored
 
 
 def effective_policy(company: dict, action: str) -> str:

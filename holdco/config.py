@@ -66,6 +66,11 @@ POLICY_ACTIONS = {
     "http_post": "Send data to an outside service",
     "run_code": "Run code on this PC",
     "spend_money": "Spend money",
+    # Phase 1: tools of connected services, by their risk tag
+    "connector_write": "Change data in a connected service",
+    "connector_publish": "Publish through a connected service",
+    "connector_contact": "Message people through a connected service",
+    "irreversible": "Irreversible actions: domains, deletions, refunds",
 }
 DEFAULT_POLICIES = {
     "send_email": "approve",
@@ -74,8 +79,19 @@ DEFAULT_POLICIES = {
     "http_post": "approve",
     "run_code": "approve",
     "spend_money": "approve",
+    "connector_write": "approve",
+    "connector_publish": "approve",
+    "connector_contact": "approve",
+    "irreversible": "approve",
 }
-LOCKED_POLICIES = {"spend_money"}  # money never moves without you
+LOCKED_POLICIES = {"spend_money", "irreversible"}  # money never moves, and nothing irreversible happens, without you
+
+# Phase 1: every tool carries one of these. read runs freely; the others map onto approval policies.
+RISK_TAGS = ("read", "write", "publish", "contact", "spend", "irreversible")
+
+# Phase 1: settings that are secrets live in the vault; the settings table keeps a "vault:<name>" marker.
+SECRET_SETTINGS = ("llm_api_key", "brave_api_key", "telegram_bot_token")
+SECRET_COMPANY_SETTINGS = ("smtp_password", "imap_password", "netlify_token")
 
 DEFAULT_COMPANY_SETTINGS: dict = {
     "cycle_minutes": 60,      # how often the CEO re-plans
@@ -90,6 +106,7 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "netlify_token": "", "netlify_site_id": "", "site_url": "",
     # Social posts / outbound automation (optional): a webhook (Zapier, Make, n8n, Discord...).
     "webhook_url": "",
+    "email_provider": "auto",    # Phase 1: auto | smtp | resend (auto = Resend when a healthy instance exists)
     # Ground truth and context (Phase 0.5)
     "postal_address": "",        # sender's postal address; commercial email must carry one (CAN-SPAM)
     "archetype": "",             # business type override for the playbook; blank = detected from the idea

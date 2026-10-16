@@ -39,17 +39,10 @@ def _today() -> str:
 
 
 def update_company_settings(company_id: int, **values) -> dict:
-    """Merge values into a company's stored settings JSON (only the stored keys, never the defaults)."""
+    """Merge values into a company's stored settings JSON (only the stored keys, never the defaults, and vault
+    markers stay markers: see db.update_company_settings)."""
     with _settings_lock:
-        row = db.one("SELECT settings FROM companies WHERE id=?", (company_id,))
-        if not row:
-            return {}
-        stored = db.loads(row.get("settings"), {}) or {}
-        if not isinstance(stored, dict):
-            stored = {}
-        stored.update(values)
-        db.update("companies", company_id, settings=json.dumps(stored))
-        return stored
+        return db.update_company_settings(company_id, **values)
 
 
 def _age(created_at: str | None) -> str:
@@ -357,7 +350,20 @@ def change_stamp(company: dict) -> str:
     pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (cid,)) or 0
     counts = task_counts(cid)
     return (f"e{ev['id'] if ev else 0}.m{msg['id'] if msg else 0}.p{pending}.t"
-            + "-".join(str(counts[s]) for s in TASK_STATUSES) + f".c{capability_hash(db.company_settings(company))}")
+            + "-".join(str(counts[s]) for s in TASK_STATUSES) + f".c{capability_hash(db.company_settings(company))}"
+            + f".x{connector_hash(company)}")
+
+
+def connector_hash(company: dict) -> str:
+    """Phase 1: which connected services the company can use and whether they work. Connecting Stripe or fixing a
+    broken mailbox is news the CEO should plan with at once, not at the next scheduled cycle."""
+    try:
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        rows = connectors.visible(company)
+    except Exception:
+        return "0"
+    parts = sorted(f"{r.get('key')}:{int(bool(r.get('enabled')))}:{r.get('status') or ''}" for r in rows)
+    return format(zlib.crc32("\x1f".join(parts).encode("utf-8", "replace")), "08x")
 
 
 def stamp_record(company: dict) -> dict:

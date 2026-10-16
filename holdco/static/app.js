@@ -159,6 +159,7 @@ const S = {
   feeds: new Set(),
   models: null,
   offline: false,
+  connectors: null,    // /api/connectors, cached for the definitions (labels, agents_can, tools)
 };
 
 const refreshState = async () => {
@@ -377,7 +378,7 @@ async function render() {
   if (!p.length) view = Portfolio();
   else if (p[0] === 'new') view = NewCompany();
   else if (p[0] === 'inbox') view = Inbox();
-  else if (p[0] === 'settings') view = Settings();
+  else if (p[0] === 'settings') view = Settings(p[1]);
   else if (p[0] === 'library') view = Library();
   else if (p[0] === 'context') view = YourContext(p[1]);
   else if (p[0] === 'doctor') view = Doctor();
@@ -572,16 +573,73 @@ function NewCompany() {
   };
 }
 
+// ---------------------------------------------------------------- phase 1: risk tags and connected services
+// Every tool and every request carries a risk tag (docs/phases/phase-1-connect.md, item 4): read and write stay
+// inside Holdco, publish and contact reach other people, spend and irreversible always wait for you.
+const TAG_INFO = {
+  read: ['accent', 'Only reads; runs without asking'],
+  write: ['accent', 'Changes data'],
+  publish: ['warn', 'Publishes something other people can see'],
+  contact: ['warn', 'Messages or acts toward other people'],
+  unclassified: ['warn', 'Holdco has no rule for this tool, so it asks you first'],
+  spend: ['bad', 'Moves money; always asks you'],
+  irreversible: ['bad', 'Cannot be undone; always asks you'],
+};
+function tagBadge(tag) {
+  if (!tag) return '';
+  const [cls, title] = TAG_INFO[tag] || ['warn', 'Unknown risk tag; Holdco asks you first'];
+  return `<span class="badge ${cls}" title="${esc(title)}">${esc(tag)}</span>`;
+}
+const KIND_LABEL = { api: 'API', 'mcp-stdio': 'MCP on this PC', 'mcp-http': 'Hosted MCP', builtin: 'Built in' };
+const isOn = (v) => v === true || /^(1|true|yes|on)$/i.test(String(v ?? '').trim());
+const fmtValue = (v) => {
+  const n = Number(v);
+  return v !== null && v !== '' && Number.isFinite(n) ? n.toLocaleString() : String(v ?? '');
+};
+const sentence = (s) => { const t = String(s ?? '').trim(); return !t || /[.!?:]$/.test(t) ? t : `${t}.`; };
+const andList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
+
+// GET /api/connectors, cached: the Inbox and the Overview only need the definitions (labels, agents_can, tools).
+async function loadConnectors(force = false) {
+  if (!S.connectors || force) S.connectors = await GET('/api/connectors');
+  return S.connectors;
+}
+const connectorDef = (key) => (S.connectors && S.connectors.definitions && S.connectors.definitions[key]) || null;
+function connectorLabel(key) {
+  const d = connectorDef(key);
+  if (d && d.label) return d.label;
+  const k = String(key || '');
+  return k ? k[0].toUpperCase() + k.slice(1) : 'a connected service';
+}
+
+// Secret inputs (data-secret) show the mask when a value is stored, and sending the mask back keeps it. An input
+// that was empty and is still empty is not sent, so a key saved elsewhere meanwhile (a connector card) survives.
+function dropUntouchedSecrets(form, values) {
+  $$('input[data-secret]', form).forEach((inp) => {
+    if (inp.name && inp.name in values && !inp.value && !inp.defaultValue) delete values[inp.name];
+  });
+}
+// After a save the secret inputs take the stored state (the mask, or empty), so clearing one later deletes it.
+// untouchedOnly leaves alone an input the owner is editing.
+function syncSecrets(form, values, untouchedOnly = false) {
+  if (!form || !values) return;
+  $$('input[data-secret]', form).forEach((inp) => {
+    if (!(inp.name in values) || (untouchedOnly && inp.value !== inp.defaultValue)) return;
+    inp.defaultValue = values[inp.name] || '';
+    inp.value = values[inp.name] || '';
+  });
+}
+
 // ---------------------------------------------------------------- inbox
 const ACTION_VERB = {
   send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
   http_post: 'wants to send data to an outside service', run_code: 'wants to run code on this PC',
-  spend_money: 'wants you to buy something', question: 'has a question',
+  spend_money: 'wants you to buy something', question: 'has a question', connector_call: 'wants to use a connected service',
 };
 
 const ACTION_LABEL = {
   send_email: 'Send email', social_post: 'Social post', deploy_site: 'Deploy website', http_post: 'Outside request',
-  run_code: 'Run code', spend_money: 'Purchase', question: 'Question',
+  run_code: 'Run code', spend_money: 'Purchase', question: 'Question', connector_call: 'Connected service',
 };
 
 const platformName = (p) => ({ x: 'X', twitter: 'X', linkedin: 'LinkedIn', reddit: 'Reddit', instagram: 'Instagram', facebook: 'Facebook', threads: 'Threads', bluesky: 'Bluesky', tiktok: 'TikTok', youtube: 'YouTube' }[(p || '').toLowerCase()] || p || 'social media');
@@ -617,6 +675,19 @@ function requestFields(a) {
         ${opts.length ? `<div class="opts">${opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('')}</div>` : ''}
         <label class="field">${opts.length ? 'Or answer in your own words' : 'Your answer'}<textarea data-k="answer" rows="3"></textarea></label>`;
     }
+    case 'connector_call': {
+      // A tool of a connected service (Phase 1). The arguments are shown, not edited: approve or reject as asked.
+      const def = connectorDef(p.connector);
+      const label = connectorLabel(p.connector);
+      const tool = String(p.tool || '');
+      const spec = def && Array.isArray(def.tools) ? def.tools.find((x) => x.tool === tool || x.name === tool) : null;
+      const can = def && def.setup && Array.isArray(def.setup.agents_can) ? def.setup.agents_can : [];
+      return `<div class="form-grid">${ro('Service', label)}
+          <label class="field">Tool<div class="box"><code>${esc(tool || '?')}</code> ${tagBadge(p.tag || a.tag)}</div></label></div>
+        ${spec && spec.description ? `<p class="muted small" style="margin:0">${esc(spec.description)}</p>` : ''}
+        <label class="field">Arguments<pre class="box">${esc(JSON.stringify(p.args ?? {}, null, 2))}</pre></label>
+        ${can.length ? `<p class="small muted" style="margin:0"><b>What agents can do with ${esc(label)}:</b> ${esc(can.join('; '))}</p>` : ''}`;
+    }
     default:
       return `<pre class="box">${esc(JSON.stringify(p, null, 2))}</pre>`;
   }
@@ -625,10 +696,11 @@ function requestFields(a) {
 function requestCard(a) {
   const agent = S.agents[a.agent_id] || { name: a.agent_name || 'An agent', role: a.agent_role || '' };
   const q = a.action === 'question';
-  const approveLabel = { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run' }[a.action] || 'Approve';
+  const approveLabel = { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run', connector_call: 'Approve and run' }[a.action] || 'Approve';
+  const verb = a.action === 'connector_call' ? `wants to use ${esc(connectorLabel((a.payload || {}).connector))}` : ACTION_VERB[a.action] || esc(a.action);
   return `<article class="req" data-req="${a.id}">
-    <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${ACTION_VERB[a.action] || esc(a.action)}</span>
-      <div class="faint small">Request #${a.id}, ${when(a.created_at)}</div></div></div>
+    <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${verb}</span>
+      <div class="faint small req-meta"><span>Request #${esc(a.id)}</span>${tagBadge(a.tag)}<span>${when(a.created_at)}</span></div></div></div>
     <div class="fields">${requestFields(a)}</div>
     <div class="foot">${q ? `<button class="btn primary" data-act="decide" data-d="answer">Send answer</button>`
       : `<input type="text" data-k="feedback" placeholder="Note for the agent (optional)">
@@ -667,6 +739,7 @@ function auditSummary(a) {
     case 'http_post': return `${p.method || 'POST'} ${p.url || ''}`;
     case 'run_code': return `Ran ${p.language || 'python'}: ${String(p.code || '').trim().split('\n')[0].slice(0, 90)}`;
     case 'spend_money': return `Buy ${p.item || '?'} for $${p.amount_usd}${p.vendor ? ` (${p.vendor})` : ''}`;
+    case 'connector_call': return `${connectorLabel(p.connector)} ${p.tool || '?'}(${JSON.stringify(p.args ?? {}).slice(0, 90)})${p.tag ? ` [${p.tag}]` : ''}`;
     default: return a.action;
   }
 }
@@ -712,9 +785,10 @@ function Inbox() {
       el = holder;
       el.innerHTML = `<div class="page-head"><div><h1>Inbox</h1><p class="sub">Everything your companies want to send, publish, run or buy waits here. Edit anything before you approve it.</p></div></div>
         <div class="stack"><section class="panel"><div id="req-list"></div>
-          <div id="req-empty" class="empty hidden"><h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code or spend money, it shows up here first.</p></div></section>
+          <div id="req-empty" class="empty hidden"><h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code, spend money or use a connected service, it shows up here first.</p></div></section>
           <section class="panel"><div class="panel-head"><h2>Recent decisions</h2></div><ul class="decided" id="decided" style="padding-top:8px"></ul></section>
           <section class="panel"><div class="panel-head"><h2>Audit log</h2><span class="small faint">Every outbound action that ran, and who allowed it.</span></div><ul class="rows" id="audit" style="padding-top:8px"></ul></section></div>`;
+      await loadConnectors().catch(() => null);   // connector_call cards name the service and what agents can do with it
       await Promise.all([loadPending(), loadDecided(), loadAudit()]);
     },
     live(ev) { if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); loadAudit().catch(() => {}); } },
@@ -754,6 +828,15 @@ function Doctor() {
     if (f.kind === 'action') return `<button class="btn sm" type="button" data-act="fix" data-fix="${esc(f.action || '')}">${esc(f.label)}</button>`;
     return `<span class="muted small mono">${esc(f.label)}</span>`;
   };
+  // A connector:<instance id> row (Phase 1) links to its card: the company's Settings tab or the global Settings
+  // page, with the instance in the address so the page scrolls to it. Older connector:<name>:<company> rows keep theirs.
+  const fixOf = (r) => {
+    const f = r.fix;
+    if (!/^connector:\d+$/.test(String(r.key || '')) || !r.instance_id) return f;
+    const page = f && f.kind === 'link' && /^#\/(c\/\d+\/)?settings$/.test(f.href || '') ? f.href
+      : r.company_id ? `#/c/${r.company_id}/settings` : '#/settings';
+    return { kind: 'link', label: (f && f.label) || 'Connector settings', href: `${page}/connector-${r.instance_id}` };
+  };
   const drawChecks = () => {
     const newest = checks.map((r) => r.checked_at).filter(Boolean).sort().pop();
     $('#doc-when', el).innerHTML = newest ? `Checked ${when(newest)}` : '';
@@ -763,8 +846,8 @@ function Doctor() {
     $('#doc-list', el).innerHTML = checks.length ? checks.map((r) => {
       const s = CHECK_STATUS[r.status] || ['', esc(r.status)];
       return `<li><span class="badge ${s[0]}" style="min-width:74px;justify-content:center">${s[1]}</span>
-        <div class="grow"><b>${esc(r.label)}</b><div class="small muted">${esc(r.detail)}</div></div>
-        <div class="fix">${fixHtml(r.fix)}</div></li>`;
+        <div class="grow"><b>${esc(r.label)}</b><div class="small muted doc-detail">${esc(r.detail)}</div></div>
+        <div class="fix">${fixHtml(fixOf(r))}</div></li>`;
     }).join('') : '<li class="faint">No checks have run yet.</li>';
   };
   const drawBackups = () => {
@@ -818,12 +901,12 @@ function Doctor() {
       el = holder;
       el.innerHTML = `<div class="page-head"><div><h1>Doctor</h1><p class="sub">Everything your agents depend on, checked every hour. Fix what is failing first.</p></div>
         <div class="actions doc-actions"><span id="doc-when" class="small faint"></span><button class="btn" data-act="run">Run checks</button><button class="btn" data-act="deep">Deep check (model + live search)</button><button class="btn" data-act="backup">Back up now</button></div></div>
-        <div class="cols"><section class="panel"><div class="panel-head"><h2>Checks</h2><span id="doc-sum"></span></div><ul class="rows" id="doc-list" style="padding-top:8px"><li class="faint"><span class="spinner"></span> Running checks…</li></ul></section>
+        <div class="cols"><section class="panel"><div class="panel-head"><h2>Checks</h2><span id="doc-sum"></span></div><ul class="rows doc-rows" id="doc-list" style="padding-top:8px"><li class="faint"><span class="spinner"></span> Running checks…</li></ul></section>
         <section class="panel"><div class="panel-head"><h2>Backups</h2></div><ul class="rows" id="doc-backups" style="padding-top:8px"></ul><p class="small muted" id="doc-keep" style="padding:0 18px 14px"></p></section></div>`;
       await load();
       timer = setInterval(() => { if (S.view !== view) { clearInterval(timer); return; } load().catch(() => {}); }, 60000);
     },
-    live(ev) { if (ev.type === 'settings' || ev.type === 'doctor') load().catch(() => {}); },
+    live(ev) { if (ev.type === 'settings' || ev.type === 'doctor' || ev.type === 'connectors') load().catch(() => {}); },
     async act(name, t) {
       if (name === 'fix' && t.dataset.fix === 'reindex') {
         t.disabled = true;
@@ -840,9 +923,322 @@ function Doctor() {
   return view;
 }
 
+// ---------------------------------------------------------------- phase 1: connector cards
+// One card per connector definition (docs/phases/phase-1-connect.md, item 5), grouped by category. Used by the
+// company Settings tab (scope company) and the global Settings page (scope global).
+// opts: { scope: 'company' | 'global', cid: the company (company scope), focus: an instance id to scroll to,
+//         settings: () => the global settings (masked), for a field kept as a global setting ("setting"),
+//         onSaved: (definition) => called after a save }
+const connectorFocus = (arg) => { const m = /^connector-(\d+)$/.exec(arg || ''); return m ? +m[1] : 0; };
+
+function ConnectorCards(opts) {
+  let el = null, data = null, oauthId = 0;
+  const company = opts.scope === 'company';
+  const guides = new Map();   // key -> the owner's open or closed choice for the setup guide
+  const dirty = new Set();    // keys of cards with unsaved typing: a refresh redraws only their status
+  const mine = (i) => (company ? i.company_id === opts.cid : i.company_id == null);
+  const own = (key) => (data ? data.instances.find((i) => i.key === key && mine(i)) : null) || null;
+  const defsOf = (scope) => Object.values(data.definitions).filter((d) => (d.scope || 'company') === scope);
+  const flag = (d, k) => (d[k] !== undefined ? d[k] : (d.setup || {})[k]);   // beta, enabled_by_default
+  const labelOf = (key) => ((data && data.definitions[key]) || {}).label || key;
+
+  const healthBadge = (inst) => {
+    if (!inst) return '<span class="badge">Not set up</span>';
+    if (!inst.enabled) return '<span class="badge">Off</span>';
+    const s = CHECK_STATUS[inst.status];
+    return s ? `<span class="badge ${s[0]}">${s[1]}</span>` : '<span class="badge">Not checked yet</span>';
+  };
+  const modeBadge = (mode) => (mode === 'live' ? '<span class="badge warn" title="Real money and real customers">Live mode</span>'
+    : mode === 'test' ? '<span class="badge accent" title="Test data only">Test mode</span>' : '');
+  const stateHtml = (d, inst) => healthBadge(inst) + (inst ? modeBadge(inst.mode) : '')
+    + (d.oauth && inst && inst.signed_in ? '<span class="badge good">Signed in</span>' : '');
+  const metricTile = (key, m) => {
+    const name = String(m.name || '');
+    const short = name.startsWith(`${key}.`) ? name.slice(key.length + 1) : name;
+    const title = [m.note, m.created_at ? `Read ${new Date(m.created_at).toLocaleString()}` : ''].filter(Boolean).join('. ');
+    return `<div class="kpi" title="${esc(title)}"><div class="v">${esc(fmtValue(m.value))}</div><div class="k">${esc(short.replace(/[._]/g, ' '))}</div></div>`;
+  };
+  const statusHtml = (d, inst) => {
+    if (!inst) return '<p class="small faint" style="margin:0">Not connected. Fill in the fields and press Save and test.</p>';
+    const metrics = Array.isArray(inst.metrics) ? inst.metrics : [];
+    return `<p class="conn-detail">${inst.detail ? esc(sentence(inst.detail)) : 'No check has run yet.'}${inst.last_check ? ` <span class="faint">Checked ${when(inst.last_check)}.</span>` : ''}</p>
+      ${metrics.length ? `<div class="kpis conn-metrics">${metrics.map((m) => metricTile(d.key, m)).join('')}</div>`
+        : d.has_metrics && inst.enabled ? '<p class="small faint" style="margin:0">No numbers yet. Once a check passes, Test reads them; after that Holdco reads them every hour.</p>' : ''}`;
+  };
+  const toolsHtml = (d) => {
+    const tools = Array.isArray(d.tools) ? d.tools : [];
+    const blocked = Array.isArray(d.blocked) ? d.blocked : [];
+    if (!tools.length && !blocked.length) return '';
+    const plain = tools.every((t) => !t.description);   // MCP tools come from the classification map, without text
+    const item = (t) => `<code>${esc(t.tool || t.name)}</code> ${tagBadge(t.tag)}`;
+    return `<div><b class="small">Tools agents can load</b>${!tools.length ? ''
+      : plain ? `<div class="conn-chips">${tools.map((t) => `<span class="conn-chip">${item(t)}</span>`).join('')}</div>`
+        : `<ul>${tools.map((t) => `<li>${item(t)}${t.description ? `<div class="faint small">${esc(t.description)}</div>` : ''}</li>`).join('')}</ul>`}
+      ${blocked.length ? `<p class="small muted" style="margin:6px 0 0">Never available: ${blocked.map((b) => `<code>${esc(b)}</code>`).join(', ')}</p>` : ''}</div>`;
+  };
+  const guideHtml = (d, inst) => {
+    const s = d.setup || {};
+    const perms = Array.isArray(s.permissions) ? s.permissions : [];
+    const docs = /^https?:\/\//.test(s.docs_url || '') ? s.docs_url : '';
+    if (!s.where_to_get_key && !perms.length && !s.test_mode && !docs) return '';
+    const open = guides.has(d.key) ? guides.get(d.key) : !inst;   // open until the card is set up
+    return `<details class="conn-guide" data-guide="${esc(d.key)}"${open ? ' open' : ''}><summary class="small">How to connect it</summary><div class="conn-guide-body">
+      ${s.where_to_get_key ? `<p><b>Where to get the key.</b> ${esc(s.where_to_get_key)}</p>` : ''}
+      ${perms.length ? `<p style="margin-bottom:2px"><b>Permissions to tick</b></p><ul>${perms.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+      ${s.test_mode ? `<p><b>Test mode.</b> ${esc(s.test_mode)}</p>` : ''}
+      ${docs ? `<p><a href="${esc(docs)}" target="_blank" rel="noopener noreferrer">${esc(d.label || d.key)} documentation</a></p>` : ''}</div></details>`;
+  };
+  const fieldsHtml = (d, inst) => {
+    const cfg = (inst && inst.config) || {};
+    const globals = (opts.settings && opts.settings()) || {};
+    const fields = ((d.setup || {}).fields || []).filter((f) => f && f.key && !f.hidden);
+    const value = (f) => {
+      const v = cfg[f.key];
+      return (v === undefined || v === null || v === '') && f.setting ? globals[f.setting] : v;
+    };
+    const inputs = fields.filter((f) => f.type !== 'bool').map((f) => `<label class="field">${esc(f.label || f.key)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}
+      <input type="${f.secret ? 'password' : 'text'}" data-field="${esc(f.key)}" data-kind="${f.secret ? 'secret' : 'text'}" value="${esc(value(f) ?? '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="${f.secret ? 'new-password' : 'off'}" spellcheck="false"></label>`);
+    const bools = fields.filter((f) => f.type === 'bool').map((f) => `<label class="check"><input type="checkbox" data-field="${esc(f.key)}" data-kind="bool"${isOn(value(f)) ? ' checked' : ''}>
+      <span>${esc(f.label || f.key)}${f.hint ? `<br><span class="faint small">${esc(f.hint)}</span>` : ''}</span></label>`);
+    return (inputs.length ? `<div class="form-grid">${inputs.join('')}</div>` : '') + bools.join('');
+  };
+  const card = (d) => {
+    const inst = own(d.key);
+    const s = d.setup || {};
+    const beta = !!flag(d, 'beta');
+    const enabled = inst ? !!inst.enabled : flag(d, 'enabled_by_default') !== false;
+    const can = Array.isArray(s.agents_can) ? s.agents_can : [];
+    const note = d.note || s.note || '';
+    return `<article class="conn" id="conn-${esc(d.key)}" data-conn="${esc(d.key)}"${inst ? ` data-inst="${esc(inst.id)}"` : ''}>
+      <div class="conn-head"><div class="conn-title"><h3>${esc(d.label || d.key)}</h3><span class="badge">${esc(d.category || 'Other')}</span>
+          ${d.kind ? `<span class="badge" title="How Holdco talks to it">${esc(KIND_LABEL[d.kind] || d.kind)}</span>` : ''}${beta ? '<span class="badge warn">Beta</span>' : ''}</div>
+        <div class="conn-state" data-conn-state>${stateHtml(d, inst)}</div></div>
+      ${note ? `<p class="small conn-note ${beta ? 'warn-text' : 'muted'}">${esc(note)}</p>` : ''}
+      <div class="conn-info">${can.length ? `<div><b class="small">What agents can do</b><ul>${can.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}${toolsHtml(d)}</div>
+      ${guideHtml(d, inst)}
+      <form class="form-stack conn-form" data-form="connector-${esc(d.key)}" data-key="${esc(d.key)}">
+        ${fieldsHtml(d, inst)}
+        <div class="actions">
+          <label class="check small conn-enabled"><input type="checkbox" name="conn_enabled"${enabled ? ' checked' : ''}><span>Enabled</span></label>
+          <button class="btn primary" type="submit">Save and test</button>
+          ${inst ? `<button class="btn" type="button" data-act="conn-test" data-id="${esc(inst.id)}">Test</button>` : ''}
+          ${d.oauth && inst && !inst.signed_in ? `<button class="btn" type="button" data-act="conn-signin" data-id="${esc(inst.id)}">Sign in</button>` : ''}
+          ${inst ? `<button class="btn danger" type="button" data-act="conn-remove" data-id="${esc(inst.id)}">Remove</button>` : ''}
+        </div></form>
+      <div class="conn-status" data-conn-status>${statusHtml(d, inst)}</div>
+    </article>`;
+  };
+  // Read-only rows: on a company tab, the global instances that apply to it; on the global page, every company's own.
+  const extraHtml = () => {
+    const row = (i, href) => `<li><span class="conn-row-state">${healthBadge(i)}${modeBadge(i.mode)}</span>
+      <div class="grow"><b>${esc(i.label || labelOf(i.key))}</b>${company ? '' : ` <span class="muted">at ${esc(i.company_name || `company ${i.company_id}`)}</span>`}
+        <div class="small muted">${esc(sentence(i.detail) || 'Not checked yet.')}${i.last_check ? ` <span class="faint">Checked ${when(i.last_check)}.</span>` : ''}</div></div>
+      <a class="btn sm" href="${esc(href)}">Open</a></li>`;
+    if (company) {
+      const shared = data.instances.filter((i) => i.company_id == null && (data.definitions[i.key] || {}).scope === 'global');
+      const names = andList(defsOf('global').map((d) => d.label || d.key));
+      return `<h3 class="conn-cat">Set up once for every company</h3>${shared.length
+        ? `<ul class="rows conn-rows">${shared.map((i) => row(i, `#/settings/connector-${i.id}`)).join('')}</ul>`
+        : `<p class="small faint">Nothing yet.${names ? ` ${esc(names)} ${defsOf('global').length === 1 ? 'is' : 'are'} set up on the <a href="#/settings">Settings page</a> and apply to every company.` : ''}</p>`}`;
+    }
+    const per = data.instances.filter((i) => i.company_id != null);
+    const names = andList(defsOf('company').map((d) => d.label || d.key));
+    return `<h3 class="conn-cat">Set up per company</h3>${per.length
+      ? `<ul class="rows conn-rows">${per.map((i) => row(i, `#/c/${i.company_id}/settings/connector-${i.id}`)).join('')}</ul>`
+      : `<p class="small faint">None yet.${names ? ` ${esc(names)} belong to one company each: set them up in that company's Settings tab.` : ''}</p>`}`;
+  };
+  const body = () => {
+    const list = defsOf(opts.scope);
+    const cats = [...new Set(list.map((d) => d.category || 'Other'))];
+    return (list.length ? cats.map((c) => `<div class="conn-group"><h3 class="conn-cat">${esc(c)}</h3><div class="conn-cards">${list.filter((d) => (d.category || 'Other') === c).map(card).join('')}</div></div>`).join('')
+      : '<p class="faint">No connectors of this kind in this version of Holdco.</p>') + `<div class="conn-group" id="conn-extra">${extraHtml()}</div>`;
+  };
+  // Cards the owner is typing in keep their fields; everything else is redrawn from the server's answer.
+  const paint = () => {
+    const list = el && $('#conn-list', el);
+    if (!list || !data) return;
+    const cards = $$('[data-conn]', list);
+    if (!cards.length) { list.innerHTML = body(); return; }
+    cards.forEach((node) => {
+      const d = data.definitions[node.dataset.conn];
+      if (!d) { node.remove(); return; }
+      const inst = own(d.key);
+      if (!dirty.has(d.key)) { node.outerHTML = card(d); return; }
+      const st = $('[data-conn-state]', node);
+      const ss = $('[data-conn-status]', node);
+      if (st) st.innerHTML = stateHtml(d, inst);
+      if (ss) ss.innerHTML = statusHtml(d, inst);
+    });
+    const extra = $('#conn-extra', list);
+    if (extra) extra.innerHTML = extraHtml();
+  };
+  const load = async () => {
+    const r = await GET(company ? `/api/connectors?company_id=${opts.cid}` : '/api/connectors');
+    data = { definitions: r.definitions || {}, instances: Array.isArray(r.instances) ? r.instances : [] };
+    S.connectors = r;
+    paint();
+  };
+  const loadSoon = debounce(() => load().catch(() => {}), 700);
+  const reveal = (id) => {
+    const node = el && $(`[data-inst="${+id}"]`, el);
+    if (!node) return;
+    node.classList.add('flash');
+    node.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    setTimeout(() => node.classList.remove('flash'), 2600);
+  };
+  const say = (label, h, extra = '') => {
+    const detail = h && h.detail ? ` ${sentence(h.detail)}` : '';
+    if (h && h.status === 'ok') toast(`${label} works.${detail}${extra}`);
+    else if (h && h.status === 'warn') toast(`${label} saved with a warning.${detail}`);
+    else toast(`${label}: the check failed.${detail}`, true);
+  };
+  const busy = (btn, text) => {
+    const was = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span> ${esc(text)}`;
+    return () => { btn.disabled = false; btn.innerHTML = was; };
+  };
+  const slowText = (d, saving) => (d && d.kind === 'mcp-stdio' ? 'Starting it; the first time can take two minutes…' : saving ? 'Saving and testing…' : 'Testing…');
+  // After an OAuth sign-in in another tab: when the owner comes back, reload; once signed in, test right away.
+  const onFocus = async () => {
+    window.removeEventListener('focus', onFocus);
+    const id = oauthId;
+    if (!id || !el || el.isConnected === false) { oauthId = 0; return; }
+    try {
+      await load();
+      const inst = data.instances.find((i) => i.id === id);
+      if (!inst || !inst.signed_in) { window.addEventListener('focus', onFocus); return; }   // not finished yet
+      oauthId = 0;
+      const r = await api('POST', `/api/connectors/${id}/test`, {});
+      say(`Signed in. ${inst.label || labelOf(inst.key)}`, r.health);
+      await load();
+    } catch (e) { oauthId = 0; fail(e); }
+  };
+  const signIn = async (id, btn) => {
+    // The tab opens inside the click, so the browser does not block it; the address comes from the server.
+    let win = null;
+    try { win = window.open('', '_blank'); if (win) win.opener = null; } catch (_) { win = null; }
+    const done = busy(btn, 'Opening…');
+    try {
+      const r = await api('POST', `/api/connectors/${id}/oauth/start`, {});
+      if (!/^https?:\/\//.test(r.url || '')) throw new Error('The server did not return a sign-in address.');
+      if (win) win.location.href = r.url;
+      else modal({ title: 'Sign in', body: `<p>Your browser blocked the new tab. <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">Open the sign-in page</a>, finish there, then come back to this tab.</p>` });
+      toast('Finish signing in in the new tab, then come back here.');
+      if (!oauthId) window.addEventListener('focus', onFocus);
+      oauthId = id;
+    } catch (e) { if (win) win.close(); fail(e); }
+    done();
+  };
+  return {
+    owns: (name) => /^conn-/.test(name),
+    ownsForm: (name) => /^connector-/.test(name),
+    async mount(holder) {
+      el = holder;
+      el.innerHTML = `<section class="panel conn-panel" id="connectors"><div class="panel-head"><h2>Connectors</h2>
+          <span class="small faint">${company ? 'Accounts this company uses.' : 'Shared by every company.'} Keys stay in the vault on this PC and never reach a prompt.</span></div>
+        <div class="panel-body" id="conn-list"><span class="spinner"></span> Loading connectors…</div></section>`;
+      const touch = (e) => {
+        const t = e.target;
+        if (!t || !t.closest || !t.closest('form.conn-form')) return;
+        const c = t.closest('[data-conn]');
+        if (c) dirty.add(c.dataset.conn);
+      };
+      el.addEventListener('input', touch);
+      el.addEventListener('change', touch);
+      el.addEventListener('toggle', (e) => { const g = e.target; if (g && g.dataset && g.dataset.guide) guides.set(g.dataset.guide, g.open); }, true);
+      try { await load(); } catch (e) { $('#conn-list', el).innerHTML = `<p class="warn-text" style="margin:0">Connectors could not load: ${esc(e.message)}</p>`; }
+      if (opts.focus) reveal(opts.focus);
+    },
+    // Health checks, Doctor runs and OAuth sign-ins change what the cards show.
+    live(ev) {
+      const type = String(ev.type || '');
+      if (/connector|doctor/.test(type) || (type === 'event' && /connector/.test(String(ev.kind || '')))) loadSoon();
+    },
+    async act(name, t) {
+      const id = +t.dataset.id;
+      const inst = data ? data.instances.find((i) => i.id === id) : null;
+      const label = inst ? inst.label || labelOf(inst.key) : 'This connector';
+      if (name === 'conn-jump') { const p = el && $('#connectors', el); if (p) p.scrollIntoView({ block: 'start', behavior: 'smooth' }); return; }
+      if (name === 'conn-signin') { await signIn(id, t); return; }
+      if (name === 'conn-test') {
+        const done = busy(t, slowText(inst && data.definitions[inst.key], false));
+        try {
+          const r = await api('POST', `/api/connectors/${id}/test`, {});
+          const n = Array.isArray(r.metrics) ? r.metrics.length : 0;
+          say(label, r.health, n ? ` Read ${plural(n, 'number')}.` : '');
+          await load();
+        } catch (e) { fail(e); }
+        done();
+        return;
+      }
+      if (name === 'conn-remove') {
+        modal({
+          title: `Remove ${label}?`,
+          body: `<p>Holdco deletes this connection and its keys from the vault on this PC. Agents lose access to it at once; numbers it already read stay in the history.</p>
+            ${company ? '' : '<p class="muted small">It applies to every company, so they all lose it.</p>'}`,
+          foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn danger" data-act="conn-remove-yes" data-id="${esc(id)}">Remove</button>`,
+        });
+        return;
+      }
+      if (name === 'conn-remove-yes') {
+        t.disabled = true;
+        try {
+          await api('DELETE', `/api/connectors/${id}`, {});
+          closeModal();
+          if (inst) { dirty.delete(inst.key); guides.delete(inst.key); }
+          toast(`${label} removed.`);
+          await load();
+        } catch (e) { fail(e); t.disabled = false; }
+      }
+    },
+    // data-form="connector-<key>": POST /api/connectors. A secret left as the mask keeps the stored key; an empty
+    // one that was set deletes it; hidden fields (api_base) are never sent, so the server keeps them.
+    async submit(name, form) {
+      const key = form.dataset.key || name.replace(/^connector-/, '');
+      const d = data && data.definitions[key];
+      if (!d) return;
+      const inst = own(key);
+      const config = {};
+      $$('[data-field]', form).forEach((inp) => {
+        const k = inp.dataset.field;
+        if (inp.dataset.kind === 'bool') config[k] = !!inp.checked;
+        else if (inp.dataset.kind === 'secret') { if (inp.value || inp.defaultValue) config[k] = inp.value; }
+        else config[k] = String(inp.value || '').trim();
+      });
+      const on = $('[name=conn_enabled]', form);
+      const payload = { key, company_id: company ? opts.cid : null, enabled: !!(on && on.checked), config };
+      if (inst) payload.id = inst.id;
+      const btn = $('button[type=submit]', form);
+      const done = btn ? busy(btn, slowText(d, true)) : () => {};
+      try {
+        const r = await api('POST', '/api/connectors', payload);
+        dirty.delete(key);
+        say(d.label || key, r.health);
+        await load();
+        if (opts.onSaved) opts.onSaved(d);
+      } catch (e) { fail(e); }
+      done();
+    },
+  };
+}
+
 // ---------------------------------------------------------------- settings
-function Settings() {
+function Settings(arg) {
   let el, data;
+  // A connector field kept as a global setting (Brave's key) is also in this page's form: keep that input in step.
+  const conns = ConnectorCards({
+    scope: 'global', focus: connectorFocus(arg), settings: () => (data ? data.settings : {}),
+    onSaved: async (d) => {
+      const keys = ((d.setup || {}).fields || []).map((f) => f && f.setting).filter(Boolean);
+      if (!keys.length) return;
+      try {
+        const s = await GET('/api/settings');
+        data = { ...data, settings: s.settings };
+        syncSecrets($('form[data-form="settings"]', el), Object.fromEntries(keys.map((k) => [k, s.settings[k]])), true);
+      } catch (_) { /* the form keeps what it shows */ }
+    },
+  });
   const sel = (name, value, opts) => `<select name="${name}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   const modelSel = (name, value, models, blank) => {
     const opts = [...(blank ? [['', blank]] : []), ...models.map((m) => [m, m])];
@@ -852,13 +1248,14 @@ function Settings() {
   const draw = (models) => {
     const s = data.settings;
     const pol = s.policies;
-    el.innerHTML = `<div class="page-head"><div><h1>Settings</h1><p class="sub">Applies to every company. Each company can override approvals in its own settings.</p></div></div>
+    $('#set-main', el).innerHTML = `<div class="page-head"><div><h1>Settings</h1><p class="sub">Applies to every company. Each company can override approvals in its own settings.</p></div>
+      <div class="actions"><button class="btn" type="button" data-act="conn-jump">Connectors</button></div></div>
     <form class="panel" data-form="settings">
       <div class="section"><h2>Model</h2><p class="muted">Holdco talks to a model server on this PC. Ollama is the easiest; LM Studio, vLLM and llama.cpp work through the OpenAI-compatible option.</p>
         <div class="form-grid">
           <label class="field">Server type${sel('llm_backend', s.llm_backend, [['ollama', 'Ollama'], ['openai', 'OpenAI-compatible']])}</label>
           <label class="field">Server address<input type="text" name="llm_base_url" value="${esc(s.llm_base_url)}"></label>
-          <label class="field">API key<span class="hint">Only if your server needs one.</span><input type="password" name="llm_api_key" value="${esc(s.llm_api_key)}" autocomplete="off"></label>
+          <label class="field">API key<span class="hint">Only if your server needs one.</span><input type="password" name="llm_api_key" value="${esc(s.llm_api_key)}" autocomplete="off" data-secret></label>
         </div>
         <div class="form-grid" style="margin-top:14px">
           <label class="field">Agent model<span class="hint">Used by every agent unless you set one per agent.</span>${models.length ? modelSel('default_model', s.default_model, models) : `<input type="text" name="default_model" value="${esc(s.default_model)}">`}</label>
@@ -880,7 +1277,7 @@ function Settings() {
       </div>
       <div class="section"><h2>Phone notifications</h2><p class="muted">Approve requests and answer questions from your phone. A Telegram bot gives you buttons; ntfy only notifies.</p>
         <div class="form-grid">
-          <label class="field">Telegram bot token<input type="password" name="telegram_bot_token" value="${esc(s.telegram_bot_token)}" autocomplete="off"></label>
+          <label class="field">Telegram bot token<input type="password" name="telegram_bot_token" value="${esc(s.telegram_bot_token)}" autocomplete="off" data-secret></label>
           <label class="field">Telegram chat id<input type="text" name="telegram_chat_id" value="${esc(s.telegram_chat_id)}" inputmode="numeric" autocomplete="off"></label>
           <label class="field">Notify me about${sel('notify_level', s.notify_level || 'important', [['important', 'Requests, questions and errors'], ['all', 'Everything, including finished tasks']])}</label>
         </div>
@@ -918,7 +1315,7 @@ function Settings() {
         <div class="form-grid">
           <label class="field">Search with${sel('search_provider', s.search_provider, [['duckduckgo', 'DuckDuckGo (no key)'], ['searxng', 'SearXNG (self-hosted)'], ['brave', 'Brave Search API']])}</label>
           <label class="field">SearXNG address<input type="text" name="searxng_url" value="${esc(s.searxng_url)}" placeholder="http://127.0.0.1:8888"></label>
-          <label class="field">Brave API key<input type="password" name="brave_api_key" value="${esc(s.brave_api_key)}" autocomplete="off"></label>
+          <label class="field">Brave API key<span class="hint">The Brave Search card under Connectors keeps the same key and can test it.</span><input type="password" name="brave_api_key" value="${esc(s.brave_api_key)}" autocomplete="off" data-secret></label>
         </div>
       </div>
       <div class="section actions" style="justify-content:space-between"><span class="faint small">Data folder: <code>${esc(data.data_dir)}</code></span><button class="btn primary" type="submit">Save settings</button></div>
@@ -927,13 +1324,19 @@ function Settings() {
   return {
     async mount(holder) {
       el = holder;
+      el.innerHTML = '<div id="set-main"></div><div id="set-conns" class="conn-holder"></div>';
       data = await GET('/api/settings');
       draw(await loadModels(true));
+      await conns.mount($('#set-conns', el));
     },
+    live(ev) { conns.live(ev); },
     async submit(name, form) {
+      if (conns.ownsForm(name)) return conns.submit(name, form);
+      if (name !== 'settings') return undefined;
       const f = new FormData(form);
       const body = {};
       for (const [k, v] of f.entries()) if (!k.startsWith('policy_')) body[k] = v;
+      dropUntouchedSecrets(form, body);
       ['num_ctx', 'max_concurrent_runs', 'max_steps_per_run', 'max_task_attempts', 'backup_keep'].forEach((k) => {
         const n = parseInt(body[k], 10);
         if (Number.isFinite(n)) body[k] = n; else delete body[k];   // an empty box keeps the stored value
@@ -947,14 +1350,17 @@ function Settings() {
       Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
       try {
         data = { ...data, ...(await api('PUT', '/api/settings', body)) };
+        syncSecrets(form, data.settings);   // a key just saved now shows the mask
         S.models = null;
         toast('Settings saved.');
         refreshState();
       } catch (e) { fail(e); }
+      return undefined;
     },
-    async act(name) {
+    async act(name, t) {
+      if (conns.owns(name)) return conns.act(name, t);
       if (name === 'test-llm') {
-        const form = $('form', el);
+        const form = $('form[data-form="settings"]', el);
         await this.submit('settings', form);
         const out = $('#llm-result', el);
         out.innerHTML = '<span class="spinner"></span> Asking the model…';
@@ -965,7 +1371,7 @@ function Settings() {
         } catch (e) { out.textContent = e.message; }
       }
       if (name === 'test-notify') {
-        const form = $('form', el);
+        const form = $('form[data-form="settings"]', el);
         await this.submit('settings', form);
         const out = $('#notify-result', el);
         out.innerHTML = '<span class="spinner"></span> Sending…';
@@ -1358,6 +1764,21 @@ function CompanyView(cid, tab, arg) {
 }
 
 // ---- overview
+// Metric tiles (Phase 1): numbers a connector read (source = its key) come first and say where they came from;
+// numbers an agent typed with record_metric (source manual) say so.
+function metricTiles(metrics) {
+  const polled = (m) => !!m.source && m.source !== 'manual';
+  return [...metrics].sort((a, b) => (polled(b) - polled(a)) || String(a.name).localeCompare(String(b.name))).map((m) => {
+    const src = polled(m) ? connectorLabel(m.source) : '';
+    const name = String(m.name || '');
+    const short = src && name.startsWith(`${m.source}.`) ? name.slice(m.source.length + 1) : name;
+    const title = [m.note, src ? `Read from ${src}${m.created_at ? ` ${new Date(m.created_at).toLocaleString()}` : ''}` : 'Typed in by an agent (record_metric); Holdco did not check it']
+      .filter(Boolean).join('. ');
+    return `<div class="kpi${src ? ' polled' : ''}" title="${esc(title)}"><div class="v">${esc(fmtValue(m.value))}</div>
+      <div class="k">${esc(short.replace(/[._]/g, ' '))}</div><div class="src">${src ? `from ${esc(src)}` : 'typed by an agent'}</div></div>`;
+  }).join('');
+}
+
 function TabOverview(cid, data) {
   let el, facts = null, plan = null;
   const side = () => {
@@ -1381,8 +1802,8 @@ function TabOverview(cid, data) {
       <div class="kpi"><div class="v">${d.stats.tasks_open}</div><div class="k">Open tasks</div></div>
       <div class="kpi"><div class="v">${d.stats.tasks_done}</div><div class="k">Tasks done</div></div>
       <div class="kpi"><div class="v">${d.stats.done_today}</div><div class="k">Done today</div></div>
-      <div class="kpi"><div class="v">${(c.tokens_used / 1e6).toFixed(c.tokens_used > 1e7 ? 0 : 2)}M</div><div class="k">Tokens used</div></div>
-      ${d.metrics.map((m) => `<div class="kpi" title="${esc(m.note)}"><div class="v">${esc(Number(m.value).toLocaleString())}</div><div class="k">${esc(m.name.replace(/_/g, ' '))}</div></div>`).join('')}`;
+      <div class="kpi"><div class="v">${((Number(c.tokens_used) || 0) / 1e6).toFixed(c.tokens_used > 1e7 ? 0 : 2)}M</div><div class="k">Tokens used</div></div>
+      ${metricTiles(d.metrics || [])}`;
     $('#ov-folder', el).innerHTML = `<p class="small muted" style="margin:0 0 6px">Everything the team makes is a normal file on your PC:</p><code class="small" style="overflow-wrap:anywhere">${esc(d.folder)}</code>`;
   };
   // "What your agents know": the same facts block every agent gets in its prompt (GET /facts).
@@ -1451,6 +1872,8 @@ function TabOverview(cid, data) {
           <section class="panel"><div class="panel-body" id="ov-folder"></div></section></div></div>`;
       mountFeed($('#ov-feed', el), cid);
       side();
+      // Connector labels for the metric tiles ("from Stripe"); the key stands in until they arrive.
+      if ((data().metrics || []).some((m) => m.source && m.source !== 'manual') && !S.connectors) loadConnectors().then(() => { if (el) side(); }).catch(() => {});
       await loadKnow();
     },
     live(ev) {
@@ -1970,11 +2393,14 @@ function TabCharter(cid, data) {
 
 // ---- company settings
 // Settings Holdco keeps for itself in the same JSON; the form never sends them (the server would accept founding_stage).
+// Kept in step with server.INTERNAL_COMPANY_SETTINGS (plus pinned_context, which the Context tab owns).
 const INTERNAL_COMPANY_SETTINGS = ['founding_stage', 'founding_retry', 'founding_research_note', 'founding_context', 'last_waiting_notice',
-  'budget_notice', 'truth_scan_done', 'pinned_context'];
+  'budget_notice', 'truth_scan_done', 'name_locked', 'template', 'pinned_context'];
+const EMAIL_PROVIDERS = [['auto', 'Resend when connected, otherwise SMTP'], ['smtp', 'SMTP'], ['resend', 'Resend']];
 
-function TabSettings(cid, data) {
+function TabSettings(cid, data, arg) {
   let el, global, plan = null;
+  const conns = ConnectorCards({ scope: 'company', cid, focus: connectorFocus(arg) });
   const draw = () => {
     const c = data().company;
     const s = c.settings;
@@ -1982,7 +2408,8 @@ function TabSettings(cid, data) {
     const val = (k) => esc(s[k] ?? '');
     const used = plan && plan.budget ? plan.budget.used : null;
     const detected = !s.archetype && plan && plan.archetype ? ` (now: ${archetypeLabel(plan.archetype)})` : '';
-    el.innerHTML = `<form class="panel" data-form="co-settings">
+    const provider = EMAIL_PROVIDERS.some(([k]) => k === s.email_provider) ? s.email_provider : 'auto';
+    $('#co-set-form', el).innerHTML = `<form class="panel" data-form="co-settings">
       <div class="section"><h2>Direction</h2>
         <label class="field">Standing orders<span class="hint">Every agent reads these in every session. Brand rules, things to avoid, priorities.</span>
           <textarea name="directives" rows="5" placeholder="Never offer discounts. Write in British English. Focus on cafés in Manchester first.">${val('directives')}</textarea></label>
@@ -2001,12 +2428,17 @@ function TabSettings(cid, data) {
         <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
           `<select name="policy_${k}"><option value="">Default (${esc({ approve: 'ask me', auto: 'allowed', off: 'never' }[global.settings.policies[k]])})</option>
           ${[['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']].map(([v, l]) => `<option value="${v}" ${pol[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`}</label>`).join('')}</div></div>
-      <div class="section"><h2>Email</h2><p class="muted">Sending (SMTP). Port 587 uses STARTTLS, 465 uses SSL. For Gmail, create an app password.</p>
+      <div class="section"><h2>Email</h2>
+        <div class="form-grid" style="margin:10px 0 16px;max-width:520px">
+          <label class="field">Send email with<span class="hint">Resend is set up on its card under Connectors at the top of this tab. Replies always arrive through IMAP below.</span>
+            <select name="email_provider">${EMAIL_PROVIDERS.map(([k, l]) => `<option value="${k}" ${provider === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+        </div>
+        <p class="muted">Sending (SMTP). Port 587 uses STARTTLS, 465 uses SSL. For Gmail, create an app password.</p>
         <div class="form-grid">
           <label class="field">SMTP server<input type="text" name="smtp_host" value="${val('smtp_host')}" placeholder="smtp.gmail.com"></label>
           <label class="field">Port<input type="number" name="smtp_port" value="${val('smtp_port')}"></label>
           <label class="field">Username<input type="text" name="smtp_user" value="${val('smtp_user')}" autocomplete="off"></label>
-          <label class="field">Password<input type="password" name="smtp_password" value="${val('smtp_password')}" autocomplete="new-password"></label>
+          <label class="field">Password<input type="password" name="smtp_password" value="${val('smtp_password')}" autocomplete="new-password" data-secret></label>
           <label class="field">From address<input type="email" name="smtp_from" value="${val('smtp_from')}"></label>
           <label class="field">From name<input type="text" name="smtp_from_name" value="${val('smtp_from_name')}" placeholder="${esc(c.name)}"></label>
         </div>
@@ -2017,12 +2449,12 @@ function TabSettings(cid, data) {
           <label class="field">IMAP server<input type="text" name="imap_host" value="${val('imap_host')}" placeholder="imap.gmail.com"></label>
           <label class="field">Port<input type="number" name="imap_port" value="${val('imap_port')}"></label>
           <label class="field">Username<input type="text" name="imap_user" value="${val('imap_user')}" autocomplete="off"></label>
-          <label class="field">Password<input type="password" name="imap_password" value="${val('imap_password')}" autocomplete="new-password"></label>
+          <label class="field">Password<input type="password" name="imap_password" value="${val('imap_password')}" autocomplete="new-password" data-secret></label>
         </div>
         <div class="actions" style="margin-top:14px"><input type="email" id="test-to" placeholder="Send a test email to…" style="max-width:280px"><button class="btn" type="button" data-act="test-email">Send test</button></div></div>
       <div class="section"><h2>Website</h2><p class="muted">The site in <code>site/</code> always previews locally. To publish it, add a Netlify personal access token; Holdco creates the site on first deploy.</p>
         <div class="form-grid">
-          <label class="field">Netlify token<input type="password" name="netlify_token" value="${val('netlify_token')}" autocomplete="off"></label>
+          <label class="field">Netlify token<input type="password" name="netlify_token" value="${val('netlify_token')}" autocomplete="off" data-secret></label>
           <label class="field">Netlify site ID<span class="hint">Leave blank to create one.</span><input type="text" name="netlify_site_id" value="${val('netlify_site_id')}"></label>
           <label class="field">Public address<input type="url" name="site_url" value="${val('site_url')}"></label>
         </div></div>
@@ -2037,32 +2469,43 @@ function TabSettings(cid, data) {
   return {
     async mount(holder) {
       el = holder;
+      // Connectors first, at the top of the tab; they load while the settings form is fetched.
+      el.innerHTML = '<div id="co-conns" class="conn-holder"></div><div id="co-set-form"></div>';
+      const connsReady = conns.mount($('#co-conns', el));
       const [g, pl] = await Promise.all([GET('/api/settings'), GET(`/api/companies/${cid}/planning`).catch(() => null)]);
       global = g;
       plan = pl && pl.planning;
       draw();
+      await connsReady;
     },
+    live(ev) { conns.live(ev); },
     async submit(name, form) {
+      if (conns.ownsForm(name)) return conns.submit(name, form);
+      if (name !== 'co-settings') return undefined;
       const f = Object.fromEntries(new FormData(form));
       const settings = { policies: {} };
       for (const [k, v] of Object.entries(f)) {
         if (k.startsWith('policy_')) settings.policies[k.slice(7)] = v;
         else if (k !== 'name' && !INTERNAL_COMPANY_SETTINGS.includes(k)) settings[k] = v;
       }
+      dropUntouchedSecrets(form, settings);
       const budget = parseInt(settings.daily_token_budget, 10);
       if (Number.isFinite(budget)) settings.daily_token_budget = Math.max(0, budget); else delete settings.daily_token_budget;   // empty keeps the stored value
       if (typeof settings.postal_address === 'string') settings.postal_address = settings.postal_address.trim();
       try {
-        await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
+        const r = await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
+        syncSecrets(form, r.company && r.company.settings);   // a password just saved now shows the mask
         toast('Saved.');
         refreshState();
       } catch (e) { fail(e); }
+      return undefined;
     },
-    async act(name) {
+    async act(name, t) {
+      if (conns.owns(name)) return conns.act(name, t);
       if (name === 'test-email') {
         const to = $('#test-to', el).value.trim();
         if (!to) { toast('Enter an address to send the test to.', true); return; }
-        await this.submit('co-settings', $('form', el));
+        await this.submit('co-settings', $('form[data-form="co-settings"]', el));
         try { const r = await api('POST', `/api/companies/${cid}/emails/test`, { to }); toast(r.message, !r.ok); } catch (e) { fail(e); }
       }
       if (name === 'delete') {

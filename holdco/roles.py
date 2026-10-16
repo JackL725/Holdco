@@ -20,7 +20,7 @@ CHAT_EXTRA = ["list_tasks", "create_task", "update_task", "report_to_owner"]
 # Tools every role gets in task runs, on top of its preset's belt (Phase 0: working notes).
 TASK_EXTRA = ["note_progress"]
 # Phase 0.5: finding things and the real state of the company, for every role and run kind.
-CONTEXT_EXTRA = ["search", "grep", "edit_file", "company_status"]
+CONTEXT_EXTRA = ["search", "grep", "edit_file", "company_status", "find_tool"]   # find_tool: Phase 1 connectors
 # Phase 0.5: verified facts and the source check, for roles that research (they have web_search).
 RESEARCH_EXTRA = ["record_fact", "check_sources"]
 

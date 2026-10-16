@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import config
 
-SKIP = {".trash", ".runs", ".cache", "__pycache__", "node_modules", ".git"}   # .cache: fetched pages (truth.py)
+SKIP = {".trash", ".runs", ".cache", ".qa", "__pycache__", "node_modules", ".git"}   # .cache: fetched pages (truth.py)
 
 
 def slugify(name: str) -> str:

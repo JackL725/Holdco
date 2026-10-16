@@ -27,10 +27,14 @@ ACTION_LABELS = {
     "run_code": "Run code",
     "spend_money": "Purchase",
     "question": "Question",
+    "connector_call": "Connected service call",
 }
 
 
 def _summary(action: str, p: dict) -> str:
+    if action == "connector_call":
+        args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
+        return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
     if action == "send_email":
         return f"Email to {p.get('to')}: {p.get('subject')}"
     if action == "social_post":
@@ -49,12 +53,19 @@ def _summary(action: str, p: dict) -> str:
     return action
 
 
-def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict) -> str:
-    """Called by agent tools for any outbound action."""
+# Phase 1: the risk tag of each built-in outbound action, shown on the Inbox card.
+TAG_OF_ACTION = {"send_email": "contact", "social_post": "publish", "deploy_site": "publish", "http_post": "publish",
+                 "run_code": "write", "spend_money": "spend", "question": "read"}
+
+
+def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict,
+         policy_action: str | None = None) -> str:
+    """Called by agent tools for any outbound action. policy_action (Phase 1) names the policy to apply when it
+    differs from the action, as for connector_call, whose policy comes from the tool's risk tag."""
     if action == "question":
         policy = "approve"
     else:
-        policy = db.effective_policy(company, action)
+        policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
     killed = False
@@ -127,7 +138,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     elif decision == "approve":
         db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
         try:
-            result = execute(company, row["action"], p)
+            result = execute(company, row["action"], p, approval_id=approval_id)
             status = "done"
         except Exception as e:
             result, status = str(e), "failed"
@@ -220,17 +231,24 @@ def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payl
           approval_id: int | None = None) -> int:
     """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent.
     records/ is refreshed after the row is written, so it includes this action."""
+    from . import vault   # imported here: vault imports db; a secret in a result never reaches the audit log
     aid = db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
                  "approval_id) VALUES(?,?,?,?,?,?,?,?)",
-                 (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
-                  default=str)[:20000], str(result or "")[:4000], approval_id))
+                 (db.now(), company_id, action, proposed_by or "", approved_by,
+                  vault.redact(json.dumps(payload, sort_keys=True, default=str))[:20000],
+                  vault.redact(str(result or ""))[:4000], approval_id))
     _records_changed(company_id)
     return aid
 
 
 # ---------------- executors ----------------
 
-def execute(company: dict, action: str, p: dict) -> str:
+def execute(company: dict, action: str, p: dict, approval_id: int | None = None) -> str:
+    """Run one outbound action. approval_id is the request being run, when it is one (decide passes it)."""
+    if action == "connector_call":
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        # The request's company goes along, so the connector it names is checked to still be this company's.
+        return connectors.execute(p, company=company, approval_id=approval_id)
     if action == "send_email":
         in_reply = ""
         if p.get("reply_to_email_id"):
@@ -265,15 +283,42 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float
 def _social(company: dict, p: dict) -> str:
     cs = db.company_settings(company)
     content = p.get("content", "")
+    # Phase 1: a healthy Buffer connection with a channel for this platform queues the post there. A Buffer failure
+    # after that point is a real failure (the approval shows it and can be retried), not a silent fallback.
+    try:
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        buffer = connectors.instance("buffer", company)
+    except Exception:
+        buffer = None
+    note = ""
+    if buffer and buffer.get("enabled", 1) and buffer.get("status") == "ok":
+        from . import conn_buffer
+        platform = p.get("platform", "") or "social"
+        if not conn_buffer.default_channels(buffer):
+            note = " Buffer was not used: its card has no default channels, so Holdco does not know where to post."
+        else:
+            # Channel by channel; the ones that went out are kept in the request (decide stores the payload), so a
+            # retry after a partial failure skips them.
+            posted = [str(x) for x in (p.get("buffer_posted") or [])]
+            try:
+                via = conn_buffer.post_for_platform(buffer, company, platform, content, p.get("link", ""),
+                                                    posted=posted)
+            finally:
+                if posted:
+                    p["buffer_posted"] = posted
+            if via is not None:
+                return via
+            note = f" Buffer was not used: none of its default channels is a {platform} channel."
     if cs.get("webhook_url"):
         status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
                                                       "platform": p.get("platform", ""), "content": content,
                                                       "link": p.get("link", "")})
         if status >= 400:
             raise RuntimeError(f"Webhook returned HTTP {status}: {text[:300]}")
-        return f"Sent to the posting webhook (HTTP {status})."
+        return f"Sent to the posting webhook (HTTP {status}).{note}"
     intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": content[:280]})
-    return f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+    return (f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+            f"{note}")
 
 
 def _http(p: dict) -> str:
@@ -315,7 +360,8 @@ def _deploy_netlify(company: dict) -> str:
         site_id = site["id"]
         cs["netlify_site_id"] = site_id
         cs["site_url"] = site.get("ssl_url") or site.get("url", "")
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        # Only these keys: cs holds the resolved Netlify token, which must never go back into the table.
+        db.update_company_settings(company["id"], netlify_site_id=site_id, site_url=cs["site_url"])
     req = urllib.request.Request(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
                                  method="POST", headers={**auth, "Content-Type": "application/zip"})
     try:
@@ -325,8 +371,7 @@ def _deploy_netlify(company: dict) -> str:
         raise RuntimeError(f"Netlify deploy failed: HTTP {e.code} {e.read(300).decode('utf-8', 'replace')}") from None
     url = info.get("ssl_url") or info.get("url") or cs.get("site_url", "")
     if url:
-        cs["site_url"] = url
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        db.update_company_settings(company["id"], site_url=url)
     return f"Website deployed: {url}"
 
 

@@ -487,6 +487,12 @@ def run(deep: bool = False, force: bool = False) -> list[dict]:
             _Job([("token_budgets", "Token budgets", None)], _check_budgets),
         ]
         rows = _run_jobs(jobs)
+        for extra in ("vault", "connectors"):   # Phase 1: the vault row and one row per connector instance
+            try:
+                mod = __import__(f"holdco.{extra}", fromlist=["doctor_rows"])
+                rows.extend(mod.doctor_rows())
+            except Exception as e:
+                rows.append(_row(extra, extra.title(), "bad", notify.scrub(f"Could not check: {e}")))
     except Exception as e:  # the Doctor must never take the scheduler or the page down with it
         traceback.print_exc()
         rows = [_row("doctor", "Doctor", "bad", notify.scrub(f"The health checks could not run: {e}"))]

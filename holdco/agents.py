@@ -7,7 +7,7 @@ import re
 import threading
 import traceback
 
-from . import bus, config, db, doctor, llm, planning, playbooks, presets, roles, tools, truth, watchdog, workspace
+from . import bus, config, connectors, db, doctor, llm, planning, playbooks, presets, roles, tools, truth, vault, watchdog, workspace
 from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
 
 # agent_id -> kind of run currently executing
@@ -56,9 +56,14 @@ def _memory_text(company_id: int) -> str:
 
 
 def _metrics_text(company_id: int) -> str:
-    rows = db.q("SELECT name, value, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                "WHERE company_id=? GROUP BY name) ORDER BY name", (company_id,))
-    return "\n".join(f"- {r['name']}: {r['value']:g} (as of {r['created_at'][:10]})" for r in rows) or "(none recorded)"
+    """Latest value of each metric with where it came from: "(source: stripe)" when a connector polled it,
+    "(manual)" when an agent typed it with record_metric (Phase 1)."""
+    rows = db.q("SELECT name, value, created_at, COALESCE(NULLIF(source, ''), 'manual') AS source FROM metrics "
+                "WHERE id IN (SELECT MAX(id) FROM metrics WHERE company_id=? GROUP BY name) ORDER BY name",
+                (company_id,))
+    return "\n".join(f"- {r['name']}: {float(r['value'] or 0):g} as of {(r['created_at'] or '')[:10]} "
+                     f"({'manual' if r['source'] == 'manual' else 'source: ' + r['source']})"
+                     for r in rows) or "(none recorded)"
 
 
 def _shared_rules(kind: str, max_steps: int) -> str:
@@ -77,6 +82,8 @@ def _shared_rules(kind: str, max_steps: int) -> str:
         "owner hasn't approved.",
         "Check your notes and the file list before starting so you don't redo work. If you need a teammate, create "
         "a task for them with a deliverable.",
+        "Outside services (payments, email, a browser, social posting) are reached through find_tool; what you load "
+        "may wait for the owner's approval, like email.",
     ]
     if kind == "chat":
         rules[0] = (f"You have {max_steps} tool calls for this reply; use them only if they help, then answer in "
@@ -140,6 +147,7 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: d
         _section(truth.changes_section, company, agent, kind),
         _section(truth.waiting_section, company),
         "# Team (assign tasks by role)\n" + _team_text(company["id"]),
+        _section(connectors.prompt_section, company),
         "# Shared memory (notes, decisions, owner answers)\n" + (_section(ctxsys.memory_section, company, agent, task)
                                                                  or "(nothing yet)"),
         "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}",
@@ -422,6 +430,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     else:
         tool_specs = tools.role_tools(agent, kind)
     ctx.allowed = {t["name"] for t in tool_specs}
+    base_specs, loaded_seen = list(tool_specs), 0   # Phase 1: find_tool adds connector tools during the run
     info = roles.role_info(agent)
     think = agent.get("reasoning") or info.get("reasoning", "medium")
     if kind == "founding":
@@ -464,6 +473,12 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     try:
         with slot:
             for step in range(max_steps):
+                if len(ctx.loaded_tools) != loaded_seen:
+                    # find_tool loaded connector tools last step: the model sees them from this call on.
+                    loaded_seen = len(ctx.loaded_tools)
+                    tool_specs = base_specs + [{k: t[k] for k in ("name", "description", "parameters")}
+                                               for t in ctx.loaded_tools]
+                    ctx.allowed = {t["name"] for t in tool_specs}
                 if kind != "chat" and db.get_settings().get("kill_switch"):
                     status, error = "stopped", "Kill switch: the owner stopped all agents."
                     break
@@ -751,7 +766,7 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
                "COALESCE((SELECT MIN(id) FROM (SELECT id FROM events WHERE company_id=? AND kind IN ('think','result') "
                "ORDER BY id DESC LIMIT 1500)), 0)", (cid, cid))
         db.update("runs", run_id, status=status if not ctx.finished else ctx.finish_status, summary=summary[:4000],
-                  transcript=json.dumps(messages[1:], ensure_ascii=False)[:2_000_000], tokens=tokens, steps=steps,
+                  transcript=vault.redact(json.dumps(messages[1:], ensure_ascii=False))[:2_000_000], tokens=tokens, steps=steps,
                   finished_at=ts)
         if status == "error":
             bus.emit(cid, "error", f"{agent['name']} hit an error: {error}", aid, {"run_id": run_id})

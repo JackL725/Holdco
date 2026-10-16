@@ -121,6 +121,22 @@ def founding_step(user: str, step: int):
     return seq[min(step, len(seq) - 1)]
 
 
+PAY_LINK_RE = re.compile(r"https?://[^\s)]+/pay/plink_\w+")
+
+
+def payment_link_step(messages: list[dict], step: int):
+    """Phase 1 gate (docs/phases/phase-1-connect.md, the test_22 walkthrough, numbered test_27 in test_e2e.py):
+    Forge loads the Stripe tool, creates the link, opens it with browser_check and hands it off."""
+    tool_texts = [str(m.get("content") or "") for m in messages if m.get("role") == "tool"]
+    link = next((m.group(0) for t in reversed(tool_texts) for m in [PAY_LINK_RE.search(t)] if m), "")
+    seq = [tc("find_tool", query="stripe payment link"),
+           tc("stripe__create_payment_link", name="Starter plan", amount_usd=19, recurring_interval="month"),
+           tc("browser_check", path_or_url=link or "no link came back"),
+           tc("finish", summary="Starter plan payment link created", status="done", deliverable=link,
+              evidence="stripe__create_payment_link returned the link; browser_check returned 200")]
+    return seq[min(step, len(seq) - 1)]
+
+
 def script(messages: list[dict], tools: list[dict]):
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -141,6 +157,13 @@ def script(messages: list[dict], tools: list[dict]):
                       deliverable=f"marketing/request-{stamp}.md")
         return "Got it. I've queued that for Echo in marketing as a priority task."
     role = system.split(",")[0].replace("You are ", "")
+    if role == "Forge" and "Create a payment link for the Starter plan" in user:
+        return payment_link_step(messages, step)
+    if "Echo through the test MCP server" in user:   # Phase 1: a tool loaded from an OAuth-signed-in MCP server
+        seq = [tc("find_tool", query="echo"),
+               tc("fakemcp__echo", text="hello from holdco"),
+               tc("finish", summary="Echoed a line through the test MCP server.")]
+        return seq[min(step, len(seq) - 1)]
     if role == "Forge" and "Fix form labels" in user:
         seq = [tc("finish", summary="Fixed labels"),  # lazy: should be pushed back by the deliverable check
                tc("write_file", path="site/index.html",

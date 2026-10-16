@@ -303,7 +303,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["audit blockers (0)", "page weight", "visitor-to-signup rate"],
         "tools": ["read_file", "write_file", "list_files", "delete_file", "audit_page", "check_contrast", "web_search",
-                  "fetch_url", "run_code", "deploy_site", "create_task", "remember", "finish"],
+                  "fetch_url", "run_code", "deploy_site", "create_task", "remember", "finish", "browser_check"],
         "routines": [],
         "reasoning": "high", "creativity": "precise",
         "sources": [
@@ -347,7 +347,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["blockers caught before publishing", "time to fix"],
         "tools": ["list_tasks", "read_file", "list_files", "audit_page", "check_contrast", "review_text", "fetch_url",
-                  "write_file", "create_task", "remember", "finish"],
+                  "write_file", "create_task", "remember", "finish", "browser_check"],
         "routines": [
             R("Daily review",
               "Review work finished in the last 24 hours that hasn't been reviewed yet (see list_tasks with status "
@@ -403,7 +403,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["contrast failures (0)", "consistency issues found in review"],
         "tools": ["read_file", "write_file", "list_files", "check_contrast", "audit_page", "review_text", "web_search",
-                  "fetch_url", "create_task", "remember", "finish"],
+                  "fetch_url", "create_task", "remember", "finish", "browser_check"],
         "routines": [],
         "reasoning": "medium", "creativity": "balanced",
         "sources": [
@@ -496,7 +496,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["indexed pages", "search impressions and clicks", "signups from organic search"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "review_text", "audit_page",
-                  "create_task", "remember", "finish"],
+                  "create_task", "remember", "finish", "browser_check"],
         "routines": [
             R("Weekly article",
               "Research and write one high-quality article for a question our customers search for, following your "
