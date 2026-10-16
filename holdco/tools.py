@@ -47,7 +47,6 @@ class Ctx:
     loaded_by_name: dict = field(default_factory=dict)
     brief_written: str = ""   # Phase 2: the kind of brief write_brief stored in this run (a brief is a deliverable)
     brief_warned: bool = False   # Phase 2: write_brief refused once a brief with numbers its data does not hold
-    brief_missing_warned: bool = False   # Phase 2: finish refused once a brief task that stored no brief
 
 
 @dataclass
@@ -771,7 +770,7 @@ def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     # stores with write_brief, in this session or an earlier attempt at the same task. Without one the owner gets
     # no brief, so finishing as done is refused once like a missing file.
     task = ctx.task or {}
-    kind = rhythms.KIND_OF.get(task.get("routine") or "", "")
+    kind = rhythms.brief_kind(task)
     if kind:
         if ctx.brief_written == kind or db.one("SELECT id FROM briefs WHERE company_id=? AND kind=? AND created_at>=?",
                                                (ctx.company["id"], kind, task.get("created_at") or "")):
@@ -851,17 +850,6 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         if waiting_on is None:
             status = "blocked"
             open_issues = (open_issues + "\nNothing was waiting on the owner for this task.").strip()
-    if status == "done" and ctx.task and not ctx.brief_written:
-        # Phase 2: the evening brief, weekly review and monthly check exist to store a brief; a file is not one.
-        kind = rhythms.brief_kind(ctx.task)
-        if kind and not ctx.brief_missing_warned:
-            ctx.brief_missing_warned = True
-            return (f"Not finished yet: this task's deliverable is the {kind} brief, and none is stored. Call "
-                    f"write_brief(kind=\"{kind}\", body=...) with it (numbers only from the data in your task), "
-                    f"then call finish again.")
-        if kind:
-            status = "partial"
-            open_issues = (open_issues + f"\nNo {kind} brief was stored with write_brief.").strip()
     if status == "done" and ctx.task:
         problem = _deliverable_ok(ctx, target)
         if problem and not ctx.finish_warned:

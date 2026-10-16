@@ -8,7 +8,8 @@ model never does, each replayed through the real code:
 - it assigned work by name ("Echo") instead of role;
 - it queued its own "Write daily brief" task next to the scheduled evening brief;
 - the weekly review wrote its memo to a file, marked its own task done with update_task and finished without
-  write_brief, so no weekly brief was stored.
+  write_brief, so no weekly brief was stored (finish's brief check is tests.test_phase2_review's; this file replays
+  the real run against it).
 
 Run with:  python -m unittest tests.test_phase2_realmodel -v
 """
@@ -151,13 +152,13 @@ class TestWeeklyReviewMustStoreItsBrief(Base):
     def test_finish_without_the_brief_is_refused_once_then_partial(self):
         out = tools.execute(self.ctx, "finish", {"summary": "Reviewed the week", "status": "done",
                                                  "deliverable": "briefs/weekly-2026-10-16.md"})
-        self.assertTrue(out.startswith("Not finished yet: this task's deliverable is the weekly brief"), out)
+        self.assertTrue(out.startswith("Not finished yet: this task's deliverable is the "), out)
         self.assertIn('write_brief(kind="weekly"', out)
         self.assertFalse(self.ctx.finished)
         tools.execute(self.ctx, "finish", {"summary": "Reviewed the week", "status": "done"})
         self.assertTrue(self.ctx.finished)
         self.assertEqual(self.ctx.finish_status, "partial")
-        self.assertIn("No weekly brief was stored", self.ctx.finish_summary)
+        self.assertIn("Deliverable check failed: this task's deliverable is the ", self.ctx.finish_summary)
 
     def test_finish_after_the_brief_is_done(self):
         self.ctx.brief_written = "weekly"
