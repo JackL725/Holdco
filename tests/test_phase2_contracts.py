@@ -380,13 +380,14 @@ class TestContractPrompts(Base):
         self.assertIn("owner sales. Open tasks: 2.\n", prompt)
         self.assertIn(f"(no goal) Open tasks: 1 (#{loose['id']}). Attach a goal with update_task(goal_id=...) or "
                       f"cancel them.", prompt)
+        # The experiment, proposal and decision lines are brain.py's (the digest and brain_lookup read them alike).
         self.assertIn(f'Running: #{due_exp - 1} (goal #{g2}, stops {today + _dt.timedelta(days=7)}) "A vet line '
-                      f'lifts signups" Metric forms.signups: 61 so far.', prompt)
+                      f'lifts signups". Metric forms.signups: 61 so far.', prompt)
         self.assertIn(f'Due to conclude: #{due_exp} (goal #{g1}, stops {today - _dt.timedelta(days=1)}) "Cold email '
-                      f'works"\nCall conclude_experiment for each one that is due.', prompt)
+                      f'works".\nCall conclude_experiment for each one that is due.', prompt)
         self.assertIn(f"## Brain proposals waiting for your review (review_brain_change)\n#{prop} by "
-                      f"{agent_of(c, 'marketing')['name']} (strategy.icp): add dog walkers to the ICP. Reason: 3 of 3 "
-                      f"replies came from walkers.\n", prompt)
+                      f"{agent_of(c, 'marketing')['name']} (strategy.icp): icp: \"add dog walkers to the ICP\". "
+                      f"Reason: 3 of 3 replies came from walkers.\n", prompt)
         self.assertIn(f"## Decisions due for review (log the outcome with log_decision, or propose a change)\n#{dec} "
                       f"(review {ago(60)[:10]}) Price at $9/month, not $15. Expected: signup rate of 5% or more.",
                       prompt)

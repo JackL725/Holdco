@@ -99,10 +99,11 @@ class Scheduler(threading.Thread):
         # 1) CEO planning cycles first: they create the work.
         for c in companies:
             if agents.running_count() >= capacity:
-                return
+                break   # full: no cycle now, but the recurring duties below are still created
             self._maybe_cycle(c)
         # 2) Recurring duties from each agent's preset (morning report, follow-ups, weekly reviews...). A company
-        #    over its token or GPU budget still gets them: they queue until the budget resets.
+        #    over its token or GPU budget, or a scheduler at capacity, still gets them: they queue until a run
+        #    slot is free and the budget resets (only creating a task here; dispatch below checks both).
         for c in companies:
             if time.time() - self._last_routines.get(c["id"], 0) >= ROUTINE_CHECK_SECONDS:
                 self._last_routines[c["id"]] = time.time()

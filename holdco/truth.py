@@ -32,6 +32,9 @@ from .actions import ACTION_LABELS
 from .routing import company_or_404, route
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401  (tools register here)
 
+# Approvals the owner answers rather than approves: questions, and Phase 2's decisions (options, a recommendation
+# and a deadline). Both wait on an answer, end "answered", and are no outbound action.
+ASKS = ("question", "decision")
 FACTS_HEADER = "# Facts (from Holdco's records; these override anything in files)"
 FACTS_CAP = 2000
 CHANGES_CAP = 1200
@@ -390,9 +393,9 @@ def _state(company: dict) -> dict:
     # ---- waiting on the owner
     waiting = []
     for a in pending:
-        is_q = a["action"] == "question"
+        is_q = a["action"] in ASKS   # Phase 2: a decision waits on the owner's answer like a question
         waiting.append({"id": a["id"], "kind": "question" if is_q else "approval", "action": a["action"],
-                        "label": "Question" if is_q else ACTION_LABELS.get(a["action"], a["action"]),
+                        "label": ACTION_LABELS.get(a["action"], a["action"]),
                         "summary": _one_line(a["summary"], 160), "created_at": a["created_at"],
                         "age": _age_short(a["created_at"]), "asked_by": names.get(a["agent_id"], "")})
     st["waiting"] = waiting
@@ -543,6 +546,14 @@ def _change_items(company: dict, agent: dict, since: str, kind: str = "task") ->
         if a["action"] == "question":
             line = (f"The owner answered question #{a['id']} ({_one_line(a['summary'], 60)}): "
                     f"{_one_line(a['result'], 110)}")
+        elif a["action"] == "decision":   # Phase 2: decided by the owner, the phone or the deadline
+            if a["status"] != "answered":
+                line = f"The owner dismissed decision #{a['id']} ({_one_line(a['summary'], 60)}) without choosing"
+            elif (a.get("decided_by") or "") == "deadline":
+                line = (f"Decision #{a['id']} ({_one_line(a['summary'], 60)}) took the recommended option at its "
+                        f"deadline: {_one_line(a['result'], 90)}")
+            else:
+                line = f"The owner decided #{a['id']} ({_one_line(a['summary'], 60)}): {_one_line(a['result'], 110)}"
         elif a["status"] == "rejected":
             line = f"The owner rejected request #{a['id']} ({label})" + \
                 (f": {_one_line(a['feedback'], 90)}" if a["feedback"] else ".")
@@ -619,7 +630,7 @@ def _waiting_text(waiting: list[dict]) -> str:
     shown = waiting if len(waiting) <= room else waiting[: room - 1]
     lines = ["# Waiting on the owner"]
     for w in shown:
-        who = "Question" if w["kind"] == "question" else f"Request ({w['label']})"
+        who = w["label"] if w["kind"] == "question" else f"Request ({w['label']})"
         lines.append(f"- {who} #{w['id']}, {w['age']}: {_one_line(w['summary'], 90)}")
     if len(shown) < len(waiting):
         lines.append(f"- ...and {len(waiting) - len(shown)} more (records/owner.md and records/outbound.md)")
@@ -704,7 +715,7 @@ def _status_text(st: dict) -> str:
              "## Waiting on the owner"]
     if st["waiting"]:
         for w in st["waiting"]:
-            who = "Question" if w["kind"] == "question" else f"Request ({w['label']})"
+            who = w["label"] if w["kind"] == "question" else f"Request ({w['label']})"
             lines.append(f"- {who} #{w['id']}, asked {w['age']} ago by {w['asked_by'] or 'an agent'}: "
                          f"{_one_line(w['summary'], 200)}")
     else:
@@ -717,7 +728,7 @@ def _status_text(st: dict) -> str:
               f"{counts.get('waiting', 0)} waiting on the owner, {counts.get('blocked', 0)} blocked). "
               f"Done: {counts.get('done', 0)}. Cancelled: {counts.get('cancelled', 0)}.", "",
               "## Latest outbound requests"]
-    recent = [a for a in st["approvals"] if a["action"] != "question"][:8]
+    recent = [a for a in st["approvals"] if a["action"] not in ASKS][:8]
     if recent:
         for a in recent:
             lines.append(f"- #{a['id']} {ACTION_LABELS.get(a['action'], a['action'])}: "
@@ -733,7 +744,7 @@ def _outbound_text(st: dict) -> str:
     names = st["names"]
     rows = []
     for a in st["approvals"]:
-        if a["action"] == "question":
+        if a["action"] in ASKS:
             continue
         who = names.get(a["agent_id"], "an agent")
         line = (f"- #{a['id']} {ACTION_LABELS.get(a['action'], a['action'])}: {_one_line(a['summary'], 160).rstrip('.')}. "
@@ -783,22 +794,26 @@ def _owner_text(st: dict) -> str:
     names = st["names"]
     lines = ["# Questions to the owner and answers", "Newest first. Written by Holdco from its records; agents cannot "
              "edit it.", ""]
-    qs = [a for a in st["approvals"] if a["action"] == "question"][:200]
+    qs = [a for a in st["approvals"] if a["action"] in ASKS][:200]
     for a in qs:
         p = _payload(a)
-        lines.append(f"- Question #{a['id']} from {names.get(a['agent_id'], 'Holdco')}, {_clock(a['created_at'])}: "
+        lines.append(f"- {ACTION_LABELS.get(a['action'], 'Question')} #{a['id']} from "
+                     f"{names.get(a['agent_id'], 'Holdco')}, {_clock(a['created_at'])}: "
                      f"{_one_line(p.get('question') or a['summary'], 400)}")
         if p.get("options"):
             lines.append(f"  Options: {' / '.join(_one_line(o, 60) for o in p['options'])}"
                          + (f". Recommended: {_one_line(p.get('recommended'), 60)}." if p.get("recommended") else ""))
         if a["status"] == "pending":
             lines.append(f"  Waiting for the owner ({_age_short(a['created_at'])}).")
+        elif a["action"] == "decision" and a["status"] != "answered":
+            lines.append(f"  Dismissed without choosing ({_clock(a['decided_at'])}).")
         else:
-            lines.append(f"  Answer ({_clock(a['decided_at'])}): {_one_line(a['result'], 400)}")
+            by = " by the deadline" if (a.get("decided_by") or "") == "deadline" else ""
+            lines.append(f"  Answer{by} ({_clock(a['decided_at'])}): {_one_line(a['result'], 400)}")
     if not qs:
         lines.append("No questions yet.")
     lines += ["", "## Owner decisions on requests"]
-    decided = [a for a in st["approvals"] if a["action"] != "question" and a["decided_at"]][:200]
+    decided = [a for a in st["approvals"] if a["action"] not in ASKS and a["decided_at"]][:200]
     for a in decided:
         verb = "rejected" if a["status"] == "rejected" else "approved"
         line = (f"- {_clock(a['decided_at'])} {verb} #{a['id']} {ACTION_LABELS.get(a['action'], a['action'])}: "
@@ -1927,7 +1942,7 @@ _KIND_TOOL = {"outreach": "send_email", "deploy": "deploy_site", "post": "social
 
 
 def _approval_done(a: dict) -> bool:
-    if a["action"] == "question":
+    if a["action"] in ASKS:
         return a["status"] == "answered"
     if a["status"] != "done":
         return False
@@ -1968,15 +1983,17 @@ def _ask_rows(ctx: Ctx) -> list[dict]:
 
 
 def _ask_state(ctx: Ctx) -> str:
+    """An ask task's action is getting the owner's answer: 'done' once a question or a decision (Phase 2) it asked,
+    or the one its duplicate was folded into, is answered; 'waiting' while one is pending; else 'missing'."""
     rows = _ask_rows(ctx)
     wid = _approval_id(getattr(ctx, "waiting_on", None))
     named = rows[0] if rows and rows[0]["id"] == wid else None
     if named:
         if named["status"] in ("pending", "running"):
             return "waiting"
-        if named["action"] == "question" and named["status"] == "answered":
+        if named["action"] in ASKS and named["status"] == "answered":
             return "done"
-    if any(r["action"] == "question" and r["status"] == "answered" for r in rows):
+    if any(r["action"] in ASKS and r["status"] == "answered" for r in rows):
         return "done"
     return "waiting" if any(r["status"] in ("pending", "running") for r in rows) else "missing"
 

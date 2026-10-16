@@ -319,13 +319,6 @@ def task_contract_section(task: dict) -> str:
     return "Contract:\n" + "\n".join(lines)
 
 
-def _no_strategy(company_id: int) -> bool:
-    s = db.one("SELECT * FROM strategy WHERE company_id=?", (company_id,))
-    has_strategy = bool(s and any((s.get(k) or "").strip() for k in
-                                  ("one_liner", "icp", "problem", "offer", "price", "positioning", "voice")))
-    return not has_strategy
-
-
 def _num(v) -> str:
     if v is None:
         return "?"
@@ -336,46 +329,15 @@ def _num(v) -> str:
     return str(int(f)) if f.is_integer() else f"{f:g}"
 
 
-def _experiment_line(e: dict) -> str:
-    from . import brain
-    goal = f"goal #{e['goal_id']}, " if e.get("goal_id") else ""
-    text = f'#{e["id"]} ({goal}stops {(e.get("stop") or "?")[:10]}) "{(e.get("hypothesis") or "").strip()[:240]}"'
-    if e.get("metric"):
-        m = brain.latest_metric(e["company_id"], e["metric"])
-        text += f" Metric {e['metric']}: " + (f"{_num(m['value'])} so far." if m else "no data yet.")
-    return text
-
-
-def _proposal_line(r: dict) -> str:
-    who = (db.get_agent(r["agent_id"]) or {}).get("name", "an agent") if r.get("agent_id") else "an agent"
-    payload = db.loads(r.get("payload"), None)
-    where, what = r.get("section") or "brain", ""
-    if isinstance(payload, dict):
-        keys = [k for k in payload if k not in ("text", "change")]
-        if len(keys) == 1:
-            where += f".{keys[0]}"
-        what = "; ".join(str(v) for v in payload.values())
-    elif payload is not None:
-        what = str(payload)
-    else:
-        what = str(r.get("payload") or "")
-    line = f"#{r['id']} by {who} ({where}): {_sentence(what, 240)}"
-    return line + (f" Reason: {_sentence(r['reason'], 200)}" if (r.get("reason") or "").strip() else "")
-
-
-def _sentence(text: str, cap: int) -> str:
-    """One line of text, capped, ending with a full stop (so the next part of the line reads as its own)."""
-    s = " ".join(str(text or "").split())[:cap].rstrip()
-    return s if not s or s[-1] in ".!?" else s + "."
-
-
 def cycle_sections(company: dict) -> str:
     """Goals (with open tasks per goal and the no-goal line), experiments, brain proposals and decisions due, placed
-    after Phase 0.5's header and before the open tasks in the planning prompt."""
-    from . import brain
+    after Phase 0.5's header and before the open tasks in the planning prompt. The lists and their lines come from
+    brain.py, so the planning prompt, the digest and brain_lookup read the brain the same way."""
+    from . import brain   # imported here: brain imports tools, which imports this module
     cid = company["id"]
-    today = _now().date()
+    today = _now().date().isoformat()
     goals = brain.active_goals(cid)
+    no_strategy = not brain.has_strategy(cid)
     counts = {r["goal_id"]: r["n"] for r in db.q(
         f"SELECT goal_id, COUNT(*) n FROM tasks WHERE company_id=? AND status IN ({','.join('?' * len(OPEN))}) "
         f"GROUP BY goal_id", (cid, *OPEN))}
@@ -394,9 +356,9 @@ def cycle_sections(company: dict) -> str:
         else:
             line += "."
         lines.append(line)
-        if _no_strategy(cid):
+        if no_strategy:
             lines.append("The strategy is not written yet: call set_strategy with all seven fields from the charter.")
-    elif _no_strategy(cid):
+    elif no_strategy:
         lines.append("The company brain is empty: no strategy and no goals yet. Before planning tasks, call "
                      "set_strategy (one_liner, icp, problem, offer, price, positioning, voice) from the charter, "
                      "then set_goal one to three times, each a number with a date.")
@@ -405,34 +367,28 @@ def cycle_sections(company: dict) -> str:
                      "before creating tasks.")
     parts = ["## Goals (plan from these; at most 3 active)\n" + "\n".join(lines)]
 
-    exps = db.q("SELECT * FROM experiments WHERE company_id=? AND verdict='pending' ORDER BY id", (cid,))
-    running, due = [], []
-    for e in exps:
-        stop = (e.get("stop") or "")[:10]
-        (due if stop and stop <= today.isoformat() else running).append(e)
+    exps = brain.running_experiments(cid, limit=10)   # verdict pending, soonest stop first
+    due = [e for e in exps if brain.due_by(e.get("stop"), today)]
+    running = [e for e in exps if e not in due]
     if exps or goals:
-        ex = [f"Running: {_experiment_line(e)}" for e in running[:5]] or \
+        ex = [f"Running: {brain.experiment_line(e)}" for e in running[:5]] or \
             ["Running: none. Write each bet as start_experiment(goal_id, hypothesis, metric, stop_days)."]
         if due:
-            ex += [f"Due to conclude: {_experiment_line(e)}" for e in due[:5]]
+            ex += [f"Due to conclude: {brain.experiment_line(e)}" for e in due[:5]]
             ex.append("Call conclude_experiment for each one that is due.")
         else:
             ex.append("Due to conclude: none.")
         parts.append("## Experiments\n" + "\n".join(ex))
 
-    props = db.q("SELECT * FROM brain_changes WHERE company_id=? AND status='pending' ORDER BY id LIMIT 5", (cid,))
+    props = brain.pending_proposals(cid, 5)
     if props:
         parts.append("## Brain proposals waiting for your review (review_brain_change)\n"
-                     + "\n".join(_proposal_line(r) for r in props))
+                     + "\n".join(brain.proposal_line(r) for r in props))
 
-    horizon = _utc(_dt.datetime.combine(today + _dt.timedelta(days=3), _dt.time(23, 59, 59)))
-    decs = db.q("SELECT * FROM decisions WHERE company_id=? AND COALESCE(outcome, '')='' AND "
-                "COALESCE(review_at, '')!='' AND review_at<=? ORDER BY review_at, id LIMIT 5", (cid, horizon))
+    decs = brain.decisions_due(cid)   # no outcome yet, review date today + 3 days or earlier
     if decs:
         parts.append("## Decisions due for review (log the outcome with log_decision, or propose a change)\n"
-                     + "\n".join(f"#{d['id']} (review {d['review_at'][:10]}) {_sentence(d['what'], 240)}"
-                                 + (f" Expected: {_sentence(d['expected'], 200)}" if (d.get("expected") or "").strip()
-                                    else "") for d in decs))
+                     + "\n".join(brain.decision_line(d) for d in decs))
     return "\n\n".join(parts)
 
 

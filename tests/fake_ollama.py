@@ -177,15 +177,75 @@ def payment_link_step(messages: list[dict], step: int):
     return seq[min(step, len(seq) - 1)]
 
 
-# Phase 2 rhythms: a brief may only use numbers from its data block, so these bodies state none.
-BRIEF = ("## What moved\nNo connector numbers moved today.\n## What shipped\n- site/index.html\n## What is stuck\n"
-         "Nothing.\n## Decisions needed\nNone.\n## Tomorrow's focus\nTalk to dog owners.")
+# Phase 2 rhythms: a brief may only use numbers from its data block (write_brief refuses others), so the bodies
+# are built from the "## Data for this brief" JSON in the task prompt and state no number of their own.
 BRIEF_KINDS = {"Evening brief": "daily", "Weekly review": "weekly", "Monthly strategy check": "monthly"}
+DATA_RE = re.compile(r"^## Data for this brief \(the only numbers you may use\)\n(.*?)\n\n### What to do\n",
+                     re.M | re.S)
+
+
+def data_block(user: str) -> dict:
+    """The rhythm task's data block (rhythms.task_data_section), or {}."""
+    m = DATA_RE.search(user)
+    try:
+        return json.loads(m.group(1)) if m else {}
+    except ValueError:
+        return {}
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z]{4,}", (text or "").lower())}
+
+
+def brief_body(kind: str, data: dict) -> str:
+    """A brief in the five headings, every number copied from the data block."""
+    moved = [f"- {m.get('name')}: {m['value']} [{m.get('source')}]" for m in (data.get("metrics") or [])[:6]
+             if isinstance(m, dict) and m.get("value") is not None]
+    moved += [f"- {g.get('title')}: {g['current']} of {g['target']}" for g in data.get("goals") or []
+              if isinstance(g, dict) and g.get("current") is not None and g.get("target") is not None]
+    shipped = [f"- {t.get('title')}" + (f" -> {t['deliverable']}" if t.get("deliverable") else "")
+               for t in (data.get("shipped") or [])[:5] if isinstance(t, dict)]
+    for group in (data.get("done_per_goal") or [])[:3]:
+        shipped += [f"- {t.get('title')}" for t in (group.get("tasks") or [])[:3] if isinstance(t, dict)]
+    stuck = (data.get("stuck") or {}).get("tasks") or []
+    needed = [f"- {d.get('question')}" + (f" (recommended: {d['recommended']})" if d.get("recommended") else "")
+              for d in (data.get("decisions_needed") or [])[:3] if isinstance(d, dict)]
+    focus = {"daily": "Tomorrow's focus", "weekly": "Next week's focus", "monthly": "Next month's focus"}[kind]
+    parts = ["## What moved", "\n".join(moved) or "No connector numbers moved.",
+             "## What shipped", "\n".join(shipped) or "Nothing new.",
+             "## What is stuck", f"{len(stuck)} tasks are blocked or waiting." if stuck else "Nothing.",
+             "## Decisions needed", "\n".join(needed) or "None.",
+             f"## {focus}", "Talk to dog owners."]
+    owner = [f"- #{t.get('id')} {t.get('title')}" for t in (data.get("owner_tasks_without_goal") or [])
+             if isinstance(t, dict)]
+    if owner:
+        parts += ["## Owner tasks without a goal", "\n".join(owner)]
+    return "\n".join(parts)
+
+
+def weekly_calls(data: dict) -> list[dict]:
+    """The weekly review: conclude each experiment that is due, give each goal-less task the goal its title is
+    about or cancel it, then the board memo."""
+    calls = [tc("conclude_experiment", experiment_id=e["id"], verdict="inconclusive",
+                result="No connector metric moved for it this week.")
+             for e in (data.get("experiments_due") or [])[:3] if isinstance(e, dict)]
+    goals = [g for g in data.get("goals") or [] if isinstance(g, dict)]
+    for t in (data.get("goalless_tasks") or [])[:6]:
+        if not isinstance(t, dict):
+            continue
+        g = next((g for g in goals if _words(t.get("title")) & (_words(g.get("title")) | _words(g.get("metric")))),
+                 None)
+        if g:
+            calls.append(tc("update_task", task_id=t["id"], goal_id=g["id"], note=f"Serves goal #{g['id']}."))
+        else:
+            calls.append(tc("update_task", task_id=t["id"], status="cancelled", note="Serves no goal."))
+    return calls + [tc("write_brief", kind="weekly", body=brief_body("weekly", data))]
 
 
 def rhythm_step(user: str, step: int):
     """The CEO's and the analyst's rhythm tasks (Phase 2): the morning plan writes docs/daily-plan.md; the briefs
-    are stored with write_brief; the monthly check also files its keep, change or kill decision."""
+    are stored with write_brief; the weekly review cleans up goals first; the monthly check files its keep, change
+    or kill decision first."""
     title = (re.search(r"^Your assignment: task #\d+: (.+)$", user, re.M) or [None, ""])[1].strip()
     if title == "Morning plan":
         seq = [tc("write_file", path="docs/daily-plan.md",
@@ -193,14 +253,35 @@ def rhythm_step(user: str, step: int):
                tc("finish", summary="Morning plan written.", deliverable="docs/daily-plan.md")]
     elif title in BRIEF_KINDS:
         kind = BRIEF_KINDS[title]
-        seq = [tc("write_brief", kind=kind, body=BRIEF)]
-        if kind == "monthly":
-            seq.append(tc("ask_decision", question="Keep, change or kill PawPlan after this month?",
-                          options="Keep\nChange: focus on dog walkers\nKill (pause the company)", recommended="Keep",
-                          reversible=False, context="The month's numbers are in the monthly brief."))
+        data = data_block(user)
+        if kind == "weekly":
+            seq = weekly_calls(data)
+        elif kind == "monthly":
+            name = (re.search(r"Keep, change or kill ([^?\n]+)\?", user) or [None, "the company"])[1]
+            seq = [tc("ask_decision", question=f"Keep, change or kill {name}?",
+                      options="Keep\nChange: focus on dog walkers\nKill (pause the company)", recommended="Keep",
+                      reversible=False, context="The month's numbers are in the monthly brief."),
+                   tc("write_brief", kind=kind, body=brief_body(kind, data))]
+        else:
+            seq = [tc("write_brief", kind=kind, body=brief_body(kind, data))]
         seq.append(tc("finish", summary=f"{title} written.", status="done"))
     else:
         return None
+    return seq[min(step, len(seq) - 1)]
+
+
+DECIDE_TITLE = "Ask the owner where to launch first"
+
+
+def decision_step(user: str, step: int):
+    """Phase 2 inbox walkthrough: the CEO asks the owner to decide (options, a recommendation, a deadline) and waits;
+    once the answer reopens the task ("[Update] Owner decided"), it finishes done."""
+    if "[Update] Owner decided" in user:
+        return tc("finish", summary="The owner made the call; the team follows it.", status="done")
+    seq = [tc("ask_decision", question="Where should PawPlan launch first: the r/dogs community or the PawTalk forum?",
+              options="r/dogs\nPawTalk forum", recommended="r/dogs", deadline_hours=48, reversible=True,
+              context="Picking one community keeps the first week focused."),
+           tc("finish", summary="Asked the owner where to launch first.", status="waiting")]
     return seq[min(step, len(seq) - 1)]
 
 
@@ -227,6 +308,8 @@ def script(messages: list[dict], tools: list[dict]):
     rhythm = rhythm_step(user, step)
     if rhythm:
         return rhythm
+    if role == "Atlas" and f": {DECIDE_TITLE}\n" in user:
+        return decision_step(user, step)
     if role == "Forge" and "Create a payment link for the Starter plan" in user:
         return payment_link_step(messages, step)
     if "Echo through the test MCP server" in user:   # Phase 1: a tool loaded from an OAuth-signed-in MCP server

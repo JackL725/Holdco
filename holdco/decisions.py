@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 
 from . import actions, bus, db, notify, planning
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401
@@ -23,7 +24,7 @@ from .tools import Ctx, ToolError, S, I, tool  # noqa: F401
 MIN_OPTIONS, MAX_OPTIONS = 2, 5
 MIN_HOURS, MAX_HOURS = 1, 336     # a deadline between one hour and two weeks
 REVIEW_DAYS = 14                  # the weekly review brings a decision back for its outcome after this many days
-MONTHLY_KEY = "ceo:Monthly strategy check"   # rhythms.MONTHLY_KEY: its keep, change or kill question
+_ALREADY_RE = re.compile(r"Already waiting for the owner as decision #(\d+)")   # actions.gate's dedupe answer
 
 
 def _iso(t: dt.datetime) -> str:
@@ -92,7 +93,9 @@ def _queue(company: dict, agent: dict, task_id: int | None, question: str, optio
         payload["topics"] = topics
     if origin:
         payload["origin"] = origin
-    return actions.gate(company, agent, task_id, "decision", payload), None
+    out = actions.gate(company, agent, task_id, "decision", payload)
+    same = _ALREADY_RE.match(out)   # the gate folded it into the same question already waiting
+    return out, (int(same.group(1)) if same else None)
 
 
 def create(company: dict, agent: dict, task_id: int | None, question: str, options: list[str], recommended: str,
@@ -118,14 +121,15 @@ def create(company: dict, agent: dict, task_id: int | None, question: str, optio
       ("question", "options", "recommended"), risk="write")
 def ask_decision(ctx: Ctx, question: str, options: str, recommended: str, deadline_hours: int = 48,
                  reversible: bool = True, context: str = "") -> str:
-    from . import truth   # imported here: truth imports tools, which imports this module
+    from . import rhythms, truth   # imported here: both import tools, which imports this module
     # Phase 0.5's claims gate on what the owner will read (the same check ask_owner runs).
     refusal = truth.claims_guard(ctx, "\n".join((question or "", context or "")), "ask")
     if refusal:
         return refusal
     origin = None
     task = ctx.task or {}
-    if task.get("routine") == MONTHLY_KEY and any(o.lower().startswith("kill") for o in planning.parse_options(options)):
+    if task.get("routine") == rhythms.MONTHLY_KEY and any(o.lower().startswith("kill")
+                                                          for o in planning.parse_options(options)):
         # The monthly keep, change or kill question never resolves on its own: Kill pauses the company.
         origin, reversible = {"kind": "monthly"}, False
     text, waiting_on = _queue(ctx.company, ctx.agent, task.get("id"), question, options, recommended,
@@ -171,7 +175,7 @@ def resolve_due() -> None:
                 "a.status='pending' AND c.status='active' ORDER BY a.id")
     if not rows:
         return
-    now =dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.timezone.utc)
     killed = bool(db.get_settings().get("kill_switch"))
     for row in rows:
         p = db.loads(row["payload"], {}) or {}

@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-planning-")
 
-from holdco import (actions, agents, backup, bus, db, doctor, llm, notify, planning, playbooks, roles,  # noqa: E402
-                    scheduler, tools, watchdog, workspace)
+from holdco import (actions, agents, backup, brain, bus, db, doctor, llm, notify, planning, playbooks,  # noqa: E402
+                    roles, scheduler, tools, watchdog, workspace)
 from tests.fake_ollama import CHARTER as FAKE_CHARTER, FakeModelServer  # noqa: E402
 
 db.init()
@@ -894,6 +894,16 @@ class TestStagedFoundingWithTheFakeModel(FoundingBase):
         self.assertIn("Three strongest reasons", workspace.safe_path(c, "docs/critique.md").read_text("utf-8"))
         titles = {t["title"] for t in db.q("SELECT title FROM tasks WHERE company_id=?", (c["id"],))}
         self.assertGreaterEqual(len(titles), 5)
+        # Phase 2: the charter stage wrote the brain (all seven strategy fields, one to three goals) and the plan
+        # stage gave every first task one of those goals and an expected effect.
+        strategy = brain.get_strategy(c["id"]) or {}
+        self.assertEqual([f for f in brain.STRATEGY_FIELDS if not (strategy.get(f) or "").strip()], [])
+        goals = {g["id"] for g in db.q("SELECT id FROM goals WHERE company_id=? AND status='active'", (c["id"],))}
+        self.assertTrue(1 <= len(goals) <= 3, goals)
+        tasks = db.q("SELECT title, goal_id, expected FROM tasks WHERE company_id=?", (c["id"],))
+        self.assertEqual([t["title"] for t in tasks if t["goal_id"] not in goals or not t["expected"]], [])
+        self.assertEqual(db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND action='decision'",
+                                   (c["id"],)), 0, "founding's goals are not a change the owner must confirm")
         events = [e["message"] for e in db.q("SELECT message FROM events WHERE company_id=? AND kind='founding' "
                                              "ORDER BY id", (c["id"],))]
         for text in ("Founding: researching the market", "Founding: writing the charter",

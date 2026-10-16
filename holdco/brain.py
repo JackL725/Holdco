@@ -218,7 +218,7 @@ def proposal_line(row: dict, short: bool = False) -> str:
     label, summary = _change_text(row.get("section") or "", _change_payload(row))
     line = f"#{row['id']} by {_agent_name(row.get('agent_id'))} ({label}): {_end(_cut(summary, 'summary', short))}"
     if (row.get("reason") or "").strip():
-        line += f" Reason: {_cut(row['reason'], 'reason', short)}"
+        line += f" Reason: {_end(_cut(row['reason'], 'reason', short))}"
     return line
 
 
@@ -237,8 +237,17 @@ def decision_line(row: dict, short: bool = False) -> str:
     return line + f" Decided by {_decider(row.get('company_id'), row.get('decided_by'))}."
 
 
+def due_by(value, day: str) -> bool:
+    """Is a date or timestamp (decisions.review_at, experiments.stop) on or before day (YYYY-MM-DD)? Both forms are
+    stored (the owner's form saves a date, tools save a timestamp), so only the date part is compared: a decision
+    due at 10:00 today counts as due all day, the same as decisions_due."""
+    v = str(value or "").strip()[:10]
+    return bool(v) and v <= day
+
+
 def decisions_due(company_id: int, days: int = DUE_DAYS, limit: int = 5) -> list[dict]:
-    """Decisions with no outcome whose review date is within `days` days (or past)."""
+    """Decisions with no outcome whose review date is within `days` days (or past), soonest first. Only the date
+    part of review_at is compared (see due_by); days=0 means due today or earlier."""
     until = (_today() + _dt.timedelta(days=days)).isoformat()
     return db.q("SELECT * FROM decisions WHERE company_id=? AND COALESCE(outcome,'')='' AND COALESCE(review_at,'')!='' "
                 "AND substr(review_at,1,10) <= ? ORDER BY review_at, id LIMIT ?", (company_id, until, limit))
@@ -631,15 +640,18 @@ def _apply_change(row: dict, by: str) -> str:
         fields["decided_by"] = "owner" if by == "owner" else "ceo"   # whoever accepted it, never the proposer's say
     before = _active_ids(cid)
     new_id = _insert(section, cid, fields)
+    told = ""
     if section == "goals" and by != "owner" and new_id in _active_ids(cid):
         company = db.get_company(cid)
         ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (cid,))
-        _tell_owner_goals(company, ceo, None, before, new_id)
-    return f"{section[:-1]} #{new_id} added"
+        told = _tell_owner_goals(company, ceo, None, before, new_id)   # the owner hears about a new active goal
+    return f"{section[:-1]} #{new_id} added" + (f" ({told.rstrip('.')})" if told else "")
 
 
-def _decide_change(row: dict, accept: bool, by: str, note: str = "") -> str:
-    """Accept (apply, then mark accepted) or reject a proposal and record it. by: ceo or owner."""
+def _decide_change(row: dict, accept: bool, by: str, note: str = "", agent_id: int | None = None) -> str:
+    """Accept (apply, then mark accepted) or reject a proposal and record it. by: ceo or owner; agent_id: the CEO
+    that reviewed it. The event carries that id: a 'brain' event without an agent is the owner's edit, which
+    planning treats as news (planning.REAL_CHANGE_SQL), and the CEO's own review must not wake it again."""
     cid = row["company_id"]
     what = _apply_change(row, by) if accept else ""
     status = "accepted" if accept else "rejected"
@@ -647,7 +659,7 @@ def _decide_change(row: dict, accept: bool, by: str, note: str = "") -> str:
     who = "the owner" if by == "owner" else _ceo_name(cid)
     label = _change_text(row["section"], _change_payload(row))[0]
     msg = f"{who} {status} brain proposal #{row['id']} ({label})" + (f": {what}" if what else "")
-    bus.emit(cid, "brain", msg)
+    bus.emit(cid, "brain", msg, agent_id if by != "owner" else None, {"change_id": row["id"], "by": by})
     # The proposer reads its notes: an accepted or rejected proposal is not proposed again.
     db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
            (cid, row.get("agent_id"), "decision", _clip(msg[0].upper() + msg[1:] + (f". Note: {note}" if note else ""),
@@ -796,8 +808,10 @@ def propose_brain_change(ctx: Ctx, section: str, change: str, reason: str = "") 
     out = decisions.create(ctx.company, ctx.agent, ctx.task["id"] if ctx.task else None, question,
                            ["Accept the change", "Reject it"], "Reject it", deadline_hours=72, reversible=True,
                            context=(reason or "").strip(), origin={"kind": "brain_change", "change_id": ch_id})
-    if out.startswith(("ERROR", "Not allowed")):
-        db.run("DELETE FROM brain_changes WHERE id=?", (ch_id,))   # no decision, so no proposal either
+    if not out.startswith("Decision #"):
+        # Refused, or folded into a decision already waiting ("Already waiting ... as decision #N", which answers
+        # a different proposal): no decision of its own, so no proposal either, or it would wait as 'owner' forever.
+        db.run("DELETE FROM brain_changes WHERE id=?", (ch_id,))
         return out
     bus.emit(cid, "brain", f"proposed a strategy change #{ch_id} ({label}); the owner decides", ctx.agent["id"],
              {"change_id": ch_id})
@@ -1086,7 +1100,7 @@ def review_brain_change(ctx: Ctx, change_id: int, decision: str, note: str = "")
     else:
         return "ERROR: decision must be accept or reject."
     try:
-        what = _decide_change(row, accept, by="ceo", note=(note or "").strip())
+        what = _decide_change(row, accept, by="ceo", note=(note or "").strip(), agent_id=ctx.agent["id"])
     except ValueError as e:
         return f"ERROR: proposal #{change_id} cannot be applied: {e}. Reject it, or make the change yourself."
     if not accept:

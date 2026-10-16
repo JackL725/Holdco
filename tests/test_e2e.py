@@ -4,10 +4,13 @@ Covers founding from a template, the 24/7 scheduler, approvals, chat, QA review 
 recurring duties, restart recovery, the prompt-based tool fallback, the OpenAI-compatible backend, pausing,
 security checks and deletion; Phase 1 adds connectors and the vault, the Stripe gate (a payment link created by an
 agent, opened by browser_check, a test purchase polled in as revenue), Resend and Buffer behind approvals, and an
-OAuth sign-in to an MCP server. The outside services are fakes on 127.0.0.1.
+OAuth sign-in to an MCP server. The outside services are fakes on 127.0.0.1. Phase 2 adds founding that writes the
+company brain, the evening brief and the weekly review on connector numbers (in a second Holdco at a local 19:00),
+a decision in the inbox, and a task that waits for the one it depends on.
 """
 from __future__ import annotations
 
+import calendar
 import secrets
 import sqlite3
 import sys
@@ -192,14 +195,17 @@ class EndToEnd(unittest.TestCase):
 
     def test_09_pause(self):
         self.api.patch(f"/api/companies/{self.cid}", {"status": "paused"})
-        wait_for(lambda: self.api.get(f"/api/companies/{self.cid}")["stats"]["agents_working"] == 0, 30,
-                 what="agents to stop")
-        before = len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"])
-        self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Should wait while paused"})
-        import time
-        time.sleep(3)
-        self.assertEqual(len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"]), before)
-        self.api.patch(f"/api/companies/{self.cid}", {"status": "active"})
+        try:
+            # Every run thread has ended, including one the scheduler handed a task just before the pause (it
+            # starts no run for a paused company), so the run count below is stable.
+            wait_for(lambda: self.api.get(f"/api/companies/{self.cid}")["stats"]["agents_working"] == 0
+                     and self.api.get("/api/state")["running"] == 0, 30, what="agents to stop")
+            before = len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"])
+            self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Should wait while paused"})
+            time.sleep(3)
+            self.assertEqual(len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"]), before)
+        finally:   # the later tests need PawPlan running even when this one fails
+            self.api.patch(f"/api/companies/{self.cid}", {"status": "active"})
 
     def test_10_hire_and_settings(self):
         a = self.api.post(f"/api/companies/{self.cid}/agents", {"preset": "seo"})["agent"]
@@ -703,6 +709,215 @@ class EndToEnd(unittest.TestCase):
         finally:
             self.api.delete(f"/api/connectors/{iid}")
         self.assertIsNone(self.connector(iid))
+
+    # ---------------------------------------------------------------- phase 2: organize
+    def sql(self, query, params=(), app=None, write=False):
+        """Read (or, with write=True, change) the running app's database directly."""
+        db = sqlite3.connect(str(Path((app or self.app).data_dir) / "holdco.db"), timeout=30)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in db.execute(query, params).fetchall()]
+            if write:
+                db.commit()
+            return rows
+        finally:
+            db.close()
+
+    def test_30_founding_writes_brain(self):
+        # PawPlan's part is over: pause it so the new company's runs are the only ones (deterministic timing).
+        self.api.patch(f"/api/companies/{self.cid}", {"status": "paused"})
+        c = self.api.post("/api/companies", {"idea": "Personalised weekly meal plans for dog owners",
+                                             "name": "Kibble Club", "template": "minimal"})["company"]
+        type(self).kid = cid = c["id"]
+        wait_for(lambda: self.api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 60,
+                 what="Kibble Club founding")
+        b = self.api.get(f"/api/companies/{cid}/brain")
+        self.assertFalse(b["empty"])
+        for field in ("one_liner", "icp", "problem", "offer", "price", "positioning", "voice"):
+            self.assertTrue((b["strategy"].get(field) or "").strip(), field)
+        goals = {g["id"]: g for g in b["goals"] if g["status"] == "active"}
+        self.assertEqual(len(goals), 2, b["goals"])
+        self.assertEqual({g["metric"] for g in goals.values()}, {"waitlist_signups", "stripe.customers"})
+        self.assertEqual(b["digest_chars"], len(b["digest"]))
+        self.assertLessEqual(b["digest_chars"], 6000)
+        self.assertTrue(b["digest"].startswith("# Company brain: Kibble Club (digest, "), b["digest"][:80])
+        for g in goals.values():
+            self.assertIn(f"#{g['id']} {g['title']} by {g['deadline']}", b["digest"])
+        # every task the plan stage created serves one of those goals and says what it should move
+        done_at = self.sql("SELECT MAX(finished_at) AS t FROM runs WHERE company_id=? AND kind='founding'",
+                           (cid,))[0]["t"]
+        founding = self.sql("SELECT id, title, goal_id, expected FROM tasks WHERE company_id=? AND created_at<=?",
+                            (cid, done_at))
+        self.assertGreaterEqual(len(founding), 2, founding)   # the minimal team: engineering and marketing
+        self.assertEqual([t for t in founding if t["goal_id"] not in goals or not t["expected"]], [])
+        listed = {t["id"]: t for t in self.tasks(cid)}
+        self.assertTrue(all(listed[t["id"]]["goal_title"] == goals[t["goal_id"]]["title"] for t in founding))
+        # founding's goals are no change the owner has to confirm
+        self.assertFalse([a for a in self.pending(cid) if a["action"] == "decision"])
+
+    def test_31_rhythms_and_briefs(self):
+        # Its own Holdco at a local 19:00, so the evening brief is due; the weekly review is due once the company
+        # is more than 160 hours old. Only the CEO keeps its recurring duties, so nothing else adds tasks.
+        app = HoldcoProcess(env={"HOLDCO_TEST_LOCAL_NOW": "19:00", "HOLDCO_VAULT_BACKEND": "file",
+                                 "HOLDCO_ALLOW_LOCAL": "127.0.0.1:*", "HOLDCO_METRICS_POLL_SECONDS": "1",
+                                 "HOLDCO_CONNECTOR_CHECK_SECONDS": "5"}).start()
+        try:
+            self._rhythms_and_briefs(app)
+            problems = [line for line in app.log().splitlines() if "Traceback" in line]
+            self.assertFalse(problems, "the evening app logged errors:\n" + app.log()[-3000:])
+        finally:
+            app.stop()
+
+    def _rhythms_and_briefs(self, app):
+        api = app.client
+        api.put("/api/settings", {"llm_base_url": self.model.url, "max_concurrent_runs": 2})
+        cid = api.post("/api/companies", {"idea": "Personalised weekly meal plans for dog owners",
+                                          "name": "Evening Paws", "template": "minimal"})["company"]["id"]
+        wait_for(lambda: api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 60, what="founding")
+        team = {a["role"]: a for a in api.get(f"/api/companies/{cid}")["agents"]}
+        for role, a in team.items():
+            if role != "ceo":
+                api.patch(f"/api/agents/{a['id']}", {"routines_on": False})
+        # Stripe through the Phase 1 connector: its metric poll writes rows with source "stripe"
+        out = api.post("/api/connectors", {"key": "stripe", "company_id": cid, "enabled": True,
+                                           "config": {"api_key": STRIPE_KEY, "api_base": self.stripe.url}})
+        self.assertEqual(out["health"]["status"], "ok", out["health"])
+        wait_for(lambda: any(m["name"] == "stripe.customers" and m["source"] == "stripe"
+                             for m in api.get(f"/api/companies/{cid}/metrics")["metrics"]), 30, what="Stripe poll")
+        goals = {g["metric"]: g["id"] for g in api.get(f"/api/companies/{cid}/brain")["goals"]}
+        # What the weekly review has to clean up, and a number an agent typed in
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        today = now[:10]
+        self.sql("INSERT INTO metrics(company_id, agent_id, name, value, note, created_at, source) "
+                 "VALUES(?,?,?,?,?,?,?)", (cid, None, "waitlist_signups", 58, "typed in by an agent", now, "manual"),
+                 app=app, write=True)
+
+        def task(title, role, created_by):
+            a = team[role]
+            self.sql("INSERT INTO tasks(company_id, title, role, agent_id, status, priority, created_by, created_at, "
+                     "updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (cid, title, role, a["id"], "blocked", 2, created_by,
+                                                               now, now), app=app, write=True)
+            return self.sql("SELECT id FROM tasks WHERE company_id=? AND title=?", (cid, title), app=app)[0]["id"]
+        stray = task("Tidy the shared drive", "engineering", team["engineering"]["name"])
+        fits = task("Collect waitlist signups at the dog park", "marketing", team["marketing"]["name"])
+        owners = task("Sketch a dog treat line", "marketing", "owner")
+        self.sql("INSERT INTO experiments(company_id, goal_id, hypothesis, metric, start, stop, verdict, created_at) "
+                 "VALUES(?,?,?,?,?,?,?,?)", (cid, goals["waitlist_signups"], "A vet line lifts signups",
+                                             "waitlist_signups", today, today, "pending", now), app=app, write=True)
+        self.sql("UPDATE companies SET created_at=? WHERE id=?",
+                 (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 86400)), cid), app=app, write=True)
+
+        def routine_done(key):
+            rows = [t for t in api.get(f"/api/companies/{cid}/tasks")["tasks"] if t["routine"] == key]
+            return rows and all(t["status"] == "done" for t in rows)
+        wait_for(lambda: routine_done("ceo:Evening brief") and routine_done("ceo:Weekly review"), 90,
+                 what="the evening brief and the weekly review")
+        latest = api.get(f"/api/briefs/latest?company_id={cid}")
+        daily, weekly = latest["daily"], latest["weekly"]
+        self.assertTrue(daily and weekly, latest)
+        self.assertIn("## What moved", weekly["body"])
+        self.assertIn("## Owner tasks without a goal", weekly["body"])
+        self.assertTrue(any(m["source"] == "stripe" for m in daily["data"]["metrics"]), daily["data"]["metrics"])
+        # The gate: the weekly memo's numbers come from connector rows; typed-in rows are only self_reported
+        data = weekly["data"]
+        self.assertTrue(data["metrics"], data)
+        self.assertEqual([m for m in data["metrics"] if m["source"] in ("", "manual", None)], [])
+        scored = [g for g in data["goals"] if g["current"] is not None]
+        self.assertEqual([g["metric"] for g in scored], ["stripe.customers"], data["goals"])
+        self.assertTrue(all(g["source"] == "stripe" for g in scored))
+        self.assertIn("waitlist_signups", [m["name"] for m in data["self_reported"]])
+        self.assertNotIn("waitlist_signups", [m["name"] for m in data["metrics"]])
+        polled = {r["value"] for r in self.sql("SELECT value FROM metrics WHERE company_id=? AND source!='manual'",
+                                               (cid,), app=app)}
+        for n in [g["current"] for g in scored] + [m["value"] for m in data["metrics"]]:
+            self.assertIn(n, polled)
+        # ...and every open task an agent created serves a goal (the review attached one or cancelled the task)
+        gate = ("SELECT COUNT(*) AS n FROM tasks WHERE company_id=? AND status IN ('todo','in_progress','blocked',"
+                "'waiting') AND goal_id IS NULL AND created_by != 'owner' AND routine = ''")
+        wait_for(lambda: self.sql(gate, (cid,), app=app)[0]["n"] == 0, 15, what="the weekly gate")
+        rows = {t["id"]: t for t in self.sql("SELECT id, status, goal_id FROM tasks WHERE id IN (?,?,?)",
+                                             (stray, fits, owners), app=app)}
+        self.assertEqual(rows[stray]["status"], "cancelled")
+        self.assertEqual((rows[fits]["status"], rows[fits]["goal_id"]), ("blocked", goals["waitlist_signups"]))
+        self.assertEqual((rows[owners]["status"], rows[owners]["goal_id"]), ("blocked", None))   # the owner's stays
+        self.assertEqual(self.sql("SELECT verdict FROM experiments WHERE company_id=?", (cid,), app=app)[0]["verdict"],
+                         "inconclusive")
+        # Run now: the owner asks for an evening brief at once (one open task at a time)
+        api.post(f"/api/companies/{cid}/rhythms/sunrise/run", expect=400)
+        first = api.post(f"/api/companies/{cid}/rhythms/evening/run")
+        again = api.post(f"/api/companies/{cid}/rhythms/evening/run")
+        self.assertTrue(first["created"])
+        self.assertEqual((first["task"]["routine"], first["task"]["created_by"]), ("ceo:Evening brief", "owner"))
+        self.assertEqual((again["created"], again["task"]["id"]), (False, first["task"]["id"]))
+        wait_for(lambda: (api.get(f"/api/briefs/latest?company_id={cid}")["daily"] or {}).get("id", 0) > daily["id"],
+                 60, what="the evening brief the owner asked for")
+        kinds = [b["kind"] for b in api.get(f"/api/briefs?company_id={cid}")["briefs"]]
+        self.assertEqual((kinds.count("daily"), kinds.count("weekly")), (2, 1), kinds)
+
+    def test_32_decision_in_inbox(self):
+        cid = self.kid
+        ceo = self.agent(cid, "ceo")
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Ask the owner where to launch first",
+                                                          "agent_id": ceo["id"], "priority": 1})["task"]
+
+        def decision():
+            rows = [a for a in self.pending(cid) if a["action"] == "decision" and a["task_id"] == t["id"]]
+            return rows[0] if rows else None
+        d = wait_for(decision, 60, what="the CEO's decision in the inbox")
+        p = d["payload"]
+        self.assertEqual((p["options"], p["recommended"], p["reversible"]),
+                         (["r/dogs", "PawTalk forum"], "r/dogs", True))
+        self.assertIn("launch first", p["question"])
+        hours = (calendar.timegm(time.strptime(p["deadline_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.time()) / 3600
+        self.assertTrue(47 <= hours <= 48.1, p["deadline_at"])
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "waiting", 30,
+                 what="the CEO to wait on the decision")
+        r = self.api.post(f"/api/approvals/{d['id']}", {"decision": "answer", "answer": "PawTalk forum"})["approval"]
+        self.assertEqual((r["status"], r["result"], r["decided_by"]), ("answered", "PawTalk forum", "owner"))
+        rec = [x for x in self.api.get(f"/api/companies/{cid}/brain")["decisions"] if x["what"] == "PawTalk forum"]
+        self.assertEqual(len(rec), 1, rec)
+        self.assertEqual((rec[0]["decided_by"], rec[0]["reversible"]), ("owner", 1))
+        self.assertIn("launch first", rec[0]["why"])
+        # the waiting task reopens with the answer, and the CEO's ask is done once the owner has answered
+        reopened = next(x for x in self.tasks(cid) if x["id"] == t["id"])
+        self.assertIn(f"[Update] Owner decided #{d['id']}: PawTalk forum", reopened["description"])
+        self.assertNotEqual(reopened["status"], "waiting")
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "done", 60,
+                 what="the ask task to finish once answered")
+        self.assertNotIn(d["id"], [a["id"] for a in self.pending(cid)])
+        self.assertEqual(self.api.raw("GET", "/static/app.js")[0], 200)   # the dashboard, Brain tab included, loads
+
+    def test_33_dependency_and_lease(self):
+        cid = self.kid
+        forge, echo = self.agent(cid, "engineering"), self.agent(cid, "marketing")
+        # The engineer is off, so the task the announcement waits on stays open until the owner closes it.
+        self.api.patch(f"/api/agents/{forge['id']}", {"enabled": False})
+        try:
+            first = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Set up the checkout page",
+                                                                  "agent_id": forge["id"]})["task"]
+            then = self.api.post(f"/api/companies/{cid}/tasks", {
+                "title": "Draft checkout announcement", "agent_id": echo["id"], "priority": 1,
+                "deliverable": "marketing/launch.md", "depends_on": str(first["id"])})["task"]
+            self.assertEqual((then["depends_on"], then["blocked_by"]), ([first["id"]], [first["id"]]))
+            time.sleep(4)   # several scheduler ticks
+            listed = next(x for x in self.tasks(cid) if x["id"] == then["id"])
+            self.assertEqual((listed["status"], listed["blocked_by"]), ("todo", [first["id"]]))
+            self.assertFalse([r for r in self.api.get(f"/api/companies/{cid}/runs")["runs"]
+                              if r["task_id"] == then["id"]])
+            self.api.patch(f"/api/tasks/{first['id']}", {"status": "done"})
+            wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == then["id"])["status"] == "done", 60,
+                     what="the dependent task to run once its dependency is done")
+        finally:
+            self.api.patch(f"/api/agents/{forge['id']}", {"enabled": True})
+        done = next(x for x in self.tasks(cid) if x["id"] == then["id"])
+        self.assertEqual(done["blocked_by"], [])
+        # The run took a lease on the file it wrote and gave it back when it ended.
+        results = [m["content"] for m in self.last_transcript(cid, echo["id"], then["id"]) if m["role"] == "tool"
+                   and m["name"] == "write_file"]
+        self.assertTrue(results and results[0].startswith("Saved marketing/launch.md"), results)
+        self.assertEqual(self.sql("SELECT COUNT(*) AS n FROM leases WHERE task_id=?", (then["id"],))[0]["n"], 0)
+        files = self.api.get(f"/api/companies/{cid}/files")
+        self.assertNotIn("marketing/launch.md", [x["path"] for x in files["leases"]])
 
 
 if __name__ == "__main__":

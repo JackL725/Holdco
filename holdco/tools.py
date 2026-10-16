@@ -46,6 +46,7 @@ class Ctx:
     loaded_tools: list = field(default_factory=list)
     loaded_by_name: dict = field(default_factory=dict)
     brief_written: str = ""   # Phase 2: the kind of brief write_brief stored in this run (a brief is a deliverable)
+    brief_warned: bool = False   # Phase 2: write_brief refused once a brief with numbers its data does not hold
 
 
 @dataclass
