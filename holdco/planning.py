@@ -317,11 +317,15 @@ FLAG_SECONDS = 900       # how long cycle_started's "did anything change" answer
 
 # Events that mean something really changed. A planning cycle's own "done" event has no task id and is left
 # out, otherwise every cycle would trigger the next one. Agents' file writes and task edits are not news either:
-# what they change shows up in the task counts.
+# what they change shows up in the task counts. Phase 2: an answered decision is a 'decision' event like an
+# answered question; the owner's Brain-tab edits are 'brain' events with no agent (an agent's own brain writes,
+# the CEO's included, carry its id, so they never wake the CEO again). A new brief is not listed: the run that
+# wrote it already ends with a 'done' event that has a task id.
 REAL_CHANGE_SQL = ("(kind IN ('decision','email','connector','fact','facts') "
                    "OR (kind='done' AND data NOT LIKE '%\"task_id\": null%') "
                    "OR (kind='file' AND data LIKE '%\"by\": \"owner\"%') "
-                   "OR (kind='metric' AND agent_id IS NULL))")
+                   "OR (kind='metric' AND agent_id IS NULL) "
+                   "OR (kind='brain' AND agent_id IS NULL))")
 TASK_STATUSES = ("todo", "in_progress", "waiting", "blocked", "done", "cancelled")
 # How a planning cycle can end without a usable result. Such a cycle is no baseline: the next idle or due
 # trigger plans again (one failed cycle once froze an idle company for good).
@@ -539,17 +543,21 @@ def waiting_summary(company: dict) -> dict | None:
     if not pending and not tasks:
         return None
     questions = sum(1 for p in pending if p["action"] == "question")
-    requests = len(pending) - questions
+    decisions = sum(1 for p in pending if p["action"] == "decision")   # Phase 2: choices, not approval requests
+    requests = len(pending) - questions - decisions
     parts = []
     if questions:
         parts.append(f"{questions} question{'s' if questions != 1 else ''}")
+    if decisions:
+        parts.append(f"{decisions} decision{'s' if decisions != 1 else ''}")
     if requests:
         parts.append(f"{requests} approval request{'s' if requests != 1 else ''}")
     if tasks:
         parts.append(f"{len(tasks)} task{'s' if len(tasks) != 1 else ''} waiting or blocked")
     stamps = [p["created_at"] for p in pending if p["created_at"]] + [t["updated_at"] for t in tasks if t["updated_at"]]
     oldest = min(stamps) if stamps else None
-    return {"questions": questions, "requests": requests, "tasks": len(tasks), "what": ", ".join(parts),
+    return {"questions": questions, "decisions": decisions, "requests": requests, "tasks": len(tasks),
+            "what": ", ".join(parts),
             "oldest": oldest, "oldest_age": _age(oldest) if oldest else ""}
 
 
@@ -565,8 +573,8 @@ def _maybe_waiting_notice(company: dict) -> None:
     update_company_settings(company["id"], last_waiting_notice=today)   # first, so a send problem never repeats it
     plain = (f"{company['name']} is still waiting on you: {info['what']}. The oldest has waited {info['oldest_age']}. "
              "Planning is paused until something changes.")
-    bus.emit(company["id"], "info", plain, None, {"waiting_notice": True, **{k: info[k] for k in
-                                                                             ("questions", "requests", "tasks")}})
+    counts = {k: info[k] for k in ("questions", "decisions", "requests", "tasks")}
+    bus.emit(company["id"], "info", plain, None, {"waiting_notice": True, **counts})
     try:
         from . import notify   # imported here: notify imports modules that import this one
         notify.send_later(f"<b>{notify.escape(company['name'])}</b> is still waiting on you: "

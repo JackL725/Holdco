@@ -67,6 +67,16 @@ def _metrics_text(company_id: int) -> str:
                      for r in rows) or "(none recorded)"
 
 
+def _metrics_section(company: dict) -> str:
+    """'# Latest metrics', only while the brain is empty: the digest (brain.company_section) lists the latest value
+    of every metric with its source, but the empty-brain block is Phase 0.5's charter core, which has no numbers.
+    The facts block above already says what waits on the owner."""
+    if not brain.is_empty(company["id"]):
+        return ""
+    pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (company["id"],))
+    return "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}"
+
+
 def _shared_rules(kind: str, max_steps: int) -> str:
     rules = [
         f"You act only by calling tools, and you have {max_steps} tool calls this session: plan to call finish by "
@@ -132,7 +142,6 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: d
     cs = db.company_settings(company)
     s = db.get_settings()
     today = _dt.datetime.now().strftime("%A, %B %d, %Y")
-    pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (company["id"],))
     owner = s.get("owner_name") or "the owner"
     parts = [
         f"You are {agent['name']}, {agent['title']} at {company['name']}, a company run by AI agents on its owner's "
@@ -151,7 +160,7 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: d
         _section(connectors.prompt_section, company),
         "# Shared memory (notes, decisions, owner answers)\n" + (_section(ctxsys.memory_section, company, agent, task)
                                                                  or "(nothing yet)"),
-        "# Latest metrics\n" + _metrics_text(company["id"]) + f"\nRequests waiting for the owner: {pending}",
+        _section(_metrics_section, company),   # Phase 2: the digest has the metrics once the brain has content
         _section(ctxsys.index_section, company),
     ]
     return "\n\n".join(p for p in parts if p)
@@ -426,7 +435,9 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
         _running[agent_id] = kind
     agent = db.get_agent(agent_id)
     company = db.get_company(agent["company_id"]) if agent else None
-    if not agent or not company:
+    # A task or a cycle for a company paused (or archived) after the scheduler picked it: no run row and no attempt
+    # counted; the loop below would only stop it at its first step ("Paused by the owner").
+    if not agent or not company or (kind in ("task", "cycle") and company["status"] != "active"):
         with _running_lock:
             _running.pop(agent_id, None)
         return
@@ -808,12 +819,6 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
         if kind == "cycle":
             db.update("companies", cid, last_cycle_at=ts)
         db.run("UPDATE companies SET tokens_used = tokens_used + ? WHERE id=?", (tokens, cid))
-        for hook in (lambda: workspace.release(run_id), lambda: contracts.after_run(task, tokens),
-                     lambda: rhythms.after_run(company, task, ctx, status)):   # Phase 2: leases, budgets, weekly review
-            try:
-                hook()
-            except Exception:
-                traceback.print_exc()
         # Reasoning events are bulky: keep the latest 1500 per company (full transcripts stay in the session log).
         db.run("DELETE FROM events WHERE company_id=? AND kind IN ('think','result') AND id < "
                "COALESCE((SELECT MIN(id) FROM (SELECT id FROM events WHERE company_id=? AND kind IN ('think','result') "
@@ -832,6 +837,14 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
             msg = short[:300] if short else ("ran out of steps" if status == "out_of_steps" else status)
             bus.emit(cid, "done", f"finished: {msg}", aid, {"run_id": run_id, "task_id": task["id"] if task else None})
     finally:
+        # Phase 2, on every way out (a failure above included): free this run's file leases, add its tokens to the
+        # task's budget, and after the CEO's weekly review cancel the tasks that still serve no goal.
+        for hook in (lambda: workspace.release(run_id), lambda: contracts.after_run(task, tokens),
+                     lambda: rhythms.after_run(company, task, ctx, status)):
+            try:
+                hook()
+            except Exception:
+                traceback.print_exc()
         db.update("agents", aid, status="error" if status == "error" else "idle", current_task_id=None,
                   status_note=error[:200] if status == "error" else "")
         with _running_lock:

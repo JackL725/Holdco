@@ -21,8 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-phase2-rhythms-")
 
-from holdco import (actions, brain, db, decisions, notify, planning, rhythms, roles, routing,  # noqa: E402
-                    scheduler, tools, truth, workspace)
+from holdco import (actions, brain, contracts, db, decisions, notify, planning, rhythms, roles,  # noqa: E402
+                    routing, scheduler, tools, truth, workspace)
 from tests.fake_telegram import FakeTelegram  # noqa: E402
 
 db.init()
@@ -270,6 +270,39 @@ class TestData(Base):
         self.assertEqual([(g["goal_id"], g["done"]) for g in w["done_per_goal"]], [(self.g_rev, 1)])
         self.assertEqual(set(w["usage"]), {"gpu_hours", "tokens"})
         self.assertEqual(w["emails"], {"sent": 0, "replies": 0})
+
+    def test_due_today_counts_as_due(self):
+        """decisions.review_at holds a date (the owner's Brain form) or a timestamp (log_decision, an answered
+        decision). One due later today is due now, and the weekly review, the planning prompt and the digest agree:
+        each compares the date part only (brain.decisions_due, brain.due_by)."""
+        c = self.c
+        today = dt.datetime.now(dt.timezone.utc).date()
+        tomorrow = today + dt.timedelta(days=1)
+
+        def decision(what, review_at):
+            return db.run("INSERT INTO decisions(company_id, what, review_at, decided_by, created_at) "
+                          "VALUES(?,?,?,?,?)", (c["id"], what, review_at, "ceo", db.now()))
+
+        def experiment(hypothesis, stop):
+            return db.run("INSERT INTO experiments(company_id, goal_id, hypothesis, metric, start, stop, verdict, "
+                          "created_at) VALUES(?,?,?,?,?,?,?,?)", (c["id"], self.g_rev, hypothesis, "", str(today),
+                                                                  stop, "pending", db.now()))
+        later_today = decision("Price at $9 a month", f"{today}T23:59:59Z")
+        dated_today = decision("Launch in r/dogs first", today.isoformat())
+        not_yet = decision("Email pet shops on Mondays", f"{tomorrow}T00:00:01Z")
+        stops_today = experiment("A vet line lifts signups", today.isoformat())
+        stops_later = experiment("Cold email works", f"{tomorrow}T09:00:00Z")
+
+        w = rhythms.weekly_data(c)
+        self.assertEqual({d["id"] for d in w["decisions_due"]}, {later_today, dated_today})
+        self.assertEqual([e["id"] for e in w["experiments_due"]], [stops_today])
+        self.assertEqual({d["id"] for d in brain.decisions_due(c["id"], days=0)}, {later_today, dated_today})
+        prompt = contracts.cycle_sections(c)   # the planning prompt looks 3 days ahead
+        for did in (later_today, dated_today, not_yet):
+            self.assertIn(f"\n#{did} (review ", prompt)
+        self.assertIn(f"Due to conclude: #{stops_today} ", prompt)
+        self.assertIn(f"Running: #{stops_later} ", prompt)
+        self.assertIn(f"#{later_today} (review {today}) Price at $9 a month.", brain.digest(c))
 
     def test_morning_and_monthly_data(self):
         add_task(self.c, "Blocked thing", status="blocked", goal_id=self.g_rev)

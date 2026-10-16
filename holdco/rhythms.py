@@ -68,11 +68,6 @@ def _today() -> str:
     return _now().date().isoformat()
 
 
-def _tomorrow() -> str:
-    """For "due today or earlier" on a date or a timestamp column: value < tomorrow works for both."""
-    return (_now().date() + _dt.timedelta(days=1)).isoformat()
-
-
 def _local_date(stamp: str | None = None) -> str:
     """The owner's local date, of now or of a UTC timestamp: the portfolio brief goes out once per local day."""
     t = db.parse_time(stamp) if stamp else _now()
@@ -261,13 +256,14 @@ def weekly_data(company: dict) -> dict:
         if m:
             self_reported.append({"name": name, "value": _num(m["value"]), "at": m["created_at"],
                                   "note": (m["note"] or "")[:160]})
-    experiments = db.q("SELECT id, goal_id, hypothesis, metric, stop FROM experiments WHERE company_id=? AND "
-                       "verdict='pending' AND COALESCE(stop, '')!='' AND stop<? ORDER BY stop DESC, id DESC "
-                       "LIMIT 10", (cid, _tomorrow()))
-    reviews = [{**r, "reversible": bool(r["reversible"])} for r in db.q(
-        "SELECT id, what, expected, review_at, decided_by, reversible FROM decisions WHERE company_id=? AND "
-        "COALESCE(outcome, '')='' AND COALESCE(review_at, '')!='' AND review_at<? ORDER BY review_at DESC, id DESC "
-        "LIMIT 10", (cid, _tomorrow()))]
+    # Experiments past their stop date and decisions due for review today or earlier, read the way the digest and
+    # the planning prompt read them (brain.py: date part only), newest first like every list here.
+    today = _today()
+    experiments = [{k: e.get(k) for k in ("id", "goal_id", "hypothesis", "metric", "stop")}
+                   for e in brain.running_experiments(cid, limit=200) if brain.due_by(e.get("stop"), today)][::-1][:10]
+    reviews = [{**{k: r.get(k) for k in ("id", "what", "expected", "review_at", "decided_by")},
+                "reversible": bool(r.get("reversible", 1))}
+               for r in brain.decisions_due(cid, days=0, limit=200)][::-1][:10]
     open_sql = (f"SELECT id, title, role, status, created_by FROM tasks WHERE company_id=? AND status IN "
                 f"({','.join('?' * len(OPEN))}) AND (goal_id IS NULL OR goal_id=0)")
     goalless = db.q(open_sql + f" AND COALESCE(created_by, '') NOT IN ({','.join('?' * len(EXEMPT_CREATORS))})"
@@ -573,7 +569,7 @@ def write_brief(ctx: Ctx, kind: str, body: str) -> str:
         return "ERROR: the brief is empty. Write it in Markdown, under 350 words, then call write_brief again."
     company, cid = ctx.company, ctx.company["id"]
     data, key = _data_for(ctx, kind)
-    if not getattr(ctx, "brief_warned", False):
+    if not ctx.brief_warned:
         unknown = unsupported_numbers(body, data, instruction(company, key))
         if unknown:
             # Once per run, like the claims gate: the second attempt is stored as written.
