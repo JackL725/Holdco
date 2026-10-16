@@ -266,6 +266,13 @@ def api_company_patch(h, m, body):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
             if k == "daily_token_budget":
                 v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # 0 = no limit
+            if k in ("gpu_hours_per_day",):
+                try:
+                    v = max(0.25, float(v))
+                except (TypeError, ValueError):
+                    v = config.DEFAULT_COMPANY_SETTINGS[k]
+            if k in ("steps_per_task", "posts_per_week", "money_usd"):
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
             if k == "pinned_context":
                 v = [str(x)[:300] for x in v][:40] if isinstance(v, list) else []
             if k == "policies" and isinstance(v, dict):

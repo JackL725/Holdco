@@ -110,3 +110,16 @@ def remove_company_folder(company: dict) -> None:
     if src.exists():
         config.TRASH_DIR.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(config.TRASH_DIR / f"{company['slug']}-{int(time.time())}"))
+
+
+# ---------------- Phase 2: file leases (two agents never edit the same file at once)
+
+def lease(company: dict, rel_path: str, ctx) -> str | None:
+    """Take or renew this run's lease on a file before writing it; the refusal text when another live run holds it.
+    Scaffold: no leases yet."""
+    return None
+
+
+def release(run_id: int) -> None:
+    """Free every lease a run holds (agents._finalize)."""
+    return None

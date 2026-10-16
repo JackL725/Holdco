@@ -28,10 +28,13 @@ ACTION_LABELS = {
     "spend_money": "Purchase",
     "question": "Question",
     "connector_call": "Connected service call",
+    "decision": "Decision",
 }
 
 
 def _summary(action: str, p: dict) -> str:
+    if action == "decision":
+        return (p.get("question") or "")[:140]
     if action == "connector_call":
         args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
         return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
@@ -55,14 +58,15 @@ def _summary(action: str, p: dict) -> str:
 
 # Phase 1: the risk tag of each built-in outbound action, shown on the Inbox card.
 TAG_OF_ACTION = {"send_email": "contact", "social_post": "publish", "deploy_site": "publish", "http_post": "publish",
-                 "run_code": "write", "spend_money": "spend", "question": "read"}
+                 "run_code": "write", "spend_money": "spend", "question": "read", "decision": "read"}
 
 
 def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict,
          policy_action: str | None = None) -> str:
+    # Phase 2: a decision is queued like a question (always asks, deduplicated), never run by a policy.
     """Called by agent tools for any outbound action. policy_action (Phase 1) names the policy to apply when it
     differs from the action, as for connector_call, whose policy comes from the tool's risk tag."""
-    if action == "question":
+    if action in ("question", "decision"):
         policy = "approve"
     else:
         policy = db.effective_policy(company, policy_action or action)
@@ -116,14 +120,15 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
 
 
 def decide(approval_id: int, decision: str, payload: dict | None = None, feedback: str = "",
-           answer: str = "") -> dict:
-    """The owner approves or rejects a request (or answers a question)."""
+           answer: str = "", decided_by: str = "owner") -> dict:
+    """The owner approves or rejects a request (or answers a question or a decision). decided_by (Phase 2):
+    owner, telegram or deadline."""
     row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
     if not row:
         raise ValueError("Request not found")
     if row["status"] != "pending":
         raise ValueError(f"Request #{approval_id} is already {row['status']}")
-    if decision == "approve" and row["action"] != "question" and db.get_settings().get("kill_switch"):
+    if decision == "approve" and row["action"] not in ("question", "decision") and db.get_settings().get("kill_switch"):
         raise ValueError("The kill switch is on. Turn it off to run approvals.")
     company = db.get_company(row["company_id"])
     p = db.loads(row["payload"], {})
@@ -132,9 +137,11 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     ts = db.now()
     label = ACTION_LABELS.get(row["action"], row["action"])
 
-    if row["action"] == "question":
+    if row["action"] in ("question", "decision"):
         status, result = "answered", answer or feedback or "(no answer)"
-        note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
+        word = "decided" if row["action"] == "decision" else "answered question"
+        who = "The deadline" if decided_by == "deadline" else "Owner"
+        note = f"{who} {word} #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
     elif decision == "approve":
         db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
         try:
@@ -148,11 +155,18 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     else:
         status, result = "rejected", ""
         note = f"Owner REJECTED request #{approval_id} ({label}: {_summary(row['action'], p)})."
-    if feedback and row["action"] != "question":
+    if feedback and row["action"] not in ("question", "decision"):
         note += f" Owner feedback: {feedback}"
 
     db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
-              feedback=feedback, summary=_summary(row["action"], p) if row["action"] != "question" else row["summary"])
+              feedback=feedback, decided_by=decided_by,
+              summary=_summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"])
+    if row["action"] == "decision":
+        from . import decisions   # imported here: decisions imports tools, which imports this module
+        try:
+            decisions.on_decided(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result, decided_by)
+        except Exception as e:   # the brain record is a view; the owner's answer must stand
+            print(f"decision record failed: {e}")
     db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
            (company["id"], row["agent_id"], "decision", note, 0, ts))
     if row["task_id"]:

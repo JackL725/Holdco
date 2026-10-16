@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 
-from . import agents, backup, bus, db, doctor, emailer, notify, planning, roles, watchdog
+from . import agents, backup, bus, contracts, db, decisions, doctor, emailer, notify, planning, rhythms, roles, watchdog
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -92,10 +92,13 @@ class Scheduler(threading.Thread):
                 db.update("tasks", t["id"], agent_id=agent["id"])
             if agents.is_running(agent["id"]):
                 continue
+            if not contracts.dispatchable(t):
+                continue   # Phase 2: a dependency is not done or cancelled yet
             if t["created_by"] != "owner":   # tasks the owner created still run over the budget
                 if t["company_id"] not in over:
                     company = db.get_company(t["company_id"])
-                    over[t["company_id"]] = bool(company and planning.over_budget(company))
+                    over[t["company_id"]] = bool(company and (planning.over_budget(company)
+                                                              or contracts.over_gpu_budget(company)))
                 if over[t["company_id"]]:
                     continue   # the company used its daily token budget; owner chat and owner tasks still work
             agents.start(agent["id"], "task", task_id=t["id"])
@@ -104,7 +107,8 @@ class Scheduler(threading.Thread):
         """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller."""
         from . import connectors   # Phase 1: connector health checks and metric pipes (both cheap when not due)
         for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller,
-                     connectors.check_if_stale, connectors.poll_if_due):
+                     connectors.check_if_stale, connectors.poll_if_due,
+                     decisions.resolve_due, rhythms.portfolio_brief_if_due):   # Phase 2
             try:
                 step()
             except NotImplementedError:
@@ -179,7 +183,8 @@ class Scheduler(threading.Thread):
         owner_asked = bool(c["cycle_requested"])   # an answer, a settings change, Retry founding with a busy CEO
         requested = owner_asked and since >= 3
         # The daily token budget holds background planning only; a cycle the owner asked for still runs.
-        if planning.should_cycle(c, due, idle, requested) and (requested or not planning.over_budget(c)):
+        over = planning.over_budget(c) or contracts.over_gpu_budget(c)   # tokens (Phase 0.5) or GPU hours (Phase 2)
+        if planning.should_cycle(c, due, idle, requested) and (requested or not over):
             db.update("companies", c["id"], cycle_requested=0, last_cycle_at=db.now())
             planning.cycle_started(c, requested=owner_asked)
             agents.start(ceo["id"], "cycle")
@@ -229,6 +234,7 @@ def recover() -> None:
     db.run("UPDATE tasks SET status='todo', updated_at=? WHERE status='in_progress'", (ts,))
     db.run("UPDATE agents SET status='idle', current_task_id=NULL, status_note='' WHERE status IN ('working','error')")
     db.run("UPDATE runs SET status='interrupted', finished_at=? WHERE status='running'", (ts,))
+    db.run("DELETE FROM leases")   # Phase 2: no run survives a restart, so neither do its file leases
     db.run("UPDATE approvals SET status='failed', result='Interrupted by a restart while running. Check whether it "
            "went through before asking the agent to retry.' WHERE status='running'")
     for c in db.q("SELECT * FROM companies WHERE status='founding'"):

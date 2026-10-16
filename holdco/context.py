@@ -1780,7 +1780,8 @@ def edit_file(ctx: Ctx, path: str, find: str, replace: str, count: int = 1) -> s
     if new_text == text:
         return f"No change: the new text is the same as the old in {r}."
     # The same guards as write_file: records/ and context/, log-like names, unsupported claims, the charter path.
-    refusal = _call_write_guard(ctx, r, new_text) or _tools.planning.charter_write_hook(ctx, r, new_text)
+    refusal = (workspace.lease(ctx.company, r, ctx)   # Phase 2: another run is editing this file
+               or _call_write_guard(ctx, r, new_text) or _tools.planning.charter_write_hook(ctx, r, new_text))
     if refusal:
         return refusal
     p.write_text(new_text, encoding="utf-8", newline="")

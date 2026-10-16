@@ -113,6 +113,11 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "daily_token_budget": 3000000,   # background tokens per day; 0 = no limit
     "pinned_context": [],        # files under this company's context/ included in every prompt
     "founding_stage": "",        # research | charter | critic | plan while founding (staged founding)
+    # Phase 2 budgets
+    "gpu_hours_per_day": 6,      # model time per day; over it the company gets no dispatch or cycles until tomorrow
+    "steps_per_task": 0,         # tool calls per task attempt; 0 = the global max_steps_per_run
+    "posts_per_week": 10,        # social posts approved or pending in the last 7 days
+    "money_usd": 0,              # display only: purchases always ask the owner
 }
 
 

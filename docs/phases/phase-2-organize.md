@@ -7,11 +7,28 @@ this phase the CEO plans top down (goal, bets, tasks), every open task names the
 review is built from connector data instead of agents' own summaries. This document is the implementation spec:
 an engineer builds from it, and the design rationale lives in [operating-model.md](../operating-model.md).
 
-Status: Planned. Branch `claude/phase-2-organize`, PR based on Phase 1. Depends on Phase 0
-([phase-0-stabilize.md](phase-0-stabilize.md): `routing.py`, `watchdog.py`, `notify.py`, `approvals` rows of
-action `question`, `tasks.notes`) and Phase 1 ([phase-1-connect.md](phase-1-connect.md): `metrics.source`,
-`connectors.py`, the vault). See also [architecture.md](../architecture.md), [owner-experience.md](../owner-experience.md)
-and [testing.md](../testing.md).
+Status: in progress. Branch `claude/phase-2-organize`, based on the code of Phases 0, 0.5 and 1 (pull request
+JackL725/Holdco#4 brings 0.5 and 1 into `main`). Depends on Phase 0 ([phase-0-stabilize.md](phase-0-stabilize.md)),
+Phase 0.5 ([phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md)) and Phase 1
+([phase-1-connect.md](phase-1-connect.md)). See also [architecture.md](../architecture.md),
+[owner-experience.md](../owner-experience.md) and [testing.md](../testing.md).
+
+What Phase 0.5 and Phase 1 change in this design, decided at the start of the build:
+- Founding is staged (research, charter, critic, plan). The charter stage calls `set_strategy` and `set_goal` after
+  `update_charter`; the plan stage gives every first task a `goal_id` and `expected`.
+- The company block in the system prompt comes from `brain.company_section`: the digest once the brain has content,
+  otherwise Phase 0.5's charter core. The facts block (`truth.facts_section`) stays above it.
+- The planning prompt keeps Phase 0.5's header (nothing changed, waiting on the owner) first, then this phase's goals,
+  experiments, proposals and decisions due (`contracts.cycle_sections`), then the existing sections.
+- `ask_decision` reuses Phase 0.5's one-question-per-topic rules and the claims gate; decisions count toward the cap
+  of pending agent questions.
+- `gpu_hours_per_day` sits beside Phase 0.5's `daily_token_budget`; either stops dispatch and cycles for the day.
+- Role belts get `search`, `grep`, `edit_file`, `company_status` and `find_tool` at run time (Phases 0.5 and 1) on top of
+  the preset lists that `test_integrity` counts.
+- `write_brief` refuses a brief that states a number missing from its data block (once, listing the numbers), the same
+  anti-fabrication rule as Phase 0.5's claims gate.
+- End-to-end tests are numbered from `test_30`. Code lives in `brain.py`, `contracts.py` (task contracts, dependency
+  graph, budgets), `rhythms.py` and `decisions.py`; leases in `workspace.py`.
 
 ## Scope
 

@@ -7,7 +7,8 @@ import re
 import threading
 import traceback
 
-from . import bus, config, connectors, db, doctor, llm, planning, playbooks, presets, roles, tools, truth, vault, watchdog, workspace
+from . import (brain, bus, config, connectors, contracts, db, decisions, doctor, llm, planning, playbooks,  # noqa: F401
+               presets, rhythms, roles, tools, truth, vault, watchdog, workspace)
 from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
 
 # agent_id -> kind of run currently executing
@@ -141,7 +142,7 @@ def system_prompt(company: dict, agent: dict, kind: str, max_steps: int, task: d
         presets.render(roles.preset_key(agent), agent.get("focus") or ""),
         _shared_rules(kind, max_steps),
         _section(truth.facts_section, company),
-        "# The company\n" + _section(ctxsys.company_core, company),
+        _section(brain.company_section, company),
         _section(playbooks.section, company),
         _section(ctxsys.pinned_section, company),
         _section(truth.changes_section, company, agent, kind),
@@ -207,9 +208,11 @@ def cycle_prompt(company: dict, requested: bool = False) -> str:
     dec = "\n".join(f"- {d['status']}: {d['summary']}" + (f" (owner note: {d['feedback']})" if d["feedback"] else "")
                     for d in decided) or "(none)"
     header = _section(planning.cycle_header, company, requested)
+    organise = _section(contracts.cycle_sections, company)   # Phase 2: goals, experiments, proposals, reviews
     return (
         f"Run a planning cycle for {company['name']}.\n\n"
         + (header + "\n\n" if header else "")
+        + (organise + "\n\n" if organise else "")
         + f"## Open tasks\n{_task_lines(company, tools.OPEN_STATUSES, 'priority, id', 40)}\n\n"
         f"## Recently finished (with automatic deliverable checks)\n"
         f"{_task_lines(company, ('done', 'cancelled'), 'updated_at DESC', 8, verify=True)}\n\n"
@@ -241,12 +244,16 @@ def task_prompt(company: dict, task: dict) -> str:
     deliverable = task.get("deliverable") or "(not specified: choose a sensible file path and name it in finish)"
     acceptance = task.get("acceptance") or "(none given: use your role's definition of done)"
     routine = "\nThis is one of your recurring duties.\n" if task.get("routine") else ""
+    contract = _section(contracts.task_contract_section, task)   # Phase 2: goal, inputs, due, budget, checks
+    data = _section(rhythms.task_data_section, company, task)     # Phase 2: the numbers a brief may use
     return (
         f"Your assignment: task #{task['id']}: {task['title']}\n"
         f"Priority: p{task['priority']}. Created by {task['created_by']}.{routine}\n"
-        f"Details:\n{task['description'] or '(none)'}\n\n"
+        + (contract + "\n\n" if contract else "")
+        + f"Details:\n{task['description'] or '(none)'}\n\n"
         f"Deliverable: {deliverable}\n"
         f"Acceptance criteria:\n{acceptance}\n{prior}{retry}\n"
+        + (data + "\n\n" if data else "") +
         f"Files in the company folder (newest first):\n{workspace.tree_text(company, 40)}\n\n"
         "Do the task now. If only the owner can unblock you, use ask_owner and finish with status 'waiting'."
     )
@@ -408,6 +415,16 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
         max_steps = min(max_steps, 8)
     task = db.get_task(task_id) if task_id else None
     ts = db.now()
+    if task and kind == "task":
+        problem = contracts.start_problem(task)   # Phase 2: a task whose token budget is used up does not start
+        if problem:
+            db.update("tasks", task["id"], status="blocked", updated_at=ts,
+                      result=((task["result"] or "") + f"\n[Holdco] {problem}").strip()[-6000:])
+            bus.emit(company["id"], "task", f"task #{task['id']} blocked: {problem}", agent_id, {"task_id": task["id"]})
+            with _running_lock:
+                _running.pop(agent_id, None)
+            return
+        max_steps = contracts.max_steps_for(company, task, max_steps)
     if task:
         db.update("tasks", task["id"], status="in_progress", attempts=(task["attempts"] or 0) + 1, updated_at=ts)
         task = db.get_task(task["id"])
@@ -761,6 +778,12 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
         if kind == "cycle":
             db.update("companies", cid, last_cycle_at=ts)
         db.run("UPDATE companies SET tokens_used = tokens_used + ? WHERE id=?", (tokens, cid))
+        for hook in (lambda: workspace.release(run_id), lambda: contracts.after_run(task, tokens),
+                     lambda: rhythms.after_run(company, task, ctx, status)):   # Phase 2: leases, budgets, weekly review
+            try:
+                hook()
+            except Exception:
+                traceback.print_exc()
         # Reasoning events are bulky: keep the latest 1500 per company (full transcripts stay in the session log).
         db.run("DELETE FROM events WHERE company_id=? AND kind IN ('think','result') AND id < "
                "COALESCE((SELECT MIN(id) FROM (SELECT id FROM events WHERE company_id=? AND kind IN ('think','result') "

@@ -45,6 +45,7 @@ class Ctx:
     # Phase 1: connector tools find_tool loaded into this session (specs the model sees from its next step on)
     loaded_tools: list = field(default_factory=list)
     loaded_by_name: dict = field(default_factory=dict)
+    brief_written: str = ""   # Phase 2: the kind of brief write_brief stored in this run (a brief is a deliverable)
 
 
 @dataclass
@@ -274,6 +275,9 @@ def write_file(ctx: Ctx, path: str, content: str, append: bool = False) -> str:
     # Phase 0.5 guards: records/ and context/ protection, log-like names, future dates, unsupported claims,
     # and the one charter path. Each returns the full refusal text or None.
     full = (p.read_text(encoding="utf-8", errors="replace") + content) if append and p.exists() else content
+    refusal = workspace.lease(ctx.company, r, ctx)   # Phase 2: another run is editing this file
+    if refusal:
+        return refusal
     for guard in (truth.write_guard, planning.charter_write_hook):
         refusal = guard(ctx, r, full)
         if refusal:
@@ -315,6 +319,9 @@ def delete_file(ctx: Ctx, path: str) -> str:
             except Exception:
                 pass
         return msg
+    refusal = workspace.lease(ctx.company, workspace.rel(ctx.company, p), ctx)   # Phase 2: file leases
+    if refusal:
+        return refusal
     dest = workspace.trash(ctx.company, p)
     _log(ctx, "file", f"moved {path} to trash")
     return f"Moved to {dest}."
@@ -540,6 +547,9 @@ def mark_email_handled(ctx: Ctx, email_id: int, note: str = "") -> str:
       {"platform": S("x, linkedin, reddit, instagram, facebook, threads, bluesky..."),
        "content": S("The post text"), "link": S("Optional URL to include")}, ("platform", "content"))
 def social_post(ctx: Ctx, platform: str, content: str, link: str = "") -> str:
+    refusal = contracts.post_budget_problem(ctx)   # Phase 2: the weekly post budget
+    if refusal:
+        return refusal
     return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "social_post",
                         {"platform": platform.lower(), "content": content, "link": link})
 
@@ -707,6 +717,8 @@ def _written_for_task(ctx: Ctx, rel_path: str, is_dir: bool) -> bool:
 
 def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     """None if fine, otherwise what's wrong. Only checks things that look like file paths."""
+    if ctx.brief_written:
+        return None   # Phase 2: a rhythm's deliverable is the brief it stored with write_brief
     d = (deliverable or "").strip().strip("`'\"")
     if not d or " " in d or not re.fullmatch(r"[\w./-]+", d) or not ("/" in d or "." in d):
         return None
@@ -824,5 +836,6 @@ def role_tools(agent: dict, kind: str) -> list[dict]:
 from . import watchdog  # noqa: E402,F401  (note_progress lives with the working-notes logic)
 from . import context, planning, truth  # noqa: E402,F401  (Phase 0.5: search, guards, owner questions)
 from . import connectors, browser  # noqa: E402,F401  (Phase 1: find_tool, connector routing, browser_check)
+from . import brain, contracts, decisions, rhythms  # noqa: E402,F401  (Phase 2: brain, contracts, rhythms, decisions)
 for _name, _t in REGISTRY.items():   # tools registered before BUILTIN_RISK existed in a module keep their tag
     _t.risk = _t.risk if _t.risk != "write" else BUILTIN_RISK.get(_name, "write")

@@ -76,6 +76,43 @@ CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, task_id INTEGER, claim TEXT, url TEXT,
     quote TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS strategy (
+    company_id INTEGER PRIMARY KEY, one_liner TEXT DEFAULT '', icp TEXT DEFAULT '', problem TEXT DEFAULT '',
+    offer TEXT DEFAULT '', price TEXT DEFAULT '', positioning TEXT DEFAULT '', voice TEXT DEFAULT '', updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY, company_id INTEGER, title TEXT, metric TEXT DEFAULT '', target REAL, current REAL,
+    deadline TEXT DEFAULT '', owner_role TEXT DEFAULT '', status TEXT DEFAULT 'active', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY, company_id INTEGER, name TEXT DEFAULT '', email TEXT DEFAULT '', company TEXT DEFAULT '',
+    role TEXT DEFAULT '', stage TEXT DEFAULT 'lead', source TEXT DEFAULT '', consent TEXT DEFAULT '',
+    unsubscribed INTEGER DEFAULT 0, last_touch TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY, company_id INTEGER, what TEXT, why TEXT DEFAULT '', expected TEXT DEFAULT '',
+    review_at TEXT DEFAULT '', outcome TEXT DEFAULT '', decided_by TEXT DEFAULT '', reversible INTEGER DEFAULT 1,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY, company_id INTEGER, goal_id INTEGER, hypothesis TEXT, metric TEXT DEFAULT '',
+    start TEXT DEFAULT '', stop TEXT DEFAULT '', result TEXT DEFAULT '', verdict TEXT DEFAULT 'pending', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY, company_id INTEGER, text TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS brain_changes (
+    id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, section TEXT, payload TEXT DEFAULT '{}',
+    reason TEXT DEFAULT '', status TEXT DEFAULT 'pending', decided_at TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS leases (
+    company_id INTEGER, path TEXT, task_id INTEGER, agent_id INTEGER, run_id INTEGER, expires_at TEXT,
+    PRIMARY KEY (company_id, path)
+);
+CREATE TABLE IF NOT EXISTS briefs (
+    id INTEGER PRIMARY KEY, company_id INTEGER, kind TEXT, body TEXT, data TEXT DEFAULT '{}', created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_goals_company ON goals(company_id, status);
+CREATE INDEX IF NOT EXISTS ix_contacts_company ON contacts(company_id, stage);
+CREATE INDEX IF NOT EXISTS ix_briefs_company ON briefs(company_id, kind, id);
 CREATE TABLE IF NOT EXISTS connectors (
     id INTEGER PRIMARY KEY, company_id INTEGER, key TEXT, enabled INTEGER DEFAULT 1, config TEXT DEFAULT '{}',
     status TEXT DEFAULT '', detail TEXT DEFAULT '', last_check TEXT, created_at TEXT
@@ -138,7 +175,13 @@ MIGRATIONS = {
               # Phase 0: working notes that survive retries, and how often a task changed hands (watchdog)
               "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0",
               # Phase 0.5: outreach | deploy | post | purchase | ask | research | build | write
-              "kind": "TEXT DEFAULT ''"},
+              "kind": "TEXT DEFAULT ''",
+              # Phase 2: the task contract
+              "goal_id": "INTEGER", "expected": "TEXT DEFAULT ''", "inputs": "TEXT DEFAULT ''",
+              "depends_on": "TEXT DEFAULT '[]'", "due_at": "TEXT DEFAULT ''", "budget_steps": "INTEGER DEFAULT 0",
+              "budget_tokens": "INTEGER DEFAULT 0", "checks": "TEXT DEFAULT ''", "tokens_used": "INTEGER DEFAULT 0"},
+    # Phase 2: who decided a decision (owner, telegram or deadline)
+    "approvals": {"decided_by": "TEXT DEFAULT ''"},
     # Phase 0.5: the change stamp and backoff that stop idle re-planning
     "companies": {"last_cycle_stamp": "TEXT DEFAULT ''", "cycle_backoff": "INTEGER DEFAULT 0"},
     # Phase 1: where a number came from (a connector key, or 'manual' when an agent typed it)
