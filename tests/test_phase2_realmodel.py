@@ -7,6 +7,9 @@ model never does, each replayed through the real code:
 - the CEO set budget_steps=3 and budget_tokens=200 on every task it created;
 - it assigned work by name ("Echo") instead of role;
 - it queued its own "Write daily brief" task next to the scheduled evening brief;
+- the second run's briefs said "Revenue (30 days)" for stripe.revenue_usd_30d and were refused for the 30, and the
+  evening brief's finish named a file that never exists, so the next planning cycle reported the brief MISSING;
+- the CEO set tasks to in_progress with update_task, where no run would ever pick them up;
 - the weekly review wrote its memo to a file, marked its own task done with update_task and finished without
   write_brief, so no weekly brief was stored (finish's brief check is tests.test_phase2_review's; this file replays
   the real run against it).
@@ -27,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("HOLDCO_DATA", tempfile.mkdtemp(prefix="holdco-realmodel-"))
 
-from holdco import db, llm, rhythms, roles, tools, workspace  # noqa: E402
+from holdco import agents, db, llm, rhythms, roles, tools, workspace  # noqa: E402
 
 db.init()
 
@@ -164,6 +167,28 @@ class TestWeeklyReviewMustStoreItsBrief(Base):
         self.ctx.brief_written = "weekly"
         tools.execute(self.ctx, "finish", {"summary": "Memo stored", "status": "done"})
         self.assertEqual(self.ctx.finish_status, "done")
+
+    def test_metric_windows_in_names_may_be_stated(self):
+        data = {"metrics": [{"name": "stripe.revenue_usd_30d", "value": 57, "source": "stripe"},
+                            {"name": "email.sent_7d", "value": 34, "source": "email"}]}
+        body = "Revenue (30 days): $57 (Stripe). Emails sent in 7 days: 34. Signups: 12."
+        self.assertEqual(rhythms.unsupported_numbers(body, data), ["12"])
+
+    def test_the_brief_is_the_deliverable_not_a_path(self):
+        self.ctx.brief_written = "weekly"
+        bid = db.run("INSERT INTO briefs(company_id, kind, body, data, created_at) VALUES(?,?,?,?,?)",
+                     (self.c["id"], "weekly", "# Memo", "{}", db.now()))
+        tools.execute(self.ctx, "finish", {"summary": "Memo stored", "status": "done",
+                                           "deliverable": "briefs/weekly-2026-10-16.md"})
+        self.assertEqual(self.ctx.finish_status, "done")
+        self.assertEqual(self.ctx.deliverable, f"the weekly memo (brief #{bid}, on the Overview)")
+        self.assertEqual(agents.deliverable_status(self.c, self.ctx.deliverable), "")   # never reported MISSING
+
+    def test_in_progress_by_hand_is_queued_as_todo(self):
+        other = make_task(self.c, "engineering", "Build the landing page", status="blocked")
+        out = tools.execute(self.ctx, "update_task", {"task_id": other["id"], "status": "in_progress", "goal_id": 0})
+        self.assertIn("queued as todo", out)
+        self.assertEqual(db.get_task(other["id"])["status"], "todo")
 
     def test_morning_plan_needs_no_brief(self):
         self.assertEqual(rhythms.brief_kind({"routine": rhythms.MORNING_KEY}), "")

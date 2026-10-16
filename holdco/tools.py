@@ -436,10 +436,15 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         # The real-model run marked its own weekly review done with update_task, skipping finish's checks.
         return (f"ERROR: task #{task_id} is the task you are working on now. End it with finish (status done, "
                 f"partial, blocked or waiting), not update_task.")
+    queued = ""
     if status:
         status = status.strip().lower()
         if status not in TASK_STATUSES:
             raise ToolError(f"Status must be one of {', '.join(TASK_STATUSES)}")
+        if status == "in_progress" and t["status"] != "in_progress":
+            # Holdco marks a task in progress when an agent starts it; set by hand, no run would ever pick it up.
+            status = "todo"
+            queued = " It is queued as todo: Holdco marks a task in_progress when an agent starts it."
         fields["status"] = status
     if note:
         fields["result"] = ((t["result"] or "") + f"\n[{ctx.agent['name']}] {note}").strip()
@@ -457,7 +462,7 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
     db.update("tasks", task_id, **fields)
     _log(ctx, "task", f"updated task #{task_id}{' → ' + status if status else ''}", task_id=task_id)
     bus.notify("tasks", company_id=ctx.company["id"])
-    return f"Task #{task_id} updated."
+    return f"Task #{task_id} updated.{queued}"
 
 
 @tool("list_tasks", "List the company's tasks.", {"status": S("open (default), done, or all")})
@@ -772,8 +777,7 @@ def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     task = ctx.task or {}
     kind = rhythms.brief_kind(task)
     if kind:
-        if ctx.brief_written == kind or db.one("SELECT id FROM briefs WHERE company_id=? AND kind=? AND created_at>=?",
-                                               (ctx.company["id"], kind, task.get("created_at") or "")):
+        if ctx.brief_written == kind or rhythms.stored_brief(ctx.company["id"], task):
             return None
         return (f"this task's deliverable is the {rhythms.BRIEF_LABEL[kind]}, and none is stored yet: write it with "
                 f"write_brief(kind=\"{kind}\", body=...)")
@@ -828,6 +832,11 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     if status not in ("done", "partial", "blocked", "waiting"):
         status = "done"
     target = deliverable or (ctx.task or {}).get("deliverable", "")
+    brief = rhythms.stored_brief(ctx.company["id"], ctx.task) if ctx.task else None
+    if brief:
+        # The brief is the deliverable, not the file path the model names for it (the real-model run named
+        # briefs/daily-<date>.md, which never exists, and the next planning cycle flagged it MISSING).
+        target = f"the {rhythms.BRIEF_LABEL[brief['kind']]} (brief #{brief['id']}, on the Overview)"
     if ctx.kind == "founding" and ctx.founding_stage:
         # Phase 0.5: founding runs have no task, so each stage's own deliverable is checked instead, whatever the
         # status. Once: the stage gets one more chance to save it, then its finish is accepted with a note.

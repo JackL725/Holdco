@@ -41,6 +41,15 @@ def brief_kind(task: dict | None) -> str:
     return KIND_OF.get((task or {}).get("routine") or "", "")
 
 
+def stored_brief(company_id: int, task: dict | None) -> dict | None:
+    """The newest brief of the task's kind stored since the task was created (in this run or an earlier attempt)."""
+    kind = brief_kind(task)
+    if not kind:
+        return None
+    return db.one("SELECT id, kind, created_at FROM briefs WHERE company_id=? AND kind=? AND created_at>=? "
+                  "ORDER BY id DESC LIMIT 1", (company_id, kind, (task or {}).get("created_at") or ""))
+
+
 # POST /api/companies/<id>/rhythms/<key>/run: the routine keys to try, in order (the evening brief is the analyst's
 # when the company has one, otherwise the CEO's).
 RUN_KEYS = {"morning": (MORNING_KEY,), "evening": EVENING_KEYS, "weekly": (WEEKLY_KEY,), "monthly": (MONTHLY_KEY,)}
@@ -475,6 +484,7 @@ _LIST_MARK = re.compile(r"^\s*(?:[-*+•]\s+)?\(?\d{1,2}[.)]\s", re.M)    # "1. 
 # A number may carry a size suffix ($1.5k, 10M, $2bn) or be a multiple (3x): those are claims too.
 _NUM_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(k|K|m|M|bn|BN|x|X)?(?!\w|[.,]\d)")
 _SCALE = {"k": 1e3, "m": 1e6, "bn": 1e9}
+_NAME_RE = re.compile(r"[A-Za-z][\w]*(?:\.[\w]+)*")   # a metric or key name such as email.sent_7d
 
 
 def _numbers(text: str) -> list[tuple[str, float, float]]:
@@ -515,6 +525,8 @@ def _data_numbers(x, out: set) -> set:
         out.add(abs(float(x)))
     elif isinstance(x, str):
         out.update(v for _raw, v in numbers_in(x))
+        if _NAME_RE.fullmatch(x):   # a metric's window is part of its name: "30 days" for stripe.revenue_usd_30d
+            out.update(float(d) for d in re.findall(r"\d+", x))
     elif isinstance(x, dict):
         nums = {k: float(v) for k, v in x.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
         if nums and len(nums) == len(x):   # a table of counts, like approvals_pending: its size and its total

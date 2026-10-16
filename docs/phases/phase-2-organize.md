@@ -39,6 +39,10 @@ Changes made after the first real-model run (gpt-oss:20b on the owner's GPU, `te
   `write_brief` call to make, then accepted as `partial`; `update_task` cannot close the task the agent is running.
 - `assign_to` accepts an agent's name as well as its role, and agents cannot create tasks that duplicate a rhythm
   ("Write daily brief").
+- From the second run: a brief may state the window in a metric's name ("30 days" for `stripe.revenue_usd_30d`); a
+  brief task's deliverable is recorded as the brief ("the weekly memo (brief #3, on the Overview)") instead of the
+  file path the model names, which the next planning cycle reported as missing; `update_task` queues a task the
+  model sets to `in_progress` as `todo`, since only a starting run may mark it in progress.
 
 ## Scope
 
