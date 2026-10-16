@@ -36,6 +36,11 @@ KIND_OF = {MORNING_KEY: "", EVENING_KEYS[0]: "daily", EVENING_KEYS[1]: "daily", 
 BRIEF_LABEL = {"daily": "daily brief", "weekly": "weekly memo", "monthly": "monthly memo"}
 # POST /api/companies/<id>/rhythms/<key>/run: the routine keys to try, in order (the evening brief is the analyst's
 # when the company has one, otherwise the CEO's).
+def brief_kind(task: dict | None) -> str:
+    """The brief a rhythm task must store ("daily", "weekly", "monthly"), or "" for other tasks and the morning plan."""
+    return KIND_OF.get((task or {}).get("routine") or "", "")
+
+
 RUN_KEYS = {"morning": (MORNING_KEY,), "evening": EVENING_KEYS, "weekly": (WEEKLY_KEY,), "monthly": (MONTHLY_KEY,)}
 
 DATA_CAP = 12000              # characters of JSON in the prompt

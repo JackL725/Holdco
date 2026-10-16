@@ -211,8 +211,10 @@ class TestCreateTaskContract(Base):
         self.assertTrue(out.startswith("Created task #"), out)
         self.assertNotIn("serves no goal", out)
         t = db.get_task(int(out.split("#")[1].split(" ")[0]))
-        self.assertEqual((t["goal_id"], t["expected"], t["inputs"], t["budget_steps"], t["budget_tokens"]),
-                         (self.g2, "signup rate from 3% to 5%", "research/market.md", 12, 40000))
+        # Budgets are the owner's: the tool no longer offers them (gpt-oss set 3 steps and 200 tokens on every task
+        # in a real run), so the model's values are dropped and the company defaults apply.
+        self.assertEqual((t["goal_id"], t["expected"], t["inputs"], t["budget_steps"] or 0, t["budget_tokens"] or 0),
+                         (self.g2, "signup rate from 3% to 5%", "research/market.md", 0, 0))
         self.assertEqual(t["checks"], "browser_check site/index.html\naudit_page site/index.html")
         self.assertEqual(t["depends_on"], "[]")
         due = db.parse_time(t["due_at"])
@@ -276,10 +278,10 @@ class TestCreateTaskContract(Base):
                               "audit_page, review_text, check_contrast, fetch_url (one check per line, for example "
                               "'browser_check site/index.html').")
         self.assertEqual(self.create(title="X5", goal_id=self.g1, due_days=91), "ERROR: due_days must be 1 to 90.")
-        self.assertEqual(self.create(title="X6", goal_id=self.g1, budget_steps=2),
-                         "ERROR: budget_steps must be 3 to 60 (tool calls per attempt).")
-        self.assertEqual(self.create(title="X7", goal_id=self.g1, budget_steps=61),
-                         "ERROR: budget_steps must be 3 to 60 (tool calls per attempt).")
+        for steps in (2, 61):   # the owner's task form shares the validator
+            with self.assertRaises(contracts.ContractError) as e:
+                contracts.validate(self.c["id"], {"budget_steps": steps})
+            self.assertEqual(str(e.exception), "budget_steps must be 3 to 60 (tool calls per attempt).")
         self.assertIsNone(db.one("SELECT id FROM tasks WHERE company_id=? AND title LIKE 'X%'", (self.c["id"],)))
 
     def test_update_task_and_list_tasks(self):

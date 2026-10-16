@@ -535,3 +535,17 @@ def budget_status(company: dict) -> dict:
             "daily_email_limit": int(cs.get("daily_email_limit") or 0),
             "steps_per_task": int(float(cs.get("steps_per_task") or 0)),
             "money_usd": float(cs.get("money_usd") or 0), "money_approved_month": round(money, 2)}
+
+
+# Holdco creates the rhythms on schedule; a planning cycle that queues its own "daily brief" duplicates them.
+_RHYTHM_TITLE = re.compile(r"\b(daily|evening|morning|weekly|monthly)\s+(brief|briefing|review|plan|memo|report|"
+                           r"strategy check)\b", re.I)
+
+
+def rhythm_task_problem(ctx, title: str) -> str | None:
+    """create_task by an agent: a task that duplicates a rhythm is refused with what to do instead."""
+    if ctx.kind == "founding" or not _RHYTHM_TITLE.search(title or ""):
+        return None
+    return ("ERROR: Holdco runs the morning plan, evening brief, weekly review and monthly check itself, on schedule "
+            "(the owner can also start them from the Overview). Don't create tasks for them; plan the work that "
+            "moves a goal.")

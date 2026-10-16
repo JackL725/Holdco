@@ -30,6 +30,16 @@ What Phase 0.5 and Phase 1 change in this design, decided at the start of the bu
 - End-to-end tests are numbered from `test_30`. Code lives in `brain.py`, `contracts.py` (task contracts, dependency
   graph, budgets), `rhythms.py` and `decisions.py`; leases in `workspace.py`.
 
+Changes made after the first real-model run (gpt-oss:20b on the owner's GPU, `tests/test_phase2_realmodel.py`):
+- `create_task` does not offer `budget_steps` or `budget_tokens` to agents: the model set 3 steps and 200 tokens on
+  every task it created, which would have starved them. Budgets stay on the owner's task form and in the API.
+- A tool call whose arguments are wrapped in a second call object (`{"name": "functions.create_task", "arguments":
+  {...}}`), or named with the `functions.` prefix, is unwrapped; founding's plan stage had ended with no tasks.
+- `finish` on an evening brief, weekly review or monthly check that stored no brief is refused once with the
+  `write_brief` call to make, then accepted as `partial`; `update_task` cannot close the task the agent is running.
+- `assign_to` accepts an agent's name as well as its role, and agents cannot create tasks that duplicate a rhythm
+  ("Write daily brief").
+
 ## Scope
 
 In this phase:

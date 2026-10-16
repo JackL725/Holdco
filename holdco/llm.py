@@ -267,6 +267,30 @@ def extract_json(text: str):
     return None
 
 
+def _bare_name(name: str, tool_names: set[str]) -> str:
+    """gpt-oss sometimes names a tool with its harmony namespace, "functions.create_task"; drop the prefix when the
+    rest is a tool of this session."""
+    name = (name or "").strip()
+    if name not in tool_names and name.startswith("functions.") and name[len("functions."):] in tool_names:
+        return name[len("functions."):]
+    return name
+
+
+def unwrap_call(name: str, args: dict, tool_names: set[str]) -> tuple[str, dict]:
+    """A native tool call whose arguments are a second call object, {"name": "functions.create_task", "arguments":
+    {...}} (seen with gpt-oss in a real founding run): take the inner arguments. A tool argument that only happens to
+    be called "name" is left alone: the wrapper must name this same tool and hold an arguments object."""
+    name = _bare_name(name, tool_names)
+    keys = set(args or {})
+    inner = (args or {}).get("arguments", (args or {}).get("args", (args or {}).get("parameters")))
+    if keys and keys <= {"name", "tool", "function", "arguments", "args", "parameters"} and inner is not None:
+        inner_name = _bare_name(str(args.get("name") or args.get("tool") or args.get("function") or name), tool_names)
+        inner = _parse_args(inner)
+        if inner_name == name and inner:
+            return name, inner
+    return name, args
+
+
 def _text_tool_call(text: str, tool_names: set[str]) -> ToolCall | None:
     obj = extract_json(text)
     if not isinstance(obj, dict):
@@ -275,6 +299,8 @@ def _text_tool_call(text: str, tool_names: set[str]) -> ToolCall | None:
     args = obj.get("args", obj.get("arguments", obj.get("parameters", {})))
     if isinstance(args, str):
         args = extract_json(args) or {}
+    if isinstance(name, str):
+        name = _bare_name(name, tool_names)
     if isinstance(name, str) and name in tool_names and isinstance(args, dict):
         return ToolCall(name=name, arguments=args)
     return None
@@ -416,6 +442,8 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     content, inline_thoughts = split_thinking(content)
     if inline_thoughts:
         thinking = (thinking + "\n\n" + inline_thoughts).strip() if thinking else inline_thoughts
+    if tools:
+        calls = [ToolCall(*unwrap_call(c.name, c.arguments, names), id=c.id) for c in calls]
     if tools and not calls:
         tc = _text_tool_call(content, names)
         if tc:

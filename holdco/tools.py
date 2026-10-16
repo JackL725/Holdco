@@ -47,6 +47,7 @@ class Ctx:
     loaded_by_name: dict = field(default_factory=dict)
     brief_written: str = ""   # Phase 2: the kind of brief write_brief stored in this run (a brief is a deliverable)
     brief_warned: bool = False   # Phase 2: write_brief refused once a brief with numbers its data does not hold
+    brief_missing_warned: bool = False   # Phase 2: finish refused once a brief task that stored no brief
 
 
 @dataclass
@@ -334,10 +335,18 @@ def _team_roles(ctx: Ctx) -> dict[str, dict]:
     return {a["role"]: a for a in db.q("SELECT * FROM agents WHERE company_id=? AND enabled=1", (ctx.company["id"],))}
 
 
+def _role_named(team: dict[str, dict], assign_to: str) -> str:
+    """The role key for assign_to, which models give as a role ("marketing") or a name ("Echo")."""
+    wanted = (assign_to or "").strip().lower()
+    if wanted in team:
+        return wanted
+    return next((r for r, a in team.items() if (a.get("name") or "").strip().lower() == wanted), wanted)
+
+
 @tool("create_task", "Create a task for a teammate (or yourself). Keep it small enough for one work session.",
       {"title": S("Short imperative title"),
        "description": S("Objective, inputs (files to read), and what's out of scope"),
-       "assign_to": S("Role of the teammate (see the Team list)"),
+       "assign_to": S("Role or name of the teammate (see the Team list)"),
        "deliverable": S("Where the result will be: a file path like site/index.html, or an action like 'email queued'"),
        "acceptance": S("3-5 checkable acceptance criteria, one per line"),
        "priority": I("1 = urgent, 2 = normal, 3 = later"),
@@ -347,8 +356,6 @@ def _team_roles(ctx: Ctx) -> dict[str, dict]:
        "inputs": S("Files and facts to read first"),
        "depends_on": S("Task ids that must be done first, e.g. 12, 14"),
        "due_days": I("Due in this many days (1-90)"),
-       "budget_steps": I("Tool calls per attempt (3-60)"),
-       "budget_tokens": I("Tokens allowed across attempts"),
        "checks": S("Tool checks to run when it is done, one per line, e.g. browser_check site/index.html")},
       ("title", "assign_to"))
 def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", deliverable: str = "",
@@ -359,8 +366,11 @@ def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", del
     refusal = truth.task_guard(ctx, kind, title)
     if refusal:
         return refusal
+    refusal = contracts.rhythm_task_problem(ctx, title)
+    if refusal:
+        return refusal
     team = _team_roles(ctx)
-    role = assign_to.strip().lower()
+    role = _role_named(team, assign_to)
     if role not in team:
         match = next((r for r in team if r in role or role in r), None)
         if not match:
@@ -423,6 +433,10 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
     if not t or t["company_id"] != ctx.company["id"]:
         raise ToolError(f"Task #{task_id} not found.")
     fields: dict = {"updated_at": db.now()}
+    if status and ctx.task and ctx.task["id"] == t["id"]:
+        # The real-model run marked its own weekly review done with update_task, skipping finish's checks.
+        return (f"ERROR: task #{task_id} is the task you are working on now. End it with finish (status done, "
+                f"partial, blocked or waiting), not update_task.")
     if status:
         status = status.strip().lower()
         if status not in TASK_STATUSES:
@@ -432,9 +446,9 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         fields["result"] = ((t["result"] or "") + f"\n[{ctx.agent['name']}] {note}").strip()
     if assign_to:
         team = _team_roles(ctx)
-        role = assign_to.strip().lower()
+        role = _role_named(team, assign_to)
         if role not in team:
-            raise ToolError(f"No teammate with role '{assign_to}'.")
+            raise ToolError(f"No teammate with role '{assign_to}'. Team roles: {', '.join(team)}")
         fields.update(role=role, agent_id=team[role]["id"])
         if role != (t["role"] or ""):
             fields["reassigned"] = int(t.get("reassigned") or 0) + 1   # the watchdog spots tasks that keep bouncing
@@ -826,6 +840,17 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         if waiting_on is None:
             status = "blocked"
             open_issues = (open_issues + "\nNothing was waiting on the owner for this task.").strip()
+    if status == "done" and ctx.task and not ctx.brief_written:
+        # Phase 2: the evening brief, weekly review and monthly check exist to store a brief; a file is not one.
+        kind = rhythms.brief_kind(ctx.task)
+        if kind and not ctx.brief_missing_warned:
+            ctx.brief_missing_warned = True
+            return (f"Not finished yet: this task's deliverable is the {kind} brief, and none is stored. Call "
+                    f"write_brief(kind=\"{kind}\", body=...) with it (numbers only from the data in your task), "
+                    f"then call finish again.")
+        if kind:
+            status = "partial"
+            open_issues = (open_issues + f"\nNo {kind} brief was stored with write_brief.").strip()
     if status == "done" and ctx.task:
         problem = _deliverable_ok(ctx, target)
         if problem and not ctx.finish_warned:
