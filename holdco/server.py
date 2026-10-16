@@ -13,7 +13,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, backup, bus, config, context, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
+from . import actions, agents, backup, bus, config, context, contracts, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -209,7 +209,8 @@ def api_company(h, m, body):
     return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": metrics,
             "email_ready": emailer.outbound(c, cs) is not None, "inbox_ready": emailer.imap_configured(cs),
             "has_site": workspace.safe_path(c, "site/index.html").exists(),
-            "folder": str(workspace.root(c))}
+            "folder": str(workspace.root(c)),
+            "budgets": contracts.budget_status(c)}   # Phase 2: "GPU budget used: 4.2 of 6 h" and the Budgets section
 
 
 # Company settings Holdco manages itself (staged founding, notices, the one-time truth check). The dashboard never
@@ -437,13 +438,32 @@ def api_run(h, m, body):
 
 # ======================= tasks =======================
 
+CONTRACT_FIELDS = ("goal_id", "expected", "inputs", "depends_on", "due_days", "due_at", "budget_steps",
+                   "budget_tokens", "checks")   # Phase 2: the task contract the owner's form can set
+
+
+def _contract(company_id: int, b: dict, task: dict | None = None) -> dict:
+    """The contract fields of a task form, checked by the same rules as create_task (400 with the reason)."""
+    try:
+        return contracts.validate(company_id, {k: b[k] for k in CONTRACT_FIELDS if k in b}, task)
+    except contracts.ContractError as e:
+        raise HTTPError(400, str(e))
+
+
+def _task_out(t: dict, statuses: dict | None = None) -> dict:
+    """A task row as the dashboard reads it: depends_on as a list and blocked_by (Phase 2)."""
+    return {**t, **contracts.api_fields(t, statuses)}
+
+
 @route("GET", r"/api/companies/(\d+)/tasks")
 def api_tasks(h, m, body):
     c = _company_or_404(m.group(1))
-    base = "SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id WHERE t.company_id=? "
+    base = ("SELECT t.*, a.name AS agent_name, g.title AS goal_title FROM tasks t LEFT JOIN agents a ON "
+            "a.id=t.agent_id LEFT JOIN goals g ON g.id=t.goal_id WHERE t.company_id=? ")
     open_rows = db.q(base + "AND t.status NOT IN ('done','cancelled') ORDER BY t.priority, t.id", (c["id"],))
     closed = db.q(base + "AND t.status IN ('done','cancelled') ORDER BY t.updated_at DESC LIMIT 40", (c["id"],))
-    return {"tasks": open_rows + closed}
+    statuses = contracts.dependency_status(open_rows)
+    return {"tasks": [_task_out(t, statuses) for t in open_rows] + [_task_out(t, {}) for t in closed]}
 
 
 @route("POST", r"/api/companies/(\d+)/tasks")
@@ -456,15 +476,18 @@ def api_task_create(h, m, body):
     agent = db.get_agent(_int(b.get("agent_id"))) if b.get("agent_id") else None
     if not agent or agent["company_id"] != c["id"]:
         agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
+    contract = _contract(c["id"], b)
     ts = db.now()
     kind = truth.classify_task(title, b.get("description", ""), b.get("deliverable") or "", b.get("kind") or "")
-    tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (c["id"], title[:200], b.get("description", ""), agent["role"], agent["id"], "todo",
-                  max(1, min(_int(b.get("priority"), 1), 3)), "owner", (b.get("deliverable") or "").strip()[:200],
-                  (b.get("acceptance") or "").strip()[:2000], kind, ts, ts))
+    cols = {"company_id": c["id"], "title": title[:200], "description": b.get("description", ""),
+            "role": agent["role"], "agent_id": agent["id"], "status": "todo",
+            "priority": max(1, min(_int(b.get("priority"), 1), 3)), "created_by": "owner",
+            "deliverable": (b.get("deliverable") or "").strip()[:200],
+            "acceptance": (b.get("acceptance") or "").strip()[:2000], "kind": kind, "created_at": ts,
+            "updated_at": ts, **contract}
+    tid = db.run(f"INSERT INTO tasks({', '.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(cols.values()))
     bus.emit(c["id"], "task", f"created task #{tid} for {agent['name']}: {title}", None, {"task_id": tid, "by": "owner"})
-    return {"task": db.get_task(tid)}
+    return {"task": _task_out(db.get_task(tid))}
 
 
 @route("PATCH", r"/api/tasks/(\d+)")
@@ -473,7 +496,7 @@ def api_task_patch(h, m, body):
     if not t:
         raise HTTPError(404, "Task not found")
     b = body or {}
-    fields = {"updated_at": db.now()}
+    fields = {"updated_at": db.now(), **_contract(t["company_id"], b, t)}
     if b.get("status") in ("todo", "done", "blocked", "waiting", "cancelled"):
         fields["status"] = b["status"]
     for k in ("title", "description", "deliverable", "acceptance"):
@@ -489,7 +512,7 @@ def api_task_patch(h, m, body):
         fields["result"] = ((t["result"] or "") + f"\n[Owner] {b['note'].strip()}").strip()
     db.update("tasks", t["id"], **fields)
     bus.notify("tasks", company_id=t["company_id"])
-    return {"task": db.get_task(t["id"])}
+    return {"task": _task_out(db.get_task(t["id"]))}
 
 
 # ======================= chat, memory, metrics, email, events =======================
@@ -662,7 +685,9 @@ def api_approval_retry(h, m, body):
 @route("GET", r"/api/companies/(\d+)/files")
 def api_files(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"files": workspace.tree(c, ".", depth=6, limit=800)}
+    # Phase 2: leases are the files an agent is editing right now ("editing: Forge" in the Files tab). The owner's
+    # own edits (PUT below) ignore them: the owner is the board.
+    return {"files": workspace.tree(c, ".", depth=6, limit=800), "leases": workspace.leases(c)}
 
 
 @route("GET", r"/api/companies/(\d+)/file")

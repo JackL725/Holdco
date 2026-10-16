@@ -174,14 +174,39 @@ def deliverable_status(company: dict, path: str) -> str:
     return f"[check: {d} is MISSING]"
 
 
-def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: bool = False) -> str:
+def _goal_label(t: dict, goals: dict[int, str]) -> str:
+    """The group a task line sits in when open tasks are grouped by goal (Phase 2)."""
+    if t.get("goal_id"):
+        return f"Goal #{t['goal_id']}" + ("" if goals.get(t["goal_id"]) == "active" else " (closed)")
+    if t.get("routine"):
+        return "Recurring duty"
+    return "No goal (owner's task)" if t.get("created_by") == "owner" else "No goal"
+
+
+def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: bool = False,
+                by_goal: bool = False) -> str:
+    """One line per task. by_goal (the planning prompt's open tasks, Phase 2): each line starts with the goal it
+    serves ("Goal #1: ", "No goal: ", "Recurring duty: ") and the lines are grouped that way. Open task lines
+    carry their due date and the tasks they wait on."""
     rows = db.q(f"SELECT * FROM tasks WHERE company_id=? AND status IN ({','.join('?' * len(statuses))}) "
                 f"ORDER BY {order} LIMIT {limit}", (company["id"], *statuses))
+    deps = contracts.dependency_status(rows) if not verify else {}
+    goals: dict[int, str] = {}
+    if by_goal:
+        goals = {g["id"]: g["status"] for g in db.q("SELECT id, status FROM goals WHERE company_id=? ORDER BY id",
+                                                    (company["id"],))}
+        # By goal, then tasks with no goal, the owner's, routines; priority order within a group (a stable sort).
+        rank = {"No goal": 1, "No goal (owner's task)": 2, "Recurring duty": 3}
+        rows.sort(key=lambda t: (0, t["goal_id"]) if t.get("goal_id") else (rank[_goal_label(t, goals)], 0))
     out = []
     for t in rows:
         line = f"#{t['id']} [{t['status']}] ({t['role']}) p{t['priority']} {t['title']}"
+        if by_goal:
+            line = f"{_goal_label(t, goals)}: {line}"
         if t.get("deliverable"):
             line += f" -> {t['deliverable']}"
+        if not verify:
+            line += contracts.task_tags(t, deps, goal=not by_goal)   # Phase 2: due date, what it waits on
         if verify:
             chk = deliverable_status(company, t.get("deliverable", ""))
             if chk:
@@ -213,7 +238,8 @@ def cycle_prompt(company: dict, requested: bool = False) -> str:
         f"Run a planning cycle for {company['name']}.\n\n"
         + (header + "\n\n" if header else "")
         + (organise + "\n\n" if organise else "")
-        + f"## Open tasks\n{_task_lines(company, tools.OPEN_STATUSES, 'priority, id', 40)}\n\n"
+        + "## Open tasks (grouped by goal)\n"
+        + f"{_task_lines(company, tools.OPEN_STATUSES, 'priority, id', 40, by_goal=True)}\n\n"
         f"## Recently finished (with automatic deliverable checks)\n"
         f"{_task_lines(company, ('done', 'cancelled'), 'updated_at DESC', 8, verify=True)}\n\n"
         f"## Owner's recent decisions\n{dec}\n\n"
@@ -222,10 +248,14 @@ def cycle_prompt(company: dict, requested: bool = False) -> str:
         "## Your job now\n"
         "Start from the Facts, Since your last session and Waiting on the owner sections of your instructions: they "
         "are the real state, and everything under Waiting on the owner is already asked. If nothing changed and the "
-        "open work waits on the owner, finish now with status 'waiting'. Otherwise follow your workflow. In short: "
-        "verify the finished work above (reopen anything MISSING or weak), pick at most 3 priorities, cancel stale "
-        f"tasks, create at most {room} new tasks (each with deliverable and acceptance), handle anything the owner "
-        "asked for, and report to the owner only if something matters. Then call finish."
+        "open work waits on the owner, finish now with status 'waiting'. Otherwise plan top down. For each goal: "
+        "what is the biggest gap between current and target, which 1-2 bets could close it, and which tasks does "
+        "each bet need. Write each bet as start_experiment(goal_id, hypothesis, metric, stop_days) and give its "
+        "tasks that goal_id and an expected effect. Verify the finished work above (reopen anything MISSING or "
+        "weak), conclude experiments that are due, review brain proposals, cancel stale tasks or tasks with no goal, "
+        f"create at most {room} new tasks (each with goal_id, expected, deliverable, acceptance, and checks where a "
+        "tool can verify the work), handle anything the owner asked for, and report to the owner only if something "
+        "matters. Then call finish."
     )
 
 

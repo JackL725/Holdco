@@ -340,9 +340,20 @@ def _team_roles(ctx: Ctx) -> dict[str, dict]:
        "deliverable": S("Where the result will be: a file path like site/index.html, or an action like 'email queued'"),
        "acceptance": S("3-5 checkable acceptance criteria, one per line"),
        "priority": I("1 = urgent, 2 = normal, 3 = later"),
-       "kind": S("Optional: outreach, deploy, post, purchase, ask, research, build or write")}, ("title", "assign_to"))
+       "kind": S("Optional: outreach, deploy, post, purchase, ask, research, build or write"),
+       "goal_id": I("The active goal this task serves, e.g. 1"),
+       "expected": S("What this task should move and by how much"),
+       "inputs": S("Files and facts to read first"),
+       "depends_on": S("Task ids that must be done first, e.g. 12, 14"),
+       "due_days": I("Due in this many days (1-90)"),
+       "budget_steps": I("Tool calls per attempt (3-60)"),
+       "budget_tokens": I("Tokens allowed across attempts"),
+       "checks": S("Tool checks to run when it is done, one per line, e.g. browser_check site/index.html")},
+      ("title", "assign_to"))
 def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", deliverable: str = "",
-                acceptance: str = "", priority: int = 2, kind: str = "") -> str:
+                acceptance: str = "", priority: int = 2, kind: str = "", goal_id: int = 0, expected: str = "",
+                inputs: str = "", depends_on: str = "", due_days: int = 0, budget_steps: int = 0,
+                budget_tokens: int = 0, checks: str = "") -> str:
     kind = truth.classify_task(title, description, deliverable, kind)
     refusal = truth.task_guard(ctx, kind, title)
     if refusal:
@@ -371,23 +382,42 @@ def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", del
                            f"({','.join('?' * len(OPEN_STATUSES))})", (ctx.company["id"], *OPEN_STATUSES))
     if open_count >= 40:
         raise ToolError("There are already 40 open tasks. Finish or cancel some first.")
+    # Phase 2: the task contract (goal, expected effect, inputs, dependencies, deadline, budgets, checks).
+    if not goal_id and ctx.task and ctx.task.get("goal_id") and db.one(
+            "SELECT id FROM goals WHERE id=? AND company_id=? AND status='active'",
+            (ctx.task["goal_id"], ctx.company["id"])):
+        goal_id = ctx.task["goal_id"]   # a follow-up serves the goal of the task it came from
+    contract = contracts.validate(ctx.company["id"], {
+        "goal_id": goal_id, "expected": expected, "inputs": inputs, "depends_on": depends_on, "due_days": due_days,
+        "budget_steps": budget_steps, "budget_tokens": budget_tokens, "checks": checks})
     ts = db.now()
-    tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (ctx.company["id"], title.strip()[:200], description, role, team[role]["id"], "todo",
-                  max(1, min(int(priority or 2), 3)), ctx.agent["name"], deliverable.strip()[:200],
-                  acceptance.strip()[:2000], kind, ts, ts))
+    cols = {"company_id": ctx.company["id"], "title": title.strip()[:200], "description": description, "role": role,
+            "agent_id": team[role]["id"], "status": "todo", "priority": max(1, min(int(priority or 2), 3)),
+            "created_by": ctx.agent["name"], "deliverable": deliverable.strip()[:200],
+            "acceptance": acceptance.strip()[:2000], "kind": kind, "created_at": ts, "updated_at": ts, **contract}
+    tid = db.run(f"INSERT INTO tasks({', '.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(cols.values()))
     _log(ctx, "task", f"created task #{tid} for {team[role]['name']}: {title}", task_id=tid)
     bus.notify("tasks", company_id=ctx.company["id"])
-    tip = "" if deliverable.strip() and acceptance.strip() else \
-        " Tip: tasks with a deliverable and acceptance criteria get finished far more reliably."
+    tips = []
+    if not (deliverable.strip() and acceptance.strip()):
+        tips.append("tasks with a deliverable and acceptance criteria get finished far more reliably.")
+    if contract.get("goal_id") and not contract.get("expected"):
+        tips.append("say what it should move with expected.")
+    tip = (" Tip: " + " Also ".join(tips)) if tips else ""
+    warning = contracts.no_goal_warning(ctx.company["id"], tid) \
+        if ctx.agent.get("role") == "ceo" and not contract.get("goal_id") else None
+    if warning:
+        return warning + tip
     return f"Created task #{tid} for {team[role]['name']} ({role}).{tip}"
 
 
 @tool("update_task", "Change a task's status or add a note (e.g. cancel a stale task, unblock one, record progress).",
       {"task_id": I("Task number"), "status": S("todo, in_progress, done, blocked, waiting or cancelled"),
-       "note": S("A short note to add"), "assign_to": S("Reassign to another role")}, ("task_id",))
-def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign_to: str = "") -> str:
+       "note": S("A short note to add"), "assign_to": S("Reassign to another role"),
+       "goal_id": I("Attach the task to this active goal"), "due_days": I("Due in this many days from now (1-90)")},
+      ("task_id",))
+def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign_to: str = "", goal_id: int = 0,
+                due_days: int = 0) -> str:
     t = db.get_task(task_id)
     if not t or t["company_id"] != ctx.company["id"]:
         raise ToolError(f"Task #{task_id} not found.")
@@ -407,6 +437,9 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         fields.update(role=role, agent_id=team[role]["id"])
         if role != (t["role"] or ""):
             fields["reassigned"] = int(t.get("reassigned") or 0) + 1   # the watchdog spots tasks that keep bouncing
+    change = {k: v for k, v in (("goal_id", goal_id), ("due_days", due_days)) if v}
+    if change:
+        fields.update(contracts.validate(ctx.company["id"], change, t))   # Phase 2: attach a goal, move the deadline
     db.update("tasks", task_id, **fields)
     _log(ctx, "task", f"updated task #{task_id}{' → ' + status if status else ''}", task_id=task_id)
     bus.notify("tasks", company_id=ctx.company["id"])
@@ -425,8 +458,10 @@ def list_tasks(ctx: Ctx, status: str = "open") -> str:
                     f" ORDER BY priority, id", (ctx.company["id"], *OPEN_STATUSES))
     if not rows:
         return "No tasks."
+    statuses = contracts.dependency_status(rows)   # Phase 2: goal, due date and what each task waits on
     return "\n".join(f"#{t['id']} [{t['status']}] ({t['role']}) p{t['priority']} {t['title']}"
                      + (f" -> {t['deliverable']}" if t.get("deliverable") else "")
+                     + contracts.task_tags(t, statuses)
                      + (f" | {t['result'][-160:]}" if t["result"] else "") for t in rows)
 
 

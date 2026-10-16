@@ -70,7 +70,8 @@ class Scheduler(threading.Thread):
             if agents.running_count() >= capacity:
                 return
             self._maybe_cycle(c)
-        # 2) Recurring duties from each agent's preset (morning report, follow-ups, weekly reviews...).
+        # 2) Recurring duties from each agent's preset (morning report, follow-ups, weekly reviews...). A company
+        #    over its token or GPU budget still gets them: they queue until the budget resets.
         for c in companies:
             if time.time() - self._last_routines.get(c["id"], 0) >= ROUTINE_CHECK_SECONDS:
                 self._last_routines[c["id"]] = time.time()
@@ -79,10 +80,13 @@ class Scheduler(threading.Thread):
         open_tasks = db.q(
             "SELECT t.* FROM tasks t JOIN companies c ON c.id=t.company_id "
             "WHERE c.status='active' AND t.status='todo' ORDER BY t.priority, t.id LIMIT 200")
-        over: dict[int, bool] = {}   # the daily budget, looked up once per company per tick
+        deps = contracts.dependency_status(open_tasks)   # Phase 2: one query for every dependency in the queue
+        over: dict[int, bool] = {}   # the daily budgets (tokens, GPU hours), looked up once per company per tick
         for t in open_tasks:
             if agents.running_count() >= capacity:
                 return
+            if not contracts.dispatchable(t, deps):
+                continue   # Phase 2: a dependency is not done or cancelled yet
             agent = db.get_agent(t["agent_id"]) if t["agent_id"] else None
             if not agent or not agent["enabled"]:
                 agent = db.one("SELECT * FROM agents WHERE company_id=? AND role=? AND enabled=1",
@@ -92,15 +96,13 @@ class Scheduler(threading.Thread):
                 db.update("tasks", t["id"], agent_id=agent["id"])
             if agents.is_running(agent["id"]):
                 continue
-            if not contracts.dispatchable(t):
-                continue   # Phase 2: a dependency is not done or cancelled yet
             if t["created_by"] != "owner":   # tasks the owner created still run over the budget
                 if t["company_id"] not in over:
                     company = db.get_company(t["company_id"])
                     over[t["company_id"]] = bool(company and (planning.over_budget(company)
                                                               or contracts.over_gpu_budget(company)))
                 if over[t["company_id"]]:
-                    continue   # the company used its daily token budget; owner chat and owner tasks still work
+                    continue   # the company used its daily tokens or GPU hours; owner chat and owner tasks still work
             agents.start(agent["id"], "task", task_id=t["id"])
 
     def _housekeeping(self, s: dict) -> None:
@@ -176,6 +178,8 @@ class Scheduler(threading.Thread):
             return
         cs = db.company_settings(c)
         since = db.minutes_since(c["last_cycle_at"])
+        # A todo task waiting on a dependency (Phase 2) still counts as open work: a team whose queue all waits on
+        # one task is busy, not idle, so it does not trigger a cycle (the due trigger and the watchdog still look).
         open_n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN ('todo','in_progress')",
                            (c["id"],)) or 0
         due = since >= float(cs.get("cycle_minutes") or 60)
