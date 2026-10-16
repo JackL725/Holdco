@@ -168,6 +168,17 @@ def on_decided(row: dict, answer: str, decided_by: str) -> None:
             bus.notify("companies")
 
 
+def on_dismissed(row: dict) -> None:
+    """actions.decide: the owner dismissed a decision without choosing. Nothing is recorded in the brain, but a
+    strategy proposal it carried is rejected: otherwise it would wait as 'owner' for good, and the agent could never
+    propose that change again."""
+    p = db.loads(row.get("payload"), {}) or {}
+    origin = p.get("origin") if isinstance(p.get("origin"), dict) else {}
+    if origin.get("kind") == "brain_change":
+        from . import brain   # imported here: brain imports tools, which imports this module
+        brain.on_owner_decision(row["company_id"], origin, "Reject it")
+
+
 def resolve_due() -> None:
     """Scheduler (every tick): reversible decisions past their deadline take the recommended option; irreversible
     ones stay pending and the owner is reminded once a day. The kill switch holds auto-resolution."""

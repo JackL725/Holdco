@@ -2171,6 +2171,12 @@ def outreach_guard(ctx: Ctx, to: str, subject: str, body: str) -> tuple[str | No
             reasons.append(f"{bad}; use a real address you found in a source")
         elif suppressed(to):
             reasons.append(f"{_addr(to)} asked not to be emailed again (they replied stop or unsubscribe)")
+        else:
+            # Phase 2: a contact marked unsubscribed in the brain is never emailed again (operating-model.md).
+            gone = db.one("SELECT id FROM contacts WHERE company_id=? AND lower(email)=? AND unsubscribed=1",
+                          (company["id"], _addr(to)))
+            if gone:
+                reasons.append(f"{_addr(to)} is unsubscribed (contact #{gone['id']}); never email them again")
         # Someone who wrote to the company first gets a reply, not commercial email: CAN-SPAM exempts these
         # relationship messages, and a support answer with an opt-out footer would read oddly.
         a = _addr(to)

@@ -94,8 +94,9 @@ def _dump(data) -> str:
 
 
 def _connector(sql_alias: str = "") -> str:
+    """SQL: the row came from a connector. An empty source is manual, as everywhere else (the digest, the API)."""
     col = f"{sql_alias}source" if sql_alias else "source"
-    return f"COALESCE({col}, 'manual') != 'manual'"
+    return f"COALESCE(NULLIF({col}, ''), 'manual') != 'manual'"
 
 
 def _latest(cid: int, name: str, before: str = "", connector_only: bool = False) -> dict | None:
@@ -460,16 +461,18 @@ _DATE_RES = [re.compile(p, re.I) for p in (
     rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}(?:,?\s+\d{{4}})?",      # 14 Oct 2026
     r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]\.?m\.?)?",                           # 18:00, 6:30 pm
     r"\b\d{1,2}\s?[ap]\.?m\b\.?",                                               # 6 pm
-    r"\b(?:19|20)\d{2}\b",                                                      # a year
+    r"(?<![$€£])\b(?:19|20)\d{2}\b",                                            # a year ($2000 is money)
 )]
 _HEADING_MARK = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
 _LIST_MARK = re.compile(r"^\s*(?:[-*+•]\s+)?\(?\d{1,2}[.)]\s", re.M)    # "1. ", "2) ", "- 3. "
-_NUM_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(?!\w|[.,]\d)")
+# A number may carry a size suffix ($1.5k, 10M, $2bn) or be a multiple (3x): those are claims too.
+_NUM_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(k|K|m|M|bn|BN|x|X)?(?!\w|[.,]\d)")
+_SCALE = {"k": 1e3, "m": 1e6, "bn": 1e9}
 
 
-def numbers_in(text: str) -> list[tuple[str, float]]:
-    """The numbers a text states, as (as written, value). Leaves out what is not a claim: dates and times, list
-    numbering, file paths, URLs, and digits inside names (sent_7d, week3.md, 1st)."""
+def _numbers(text: str) -> list[tuple[str, float, float]]:
+    """numbers_in with each number's rounding room: 0 for a number written out, half its last digit times the
+    suffix for a scaled one ($1.5k is anything from 1,450 to 1,550)."""
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     t = _URL_RE.sub(" ", t)
     t = _PATH_RE.sub(" ", t)
@@ -479,12 +482,21 @@ def numbers_in(text: str) -> list[tuple[str, float]]:
     t = _LIST_MARK.sub(" ", t)
     out = []
     for m in _NUM_RE.finditer(t):
-        raw = m.group(1) + (m.group(2) or "")
+        raw = m.group(1) + (m.group(2) or "") + (m.group(3) or "")
+        scale = _SCALE.get((m.group(3) or "").lower(), 1.0)
         try:
-            out.append((raw, float(raw.replace(",", ""))))
+            value = float((m.group(1) + (m.group(2) or "")).replace(",", "")) * scale
         except ValueError:
-            pass
+            continue
+        room = 0.5 * scale * 10 ** -len((m.group(2) or ".")[1:]) if scale > 1 else 0.0
+        out.append((raw, value, room))
     return out
+
+
+def numbers_in(text: str) -> list[tuple[str, float]]:
+    """The numbers a text states, as (as written, value). Leaves out what is not a claim: dates and times, list
+    numbering, file paths, URLs, and digits inside names (sent_7d, week3.md, 1st). $1.5k counts as 1500."""
+    return [(raw, value) for raw, value, _room in _numbers(text)]
 
 
 def _data_numbers(x, out: set) -> set:
@@ -536,9 +548,10 @@ def unsupported_numbers(body: str, data: dict, extra: str = "") -> list[str]:
     allowed = _data_numbers(data, {0.0, 1.0})
     allowed.update(v for _raw, v in numbers_in(extra))
     out: list[str] = []
-    for raw, value in numbers_in(body):
-        if raw not in out and not _known(abs(value), allowed):
-            out.append(raw)
+    for raw, value, room in _numbers(body):
+        if raw in out or _known(abs(value), allowed) or (room and any(abs(abs(value) - a) <= room for a in allowed)):
+            continue
+        out.append(raw)
     return out
 
 
