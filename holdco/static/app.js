@@ -423,13 +423,23 @@ function Portfolio() {
         <div class="right">${s.approvals ? `<span class="badge warn">${plural(s.approvals, 'request')} for you</span>` : ''}<span class="faint small">${s.last_event ? 'Active ' + rel(s.last_event) : ''}</span></div></a>`;
     }).join('');
   };
+  // Phase 2: the latest portfolio brief (company_id 0), built in code once a day, pinned above the companies.
+  const loadBrief = async () => {
+    const r = await GET('/api/briefs/latest?company_id=0').catch(() => null);
+    const box = el && $('#pf-brief', el);
+    if (!box) return;
+    const b = r && r.daily;
+    box.innerHTML = b ? `<section class="panel brief-panel"><div class="panel-head"><h2>Portfolio brief</h2><span class="small faint">${when(b.created_at)}</span></div>
+      <div class="panel-body">${briefBody(b)}</div></section>` : '';
+  };
+  const loadBriefSoon = debounce(() => loadBrief().catch(() => {}), 800);
   return {
     async mount(holder) {
       el = holder;
       const hasCos = S.st && S.st.companies.some((c) => c.status !== 'archived');
       el.innerHTML = `<div class="page-head"><div><h1>Portfolio</h1><p class="sub" id="pf-sub"></p></div>
         <div class="actions"><a class="btn primary" href="#/new">Start a company</a></div></div>
-        <div id="pf-doctor"></div>
+        <div id="pf-doctor"></div><div id="pf-brief"></div>
         ${hasCos ? `<div class="cols"><section class="panel" id="pf-list"></section>
           <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="pf-feed"></div></section></div>`
         : `<section class="panel empty"><h2>Start your first company</h2>
@@ -439,8 +449,10 @@ function Portfolio() {
       if (hasCos) mountFeed($('#pf-feed', el), 0);
       else checkModel($('#model-check', el));
       draw();
+      if (hasCos) await loadBrief();
     },
     onState: draw,
+    live(ev) { if (ev.type === 'briefs' || (ev.type === 'event' && ev.kind === 'brief')) loadBriefSoon(); },
   };
 }
 
@@ -630,16 +642,45 @@ function syncSecrets(form, values, untouchedOnly = false) {
   });
 }
 
+// ---------------------------------------------------------------- phase 2: briefs, decisions, task contracts
+// docs/phases/phase-2-organize.md. CHECK_TOOLS is kept in step with contracts.CHECK_TOOLS, EXEMPT_CREATORS with
+// rhythms.EXEMPT_CREATORS (tasks the weekly review never cancels for serving no goal).
+const CHECK_TOOLS = ['browser_check', 'audit_page', 'review_text', 'check_contrast', 'fetch_url'];
+const EXEMPT_CREATORS = ['owner', 'routine', 'inbox'];
+const OPEN_STATUSES = ['todo', 'in_progress', 'blocked', 'waiting'];
+const capFirst = (s) => { const t = String(s ?? ''); return t ? t[0].toUpperCase() + t.slice(1) : t; };
+const shortDate = (iso) => { const t = new Date(iso); return Number.isNaN(t.getTime()) ? String(iso || '') : t.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); };
+const fmtHours = (n, digits = 1) => String(Number((Number(n) || 0).toFixed(digits)));
+
+// A decision's deadline: "auto in 31 h" when it is reversible (the recommended option is taken then), "waits for
+// you" when it is not (it never resolves on its own).
+function decisionDeadline(p) {
+  if (p.reversible === false) return { cls: 'warn', text: 'waits for you', title: 'It cannot be undone, so it never resolves on its own.' };
+  const t = Date.parse(p.deadline_at || '');
+  if (!Number.isFinite(t)) return { cls: '', text: 'no deadline', title: '' };
+  const h = (t - Date.now()) / 3600000;
+  const text = h <= 0 ? 'auto any minute' : h < 1 ? `auto in ${Math.max(1, Math.round(h * 60))} min` : h < 72 ? `auto in ${Math.round(h)} h` : `auto in ${Math.round(h / 24)} days`;
+  return { cls: 'accent', text, title: `If you have not answered by ${new Date(t).toLocaleString()}, the recommended option is taken.` };
+}
+
+// Briefs are Markdown the model wrote (the portfolio brief is built in code): md() escapes everything first.
+const BRIEF_LABEL = { daily: 'Daily brief', weekly: 'Weekly memo', monthly: 'Monthly check' };
+const briefBody = (b) => `<div class="brief">${md(b.body)}</div>`;
+function showBrief(b, title) {
+  modal({ title: title || BRIEF_LABEL[b.kind] || 'Brief', wide: true, body: `<p class="faint small" style="margin-top:0">Written ${when(b.created_at)}</p>${briefBody(b)}` });
+}
+
 // ---------------------------------------------------------------- inbox
 const ACTION_VERB = {
   send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
   http_post: 'wants to send data to an outside service', run_code: 'wants to run code on this PC',
   spend_money: 'wants you to buy something', question: 'has a question', connector_call: 'wants to use a connected service',
+  decision: 'needs you to decide',
 };
 
 const ACTION_LABEL = {
   send_email: 'Send email', social_post: 'Social post', deploy_site: 'Deploy website', http_post: 'Outside request',
-  run_code: 'Run code', spend_money: 'Purchase', question: 'Question', connector_call: 'Connected service',
+  run_code: 'Run code', spend_money: 'Purchase', question: 'Question', connector_call: 'Connected service', decision: 'Decision',
 };
 
 const platformName = (p) => ({ x: 'X', twitter: 'X', linkedin: 'LinkedIn', reddit: 'Reddit', instagram: 'Instagram', facebook: 'Facebook', threads: 'Threads', bluesky: 'Bluesky', tiktok: 'TikTok', youtube: 'YouTube' }[(p || '').toLowerCase()] || p || 'social media');
@@ -709,6 +750,29 @@ function requestCard(a) {
   </article>`;
 }
 
+// Phase 2: "which of these should we do?" One button per option (the recommended one primary), the context folded,
+// and when it resolves on its own. Answered through the same route as a question: the option is the answer and the
+// note goes as feedback; dismissing it (reject without an answer) records no choice.
+function decisionCard(a) {
+  const agent = S.agents[a.agent_id] || { name: a.agent_name || 'An agent', role: a.agent_role || '' };
+  const p = a.payload || {};
+  const opts = Array.isArray(p.options) ? p.options.map((o) => String(o)).filter((o) => o.trim()) : [];
+  const rec = String(p.recommended || '');
+  const due = decisionDeadline(p);
+  const after = p.reversible === false ? 'It cannot be undone, so it waits for your answer.'
+    : rec && due.text.startsWith('auto') ? `If you don't answer, "${esc(rec)}" is taken ${esc(due.text.replace(/^auto /, ''))}.` : '';
+  return `<article class="req dec" data-req="${a.id}">
+    <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${ACTION_VERB.decision}</span>
+      <div class="faint small req-meta"><span>Decision #${esc(a.id)}</span><span class="badge ${due.cls}" title="${esc(due.title)}">${esc(due.text)}</span><span>${when(a.created_at)}</span></div></div></div>
+    <div class="fields"><div class="box md">${md(p.question)}</div>
+      ${p.context ? `<details class="dec-context"><summary class="small">Context</summary><p class="small muted">${esc(p.context)}</p></details>` : ''}
+      <div class="opts">${opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('')}</div>
+      ${after ? `<p class="small faint" style="margin:0">${after}</p>` : ''}
+      <label class="field">Note for the team (optional)<textarea data-k="feedback" rows="2" placeholder="Why you chose it, or what to do next"></textarea></label></div>
+    <div class="foot"><button class="btn sm ghost" data-act="decide" data-d="reject" title="Close it without choosing; the team decides within its own authority">Dismiss without choosing</button></div>
+  </article>`;
+}
+
 async function decideRequest(card, decision, preset = '') {
   const id = +card.dataset.req;
   const payload = {};
@@ -721,7 +785,8 @@ async function decideRequest(card, decision, preset = '') {
   try {
     const r = await api('POST', `/api/approvals/${id}`, { decision, payload, feedback, answer });
     const a = r.approval;
-    const msg = { done: 'Done.', rejected: feedback ? 'Rejected. The agent will revise it.' : 'Rejected.', answered: 'Answer sent.', failed: `Couldn't complete it: ${a.result} You can retry it from Recent decisions.` }[a.status] || a.status;
+    const dec = a.action === 'decision';
+    const msg = { done: 'Done.', rejected: dec ? 'Dismissed.' : feedback ? 'Rejected. The agent will revise it.' : 'Rejected.', answered: dec ? `Decided: ${a.result}` : 'Answer sent.', failed: `Couldn't complete it: ${a.result} You can retry it from Recent decisions.` }[a.status] || a.status;
     toast(msg.slice(0, 220), a.status === 'failed');
     card.remove();
     refreshState();
@@ -757,24 +822,36 @@ function Inbox() {
         ${a.result ? `<div class="small muted" style="margin-top:4px">${esc(String(a.result).slice(0, 120))}</div>` : ''}</div></li>`).join('')
       : '<li class="faint">Nothing has run yet. Approved and automatic actions are listed here.</li>';
   };
+  // GET /api/approvals returns decisions with the rest (Phase 2): they get their own panel above the requests.
+  // Cards already shown stay as they are, so a note being typed survives a refresh.
+  const fill = (list, rows, card) => {
+    const have = new Set($$('[data-req]', list).map((n) => +n.dataset.req));
+    const want = new Set(rows.map((a) => a.id));
+    $$('[data-req]', list).forEach((n) => { if (!want.has(+n.dataset.req)) n.remove(); });
+    rows.filter((a) => !have.has(a.id)).reverse().forEach((a) => {
+      a.company_slug = slugOf(a.company_id);
+      list.insertAdjacentHTML('afterbegin', card(a));
+    });
+  };
   const loadPending = async () => {
     const r = await GET('/api/approvals');
-    const list = $('#req-list', el);
-    const have = new Set($$('[data-req]', list).map((n) => +n.dataset.req));
-    const want = new Set(r.approvals.map((a) => a.id));
-    $$('[data-req]', list).forEach((n) => { if (!want.has(+n.dataset.req)) n.remove(); });
-    r.approvals.filter((a) => !have.has(a.id)).reverse().forEach((a) => {
-      a.company_slug = slugOf(a.company_id);
-      list.insertAdjacentHTML('afterbegin', requestCard(a));
-    });
-    $('#req-empty', el).classList.toggle('hidden', r.approvals.length > 0);
+    const decisions = r.approvals.filter((a) => a.action === 'decision');
+    const requests = r.approvals.filter((a) => a.action !== 'decision');
+    fill($('#dec-list', el), decisions, decisionCard);
+    fill($('#req-list', el), requests, requestCard);
+    $('#dec-panel', el).classList.toggle('hidden', !decisions.length);
+    const empty = $('#req-empty', el);
+    empty.classList.toggle('hidden', requests.length > 0);
+    empty.innerHTML = decisions.length ? '<p class="faint" style="margin:0">No requests waiting. The decisions above need you.</p>'
+      : `<h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code, spend money or use a connected service, it shows up here first. Decisions your team needs from you appear above them.</p>`;
   };
   const loadDecided = async () => {
     const r = await GET('/api/approvals?status=decided');
     const badge = { done: 'good', answered: 'good', rejected: '', failed: 'bad', running: 'accent' };
+    const by = { deadline: '<span class="badge" title="Nobody answered in time, so the recommended option was taken">decided by the deadline</span> ', telegram: '<span class="badge">from your phone</span> ' };
     $('#decided', el).innerHTML = r.approvals.length ? r.approvals.slice(0, 30).map((a) => `
       <li>${avatar(S.agents[a.agent_id] || { name: a.agent_name || '?', role: a.agent_role })}<div class="grow">
-        <div><span class="badge ${badge[a.status] || ''}">${esc(a.status)}</span> ${esc(a.summary)}</div>
+        <div><span class="badge ${badge[a.status] || ''}">${esc(a.action === 'decision' && a.status === 'rejected' ? 'dismissed' : a.status)}</span> ${by[a.decided_by] || ''}${esc(a.summary)}</div>
         <div class="faint small">${esc(a.company_name)}, ${when(a.decided_at)}${a.feedback ? `. Your note: ${esc(a.feedback)}` : ''}</div>
         ${a.result ? `<div class="small muted" style="margin-top:4px">${inline(a.result.slice(0, 400))}</div>` : ''}</div>
         ${a.status === 'failed' ? `<button class="btn sm" data-act="retry" data-id="${a.id}">Retry</button>` : ''}</li>`).join('')
@@ -783,9 +860,10 @@ function Inbox() {
   return {
     async mount(holder) {
       el = holder;
-      el.innerHTML = `<div class="page-head"><div><h1>Inbox</h1><p class="sub">Everything your companies want to send, publish, run or buy waits here. Edit anything before you approve it.</p></div></div>
-        <div class="stack"><section class="panel"><div id="req-list"></div>
-          <div id="req-empty" class="empty hidden"><h2>You're all caught up</h2><p>When an agent wants to email someone, post, deploy the site, run code, spend money or use a connected service, it shows up here first.</p></div></section>
+      el.innerHTML = `<div class="page-head"><div><h1>Inbox</h1><p class="sub">Decisions your team needs from you, then everything your companies want to send, publish, run or buy. Edit anything before you approve it.</p></div></div>
+        <div class="stack"><section class="panel hidden" id="dec-panel"><div class="panel-head"><h2>Decisions</h2><span class="small faint">Pick an option. If one can be undone, the recommended option is taken at its deadline.</span></div><div id="dec-list"></div></section>
+          <section class="panel"><div class="panel-head"><h2>Requests</h2></div><div id="req-list"></div>
+          <div id="req-empty" class="empty hidden"></div></section>
           <section class="panel"><div class="panel-head"><h2>Recent decisions</h2></div><ul class="decided" id="decided" style="padding-top:8px"></ul></section>
           <section class="panel"><div class="panel-head"><h2>Audit log</h2><span class="small faint">Every outbound action that ran, and who allowed it.</span></div><ul class="rows" id="audit" style="padding-top:8px"></ul></section></div>`;
       await loadConnectors().catch(() => null);   // connector_call cards name the service and what agents can do with it
@@ -1679,7 +1757,7 @@ async function companySearch(cid, q, scope) {
 }
 
 // ---------------------------------------------------------------- company
-const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['context', 'Context'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
+const TABS = [['overview', 'Overview'], ['chat', 'Chat'], ['tasks', 'Tasks'], ['brain', 'Brain'], ['team', 'Team'], ['mind', 'Thinking'], ['files', 'Files'], ['context', 'Context'], ['memory', 'Memory'], ['email', 'Email'], ['charter', 'Charter'], ['settings', 'Settings']];
 
 function CompanyView(cid, tab, arg) {
   let el, d, tabView;
@@ -1724,7 +1802,7 @@ function CompanyView(cid, tab, arg) {
       el = holder;
       await reload();
       el.innerHTML = `<div id="co-head">${head()}</div><div id="tab"></div>`;
-      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, team: TabTeam, mind: TabMind, files: TabFiles, context: TabContext, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
+      const factory = { overview: TabOverview, chat: TabChat, tasks: TabTasks, brain: TabBrain, team: TabTeam, mind: TabMind, files: TabFiles, context: TabContext, memory: TabMemory, email: TabEmail, charter: TabCharter, settings: TabSettings }[tab] || TabOverview;
       tabView = factory(cid, () => d, arg, async () => { await redrawHead(); tabView?.onCompany?.(); });
       await tabView.mount($('#tab', el));
     },
@@ -1779,8 +1857,11 @@ function metricTiles(metrics) {
   }).join('');
 }
 
+// Phase 2 rhythms the owner can start now (POST /rhythms/<key>/run creates the routine task at once).
+const RHYTHMS = [['morning', 'Morning plan'], ['evening', 'Evening brief'], ['weekly', 'Weekly review'], ['monthly', 'Monthly check']];
+
 function TabOverview(cid, data) {
-  let el, facts = null, plan = null;
+  let el, facts = null, plan = null, briefs = null, brainEmpty = false;
   const side = () => {
     const d = data();
     const c = d.company;
@@ -1794,6 +1875,7 @@ function TabOverview(cid, data) {
     } else if (c.status === 'paused') {
       banner = `<div class="banner warn"><div class="grow"><b>Paused.</b> Agents finish their current step and then wait. Chat still works.</div><button class="btn primary" data-act="status" data-s="active">Resume</button></div>`;
     }
+    if (brainEmpty && c.status === 'active') banner += `<div class="banner"><div class="grow"><b>Brain not written yet;</b> the CEO fills it in the next planning cycle. Until then agents read the charter.</div><a class="btn" href="#/c/${cid}/brain">Open the Brain</a></div>`;
     if (d.stats.approvals) banner += `<div class="banner warn"><div class="grow"><b>${plural(d.stats.approvals, 'request')} from ${esc(c.name)} ${d.stats.approvals === 1 ? 'is' : 'are'} waiting for you.</b></div><a class="btn" href="#/inbox">Review</a></div>`;
     $('#ov-banner', el).innerHTML = banner;
     $('#ov-team', el).innerHTML = d.agents.map((a) => `<li>${avatar(a)}<div class="info"><div><b>${esc(a.name)}</b> <span class="role">${esc(a.title)}</span></div>
@@ -1829,9 +1911,11 @@ function TabOverview(cid, data) {
     if (!box || !plan) return;
     const c = data().company;
     const b = plan.budget || {};
+    const gpu = data().budgets || null;   // Phase 2: GPU hours used today against the company's budget
     const lines = [];
     let alert = '';
     if (b.over) alert += `<div class="banner warn"><div class="grow"><b>Paused for today: daily token budget used.</b> ${fmtTokens(b.used)} of ${fmtTokens(b.budget)} tokens. Background work waits until midnight; chat and tasks you create still run.</div><a class="btn" href="#/c/${cid}/settings">Change the budget</a></div>`;
+    if (gpu && gpu.over_gpu_budget) alert += `<div class="banner warn"><div class="grow"><b>Paused for today: GPU budget used.</b> ${fmtHours(gpu.gpu_hours_today)} of ${fmtHours(gpu.gpu_hours_per_day, 2)} hours of model time. Agents pick up no new work until midnight UTC; chat and tasks you create still run.</div><a class="btn" href="#/c/${cid}/settings/budgets">Change the budget</a></div>`;
     $('#ov-plan-banner', el).innerHTML = alert;
     if (c.status === 'founding') {
       lines.push(`<li><b>Founding</b> ${plan.founding_stage === 'done' ? 'finished' : `stage ${Math.max(1, FOUNDING_STEPS.findIndex(([k]) => k === plan.founding_stage) + 1)} of 4`}${foundingSteps(plan.founding_stage)}</li>`);
@@ -1849,6 +1933,11 @@ function TabOverview(cid, data) {
     }
     const pct = b.budget ? Math.min(100, Math.round((100 * b.used) / b.budget)) : 0;
     lines.push(`<li><b>Tokens today</b> ${fmtTokens(b.used)}${b.budget ? ` of ${fmtTokens(b.budget)}` : ' (no daily limit)'}${b.budget ? `<div class="meter${b.over ? ' over' : ''}"><div class="bar"><span style="width:${pct}%"></span></div></div>` : ''}</li>`);
+    if (gpu && gpu.gpu_hours_per_day) {
+      const gpct = Math.min(100, Math.round((100 * gpu.gpu_hours_today) / gpu.gpu_hours_per_day));
+      lines.push(`<li><b>GPU budget used</b> ${fmtHours(gpu.gpu_hours_today)} of ${fmtHours(gpu.gpu_hours_per_day, 2)} h <a class="small" href="#/c/${cid}/settings/budgets">Change</a>
+        <div class="meter${gpu.over_gpu_budget ? ' over' : ''}"><div class="bar" role="meter" aria-valuemin="0" aria-valuemax="${esc(gpu.gpu_hours_per_day)}" aria-valuenow="${esc(gpu.gpu_hours_today)}" aria-label="GPU hours used today"><span style="width:${gpct}%"></span></div></div></li>`);
+    }
     lines.push(`<li><b>Playbook</b> ${plan.archetype ? esc(archetypeLabel(plan.archetype)) : 'none matched yet'} <a class="small" href="#/c/${cid}/settings">Change</a></li>`);
     box.innerHTML = `<ul class="know">${lines.join('')}</ul>`;
     side();
@@ -1860,11 +1949,33 @@ function TabOverview(cid, data) {
     if (pl) { plan = pl.planning; drawPlan(); }
   };
   const loadKnowSoon = debounce(() => loadKnow().catch(() => {}), 1500);
+  // Phase 2: the latest daily brief, links to the weekly memo and the monthly check, and "Run now" for each rhythm.
+  const drawBrief = () => {
+    const box = $('#ov-brief', el);
+    if (!box || !briefs) return;
+    const b = briefs.daily;
+    const links = ['weekly', 'monthly'].filter((k) => briefs[k])
+      .map((k) => `<button class="linkish small" data-act="brief" data-kind="${k}">${BRIEF_LABEL[k]}</button>`).join(' <span class="faint">·</span> ');
+    $('#ov-brief-meta', el).innerHTML = `${b ? `<span class="small faint">${when(b.created_at)}</span>` : ''}${links ? ` <span class="brief-links">${links}</span>` : ''}`;
+    const c = data().company;
+    box.innerHTML = (b ? briefBody(b) : `<p class="faint" style="margin:0">No daily brief yet. ${c.status === 'founding' ? 'The first one comes after founding.' : 'One is written every evening from Holdco\'s own numbers; press Evening brief below to get one now.'}</p>`)
+      + (c.status === 'founding' ? '' : `<div class="rhythms"><span class="small muted">Run now:</span>${RHYTHMS.map(([k, l]) => `<button class="btn sm" data-act="rhythm" data-key="${k}">${l}</button>`).join('')}</div>`);
+  };
+  const loadBriefs = async () => {
+    const [r, br] = await Promise.all([GET(`/api/briefs/latest?company_id=${cid}`).catch(() => null), GET(`/api/companies/${cid}/brain`).catch(() => null)]);
+    if (!el) return;
+    briefs = r || briefs || {};
+    if (br) brainEmpty = !!br.empty;
+    drawBrief();
+    side();
+  };
+  const loadBriefsSoon = debounce(() => loadBriefs().catch(() => {}), 1000);
   return {
     async mount(holder) {
       el = holder;
       el.innerHTML = `<div id="ov-banner"></div><div id="ov-plan-banner"></div><div class="cols">
-        <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="ov-feed"></div></section>
+        <div class="stack"><section class="panel"><div class="panel-head"><h2>Daily brief</h2><span id="ov-brief-meta"></span></div><div class="panel-body" id="ov-brief"><span class="spinner"></span></div></section>
+          <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="ov-feed"></div></section></div>
         <div class="stack"><section class="panel"><div class="panel-head"><h2>What your agents know</h2><span class="small faint">From Holdco's records</span></div><div class="panel-body" id="ov-know"><span class="spinner"></span></div></section>
           <section class="panel"><div class="panel-head"><h2>Planning</h2></div><div class="panel-body" id="ov-plan"><span class="spinner"></span></div></section>
           <section class="panel"><div class="panel-head"><h2>Team</h2><a class="small" href="#/c/${cid}/team">Manage</a></div><ul class="team-list" id="ov-team" style="padding-top:6px"></ul></section>
@@ -1874,15 +1985,26 @@ function TabOverview(cid, data) {
       side();
       // Connector labels for the metric tiles ("from Stripe"); the key stands in until they arrive.
       if ((data().metrics || []).some((m) => m.source && m.source !== 'manual') && !S.connectors) loadConnectors().then(() => { if (el) side(); }).catch(() => {});
-      await loadKnow();
+      await Promise.all([loadKnow(), loadBriefs()]);
     },
     live(ev) {
       if (['approvals', 'company', 'tasks'].includes(ev.type) || (ev.type === 'event' && !['think', 'result'].includes(ev.kind))) loadKnowSoon();
+      if (ev.type === 'briefs' || (ev.type === 'event' && (ev.kind === 'brief' || ev.kind === 'brain'))) loadBriefsSoon();
     },
-    onCompany: () => { side(); drawPlan(); },
-    async act(name) {
+    onCompany: () => { side(); drawPlan(); drawBrief(); },
+    async act(name, t) {
       if (name === 'refound') {
         try { await api('POST', `/api/companies/${cid}/refound`); toast('Founding restarted.'); } catch (e) { fail(e); }
+      }
+      if (name === 'brief' && briefs && briefs[t.dataset.kind]) showBrief(briefs[t.dataset.kind]);
+      if (name === 'rhythm') {
+        t.disabled = true;
+        try {
+          const r = await api('POST', `/api/companies/${cid}/rhythms/${encodeURIComponent(t.dataset.key)}/run`, {});
+          const who = (data().agentsById[r.task.agent_id] || {}).name || 'the team';
+          toast(r.created ? `${r.task.title} queued for ${who} as task #${r.task.id}.` : `${r.task.title} is already queued as task #${r.task.id}.`);
+        } catch (e) { fail(e); }
+        t.disabled = false;
       }
     },
   };
@@ -1945,14 +2067,33 @@ function TabChat(cid, data) {
 // ---- tasks
 const LANES = [['todo', 'To do', ['todo']], ['in_progress', 'In progress', ['in_progress']], ['waiting', 'Waiting or blocked', ['waiting', 'blocked']], ['done', 'Done', ['done', 'cancelled']]];
 
+// Phase 2 contract badges on a card: the goal it serves (its title on hover), "waiting on #12" (blocked_by),
+// "due Oct 30" (red once overdue) and, for open tasks an agent created without a goal, "No goal".
+function taskTags(t) {
+  const open = OPEN_STATUSES.includes(t.status);
+  const tags = [];
+  if (t.goal_id) tags.push(`<span class="badge accent" title="${esc(`Serves goal #${t.goal_id}${t.goal_title ? `: ${t.goal_title}` : ''}`)}">Goal #${esc(t.goal_id)}</span>`);
+  else if (open && !t.routine && !EXEMPT_CREATORS.includes(t.created_by || '')) {
+    tags.push('<span class="badge nogoal" title="An agent created this task without naming the goal it serves. The weekly review cancels it unless a goal is attached.">No goal</span>');
+  }
+  const waiting = open && Array.isArray(t.blocked_by) ? t.blocked_by : [];
+  if (waiting.length) tags.push(`<span class="badge warn" title="Starts once ${waiting.length === 1 ? 'that task is' : 'those tasks are'} done or cancelled">waiting on ${waiting.map((d) => `#${esc(d)}`).join(', ')}</span>`);
+  const due = Date.parse(t.due_at || '');
+  if (open && Number.isFinite(due)) {
+    const late = due < Date.now();
+    tags.push(`<span class="badge ${late ? 'bad' : ''}" title="${esc(`Due ${new Date(due).toLocaleString()}${late ? ' (overdue)' : ''}`)}">due ${esc(shortDate(t.due_at))}</span>`);
+  }
+  return tags.length ? `<div class="tags">${tags.join('')}</div>` : '';
+}
+
 function TabTasks(cid, data) {
-  let el, tasks = [];
+  let el, tasks = [], goals = [];
   const draw = () => {
     $('.board', el).innerHTML = LANES.map(([k, label, sts]) => {
       const items = tasks.filter((t) => sts.includes(t.status));
       return `<div class="lane"><h3><span>${label}</span><span class="num">${items.length}</span></h3>
         ${items.map((t) => `<button class="card st-${esc(t.status)}" data-act="task" data-id="${t.id}">
-          <div class="t">${esc(t.title)}</div><div class="m">${avatar(data().agentsById[t.agent_id] || { name: t.agent_name || '?', role: t.role }, 'sm')}
+          <div class="t">${esc(t.title)}</div>${taskTags(t)}<div class="m">${avatar(data().agentsById[t.agent_id] || { name: t.agent_name || '?', role: t.role }, 'sm')}
           <span>#${t.id}</span>${t.priority === 1 && !['done', 'cancelled'].includes(t.status) ? '<span class="p1">Urgent</span>' : ''}
           ${t.status === 'blocked' ? '<span style="color:var(--bad)">Blocked</span>' : ''}${t.status === 'waiting' ? '<span style="color:var(--warn)">Waiting on you</span>' : ''}
           <span style="margin-left:auto">${when(t.updated_at)}</span></div></button>`).join('') || '<div class="faint small" style="padding:4px">Nothing here.</div>'}</div>`;
@@ -1960,26 +2101,95 @@ function TabTasks(cid, data) {
   };
   const load = async () => { tasks = (await GET(`/api/companies/${cid}/tasks`)).tasks; draw(); };
   const loadSoon = debounce(() => load().catch(() => {}), 500);
+  // The goal select offers the brain's active goals (GET /brain); a task keeps a goal that has closed since.
+  const loadGoals = async () => { goals = ((await GET(`/api/companies/${cid}/brain`)).goals || []); };
+  const loadGoalsSoon = debounce(() => loadGoals().catch(() => {}), 800);
   const agentOptions = (sel) => data().agents.map((a) => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} (${esc(a.role)})</option>`).join('');
+  // The contract part of both task forms. task is the task being edited (null for a new one).
+  const contractFields = (task) => {
+    const gid = task && task.goal_id ? task.goal_id : '';
+    const active = goals.filter((g) => g.status === 'active');
+    const goalOpts = [['', 'No goal'], ...active.map((g) => [g.id, `#${g.id} ${g.title}`])];
+    if (gid && !active.some((g) => g.id === gid)) goalOpts.push([gid, `#${gid} ${task.goal_title || ''} (closed)`]);
+    const deps = task && Array.isArray(task.depends_on) ? task.depends_on : [];
+    const pick = tasks.filter((x) => (!task || x.id !== task.id) && (OPEN_STATUSES.includes(x.status) || deps.includes(x.id)));
+    const due = Date.parse((task && task.due_at) || '');
+    const daysLeft = Number.isFinite(due) ? Math.ceil((due - Date.now()) / 86400000) : 0;
+    const dueHint = !Number.isFinite(due) ? '1 to 90. Empty means no deadline.'
+      : daysLeft > 0 ? `Now due ${shortDate(task.due_at)}. Change it to move the deadline, empty it to remove it.`
+        : `It was due ${shortDate(task.due_at)}. Enter days to set a new deadline.`;
+    return `<div class="contract"><h3>Goal and contract</h3>
+      <div class="form-grid">
+        <label class="field">Goal it serves<span class="hint">Tasks an agent creates without a goal are cancelled at the weekly review.</span><select name="goal_id">${goalOpts.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(gid) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+        <label class="field">Due in days<span class="hint">${esc(dueHint)}</span><input type="number" name="due_days" min="1" max="90" value="${daysLeft > 0 ? daysLeft : ''}"></label></div>
+      <label class="field">Expected effect<span class="hint">What this task should move, and by how much.</span><input type="text" name="expected" maxlength="500" value="${esc(task ? task.expected : '')}" placeholder="30 more waitlist signups"></label>
+      <label class="field">Inputs<span class="hint">Files and facts the agent must read first.</span><textarea name="inputs" rows="2" maxlength="1500" placeholder="research/market.md and the price in the Brain tab">${esc(task ? task.inputs : '')}</textarea></label>
+      <div class="deps"><div class="deps-label">Waits for<span class="hint">It starts only once the tasks you tick are done or cancelled.</span></div>
+        ${pick.length ? `<div class="dep-list">${pick.map((x) => `<label class="check small"><input type="checkbox" name="depends_on" value="${x.id}" ${deps.includes(x.id) ? 'checked' : ''}><span>#${x.id} ${esc(x.title)}${OPEN_STATUSES.includes(x.status) ? '' : ` <span class="faint">(${esc(x.status)})</span>`}</span></label>`).join('')}</div>`
+        : '<p class="small faint" style="margin:0">No open tasks to wait for.</p>'}</div>
+      <div class="form-grid">
+        <label class="field">Step budget<span class="hint">Tool calls per attempt, 3 to 60. Empty uses the company's setting.</span><input type="number" name="budget_steps" min="3" max="60" value="${task && task.budget_steps ? esc(task.budget_steps) : ''}"></label>
+        <label class="field">Token budget<span class="hint">Tokens across all attempts. Empty means no limit.${task && task.tokens_used ? ` Used so far: ${esc(fmtTokens(task.tokens_used))}.` : ''}</span><input type="number" name="budget_tokens" min="0" step="1000" value="${task && task.budget_tokens ? esc(task.budget_tokens) : ''}"></label></div>
+      <label class="field">Checks<span class="hint">One per line, each starting with ${CHECK_TOOLS.map((c) => `<code>${c}</code>`).join(', ')}. The agent is told they run on its work.</span>
+        <textarea name="checks" rows="2" class="code" placeholder="browser_check site/index.html">${esc(task ? task.checks : '')}</textarea></label></div>`;
+  };
+  // The contract as the API takes it. A new task sends what is filled in; an edit sends only what changed, so a
+  // deadline or a dependency left alone is not set again.
+  const contractBody = (form, task) => {
+    const fd = new FormData(form);
+    const out = {};
+    const text = (k) => String(fd.get(k) || '').trim();
+    const goal = text('goal_id') ? +text('goal_id') : null;
+    if (task ? goal !== (task.goal_id || null) : goal) out.goal_id = goal;
+    ['expected', 'inputs', 'checks'].forEach((k) => { if (task ? text(k) !== String(task[k] || '').trim() : text(k)) out[k] = text(k); });
+    const deps = fd.getAll('depends_on').map(Number).sort((a, b) => a - b);
+    const had = (task && Array.isArray(task.depends_on) ? task.depends_on : []).slice().sort((a, b) => a - b);
+    if (task ? deps.join() !== had.join() : deps.length) out.depends_on = deps;
+    const due = form.elements.due_days;
+    if (!task) { if (due.value) out.due_days = +due.value; } else if (due.value !== due.defaultValue) {
+      if (due.value) out.due_days = +due.value; else out.due_at = '';   // emptied: no deadline
+    }
+    ['budget_steps', 'budget_tokens'].forEach((k) => {
+      const inp = form.elements[k];
+      if (task ? inp.value !== inp.defaultValue : inp.value) out[k] = inp.value ? +inp.value : '';   // '' on an edit clears it
+    });
+    return out;
+  };
+  // A 400 (a goal that is not active, a dependency loop, a check line with an unknown tool) stays in the modal.
+  const showError = (form, e) => {
+    const box = $('.form-error', form);
+    if (!box) { fail(e); return; }
+    // The API names the fields as the tools do; the owner sees the form's labels.
+    const words = [[/^depends_on would\b/, 'Waiting on these tasks would'], [/\bdepends_on\b/g, 'Waits for'], [/\bbudget_steps\b/g, 'Step budget'], [/\bbudget_tokens\b/g, 'Token budget'],
+      [/\bdue_days\b/g, 'Due in days'], [/\bdue_at\b/g, 'The deadline'], [/\bgoal_id\b/g, 'the goal'], [/^checks line\b/, 'Checks: the line']];
+    box.textContent = capFirst(words.reduce((m, [re, w]) => m.replace(re, w), String(e.message || e)));
+    box.classList.remove('hidden');
+    box.scrollIntoView({ block: 'nearest' });
+  };
   return {
     async mount(holder) {
       el = holder;
       el.innerHTML = `<div class="actions" style="justify-content:space-between;margin-bottom:14px"><p class="muted" style="margin:0">The CEO plans work here and agents pick it up automatically. Add your own tasks any time.</p>
         <button class="btn primary" data-act="new-task">Add task</button></div><div class="board"></div>`;
-      await load();
+      await Promise.all([load(), loadGoals().catch(() => {})]);
     },
-    live(ev) { if (['tasks', 'agents'].includes(ev.type) || (ev.type === 'event' && ['task', 'done', 'run'].includes(ev.kind))) loadSoon(); },
+    live(ev) {
+      if (['tasks', 'agents'].includes(ev.type) || (ev.type === 'event' && ['task', 'done', 'run'].includes(ev.kind))) loadSoon();
+      if (ev.type === 'event' && ev.kind === 'brain') loadGoalsSoon();
+    },
     act(name, t) {
       if (name === 'new-task') {
         const ceo = data().agents.find((a) => a.role === 'ceo');
         modal({
           title: 'Add a task',
+          wide: true,
           body: `<form class="form-stack" data-form="new-task" id="nt"><label class="field">Title<input type="text" name="title" required maxlength="200"></label>
             <label class="field">Details<span class="hint">Objective, inputs to read, and what's out of scope.</span><textarea name="description" rows="4"></textarea></label>
             <div class="form-grid"><label class="field">Deliverable<input type="text" name="deliverable" placeholder="site/pricing.html"></label></div>
             <label class="field">Acceptance criteria<span class="hint">3-5 checkable points, one per line. Agents can't finish until the deliverable exists.</span><textarea name="acceptance" rows="3" placeholder="- Three plans with prices from the charter&#10;- audit_page reports no blockers"></textarea></label>
             <div class="form-grid"><label class="field">Assign to<select name="agent_id">${agentOptions(ceo?.id)}</select></label>
-            <label class="field">Priority<select name="priority"><option value="1">Urgent</option><option value="2" selected>Normal</option><option value="3">Later</option></select></label></div></form>`,
+            <label class="field">Priority<select name="priority"><option value="1">Urgent</option><option value="2" selected>Normal</option><option value="3">Later</option></select></label></div>
+            ${contractFields(null)}<div class="form-error hidden" role="alert"></div></form>`,
           foot: `<button class="btn" data-act="close-modal">Cancel</button><button class="btn primary" type="submit" form="nt">Add task</button>`,
         });
       }
@@ -1989,7 +2199,7 @@ function TabTasks(cid, data) {
         modal({
           title: `Task #${task.id}`,
           wide: true,
-          body: `<h2 style="font-size:19px;margin-bottom:6px">${esc(task.title)}</h2>
+          body: `<h2 style="font-size:19px;margin-bottom:6px">${esc(task.title)}</h2>${taskTags(task)}
             <p class="faint small">Created by ${esc(task.created_by)} ${when(task.created_at)}. Attempts: ${task.attempts}.</p>
             ${task.description ? md(task.description) : '<p class="faint">No details.</p>'}
             ${task.deliverable ? `<p><b>Deliverable:</b> ${/^[\w./-]+$/.test(task.deliverable) && /[/.]/.test(task.deliverable) ? `<a href="#/c/${cid}/files/${encodeURIComponent(task.deliverable)}">${esc(task.deliverable)}</a>` : esc(task.deliverable)}</p>` : ''}
@@ -2000,25 +2210,345 @@ function TabTasks(cid, data) {
               <div class="form-grid"><label class="field">Status<select name="status">${['todo', 'in_progress', 'waiting', 'blocked', 'done', 'cancelled'].map((s) => `<option value="${s}" ${s === task.status ? 'selected' : ''} ${s === 'in_progress' ? 'disabled' : ''}>${s.replace('_', ' ')}</option>`).join('')}</select></label>
               <label class="field">Assigned to<select name="agent_id">${agentOptions(task.agent_id)}</select></label>
               <label class="field">Priority<select name="priority">${[[1, 'Urgent'], [2, 'Normal'], [3, 'Later']].map(([v, l]) => `<option value="${v}" ${v === task.priority ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
-              <label class="field">Add a note for the agent<textarea name="note" rows="2"></textarea></label></form>`,
+              <label class="field">Add a note for the agent<textarea name="note" rows="2"></textarea></label>
+              ${contractFields(task)}<div class="form-error hidden" role="alert"></div></form>`,
           foot: `<button class="btn" data-act="close-modal">Close</button><button class="btn primary" type="submit" form="et">Save</button>`,
         });
       }
     },
     async submit(name, form) {
       const f = Object.fromEntries(new FormData(form));
+      const btn = $(`button[type=submit][form="${form.id}"]`);
+      if (btn) btn.disabled = true;
       try {
-        if (name === 'new-task') await api('POST', `/api/companies/${cid}/tasks`, { ...f, agent_id: +f.agent_id, priority: +f.priority });
+        if (name === 'new-task') {
+          await api('POST', `/api/companies/${cid}/tasks`, {
+            title: f.title, description: f.description, deliverable: f.deliverable, acceptance: f.acceptance,
+            agent_id: +f.agent_id, priority: +f.priority, ...contractBody(form, null),
+          });
+        }
         if (name === 'edit-task') {
           const task = tasks.find((x) => x.id === +form.dataset.id);
-          const body = { agent_id: +f.agent_id, priority: +f.priority, note: f.note };
+          const body = { agent_id: +f.agent_id, priority: +f.priority, note: f.note, ...contractBody(form, task) };
           if (f.status !== task.status) body.status = f.status;
           await api('PATCH', `/api/tasks/${form.dataset.id}`, body);
         }
         closeModal();
         toast('Saved.');
         await load();
+      } catch (e) { showError(form, e); }
+      if (btn) btn.disabled = false;
+    },
+  };
+}
+
+// ---- brain (Phase 2): the company's structured source of truth. Agents read a digest of it at the start of every
+// session; the owner edits it here. Edits are PATCH /api/brain/<section>/<id> (the strategy row's id is the
+// company's), deletes DELETE the same address, and the server emits a "brain" event so agents see the change.
+// In form order: the one-liner across the top, then pairs (price and voice are short, so they sit together).
+const STRATEGY_FIELDS = [['one_liner', 'One-liner', 'What you sell and to whom, in one sentence.'], ['icp', 'Customer (ICP)', 'Who buys, as precisely as you can.'],
+  ['problem', 'Problem', 'What hurts for them today.'], ['offer', 'Offer', 'What they get.'], ['positioning', 'Positioning', 'Why you, not the alternatives.'],
+  ['price', 'Price', 'What they pay.'], ['voice', 'Voice', 'How the team writes.']];
+const CONTACT_STAGES = ['lead', 'contacted', 'replied', 'customer', 'lost'];
+const GOAL_STATUSES = [['active', 'Active'], ['done', 'Done'], ['dropped', 'Dropped']];
+const VERDICT_BADGE = { pending: ['accent', 'Running'], won: ['good', 'Won'], lost: ['bad', 'Lost'], inconclusive: ['', 'Inconclusive'] };
+// The fields the owner edits inline, per section: [column, label, kind]. Kinds: text, long, number, date, check,
+// role (a role on the team), goal (one of the company's goals), or a list of choices. Mirrors brain.COLUMNS.
+const BRAIN_FIELDS = {
+  goals: [['title', 'Goal', 'text'], ['metric', 'Metric', 'text'], ['target', 'Target', 'number'], ['deadline', 'Deadline', 'date'], ['owner_role', 'Owner', 'role']],
+  contacts: [['name', 'Name', 'text'], ['email', 'Email', 'text'], ['company', 'Company', 'text'], ['role', 'Their role', 'text'], ['stage', 'Stage', CONTACT_STAGES],
+    ['source', 'Source', 'text'], ['consent', 'Consent', 'text'], ['last_touch', 'Last touch', 'date'], ['notes', 'Notes', 'long']],
+  decisions: [['what', 'What was decided', 'text'], ['expected', 'Expected result', 'text'], ['review_at', 'Review on', 'date'], ['why', 'Why', 'long'],
+    ['outcome', 'Outcome', 'long'], ['reversible', 'Can be undone', 'check']],
+  experiments: [['hypothesis', 'Hypothesis', 'text'], ['goal_id', 'Goal', 'goal'], ['metric', 'Metric', 'text'], ['start', 'Started', 'date'], ['stop', 'Stops', 'date'],
+    ['verdict', 'Verdict', ['pending', 'won', 'lost', 'inconclusive']], ['result', 'Result', 'long']],
+  lessons: [['text', 'Lesson', 'long']],
+};
+const BRAIN_SHOWN = 10;   // rows per list before "Show all"
+
+function TabBrain(cid, data) {
+  let el, b = null, editing = null, stale = false, stage = '';
+  const shown = {};   // section -> true once the owner pressed "Show all"
+  const isEditing = (section, id) => !!editing && editing.section === section && editing.id === id;
+  const roles = () => [...new Set(['ceo', ...data().agents.map((a) => a.role)])];
+  const ceoName = () => (data().agents.find((a) => a.role === 'ceo') || {}).name || 'the CEO';
+  const decider = (by) => ({ ceo: ceoName(), owner: 'you', telegram: 'you, from your phone', deadline: 'the deadline' }[by] || by || 'someone');
+  const day = (v) => String(v || '').slice(0, 10);
+  const num = (v) => (v === null || v === undefined || v === '' ? '?' : esc(fmtValue(v)));
+  const opt = (v, l, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(l)}</option>`;
+  const acts = (section, id) => `<div class="row-acts"><button class="btn sm ghost" data-act="b-edit" data-section="${section}" data-id="${id}">Edit</button>
+    <button class="btn sm ghost" data-act="b-del" data-section="${section}" data-id="${id}">Delete</button></div>`;
+  const more = (section, total) => (total > BRAIN_SHOWN && !shown[section]
+    ? `<li class="more-row"><button class="btn sm ghost" data-act="b-more" data-section="${section}">Show all ${total}</button></li>` : '');
+  const cut = (section, rows) => (shown[section] ? rows : rows.slice(0, BRAIN_SHOWN));
+
+  // One inline field. data-orig holds the value it started with, so a save sends only what changed.
+  const field = ([col, label, kind], row) => {
+    const raw = row[col];
+    const val = raw === null || raw === undefined ? '' : kind === 'date' ? day(raw) : String(raw);
+    if (kind === 'check') {
+      const on = raw === undefined || raw === null ? true : !!Number(raw);
+      return `<label class="check small"><input type="checkbox" name="${col}" data-orig="${on ? 1 : 0}" ${on ? 'checked' : ''}><span>${esc(label)}</span></label>`;
+    }
+    const attrs = `name="${col}" data-orig="${esc(val)}"`;
+    if (Array.isArray(kind)) return `<label class="field">${esc(label)}<select ${attrs}>${kind.map((o) => opt(o, capFirst(o), val)).join('')}</select></label>`;
+    if (kind === 'role') return `<label class="field">${esc(label)}<select ${attrs}>${[...new Set([...roles(), ...(val ? [val] : [])])].map((r) => opt(r, r, val)).join('')}</select></label>`;
+    if (kind === 'goal') return `<label class="field">${esc(label)}<select ${attrs}>${opt('', 'No goal', val)}${b.goals.map((g) => opt(g.id, `#${g.id} ${g.title}${g.status === 'active' ? '' : ` (${g.status})`}`, val)).join('')}</select></label>`;
+    if (kind === 'long') return `<label class="field">${esc(label)}<textarea ${attrs} rows="2">${esc(val)}</textarea></label>`;
+    const type = kind === 'number' ? 'number' : kind === 'date' ? 'date' : 'text';
+    return `<label class="field">${esc(label)}<input type="${type}" ${attrs}${kind === 'number' ? ' step="any"' : ''} value="${esc(val)}"></label>`;
+  };
+  const editForm = (section, row) => {
+    const fields = BRAIN_FIELDS[section];
+    const short = fields.filter((f) => !['long', 'check'].includes(f[2]));
+    return `<form class="form-stack brain-edit" data-form="b-edit" data-section="${section}" data-id="${row.id}">
+      ${short.length ? `<div class="form-grid">${short.map((f) => field(f, row)).join('')}</div>` : ''}
+      ${fields.filter((f) => ['long', 'check'].includes(f[2])).map((f) => field(f, row)).join('')}
+      <div class="actions"><button class="btn sm primary" type="submit">Save</button><button class="btn sm" type="button" data-act="b-cancel">Cancel</button></div></form>`;
+  };
+
+  // ---- strategy: a form on the page; Save sends the fields that changed.
+  const strategyDirty = () => $$('#b-strategy [name]', el).some((i) => i.value !== i.defaultValue);
+  const drawStrategy = () => {
+    const s = b.strategy || {};
+    $('#b-strategy-when', el).innerHTML = s.updated_at ? `Changed ${when(s.updated_at)}` : '';
+    if (strategyDirty()) return;   // the owner is typing: keep it
+    $('#b-strategy', el).innerHTML = `<div class="form-grid strategy-grid">${STRATEGY_FIELDS.map(([k, l, hint]) => (['one_liner', 'price', 'voice'].includes(k)
+      ? `<label class="field${k === 'one_liner' ? ' span' : ''}">${esc(l)}${hint ? `<span class="hint">${esc(hint)}</span>` : ''}<input type="text" name="${k}" maxlength="500" value="${esc(s[k] || '')}"></label>`
+      : `<label class="field">${esc(l)}${hint ? `<span class="hint">${esc(hint)}</span>` : ''}<textarea name="${k}" rows="2" maxlength="500">${esc(s[k] || '')}</textarea></label>`)).join('')}</div>
+      <div class="actions"><button class="btn primary" type="submit">Save strategy</button><span class="small faint">Price, offer, positioning and customer changes an agent proposes come to your Inbox.</span></div>`;
+  };
+
+  // ---- goals: a table; the status changes inline, Edit opens the row's form under it.
+  const td = (label, html, cls = '') => `<td data-label="${esc(label)}"${cls ? ` class="${cls}"` : ''}><div class="cell">${html}</div></td>`;
+  const goalRow = (g) => {
+    if (isEditing('goals', g.id)) return `<tr class="editing"><td colspan="7">${editForm('goals', g)}</td></tr>`;
+    const pct = g.target ? Math.max(0, Math.min(100, Math.round((100 * (Number(g.current) || 0)) / g.target))) : 0;
+    const d = g.days_left;
+    const left = g.status === 'active' && d !== null && d !== undefined
+      ? `<div class="small ${d < 0 ? 'warn-text' : 'faint'}">${d < 0 ? `${plural(-d, 'day')} overdue` : `${plural(d, 'day')} left`}</div>` : '';
+    return `<tr class="${g.status === 'active' ? '' : 'closed'}">
+      ${td('Goal', `<b>#${g.id}</b> ${esc(g.title)}`)}${td('Metric', g.metric ? `<code>${esc(g.metric)}</code>` : '<span class="faint">none</span>')}
+      ${td('Current / target', `<span class="num">${num(g.current)} of ${num(g.target)}</span><div class="meter"><div class="bar"><span style="width:${pct}%"></span></div></div>`)}
+      ${td('Deadline', `${esc(day(g.deadline))}${left}`)}${td('Owner', esc(g.owner_role || ''))}
+      ${td('Status', `<select data-b-status="${g.id}" aria-label="Status of goal #${g.id}">${GOAL_STATUSES.map(([v, l]) => opt(v, l, g.status)).join('')}</select>`)}
+      <td class="acts-cell">${acts('goals', g.id)}</td></tr>`;
+  };
+  const drawGoals = () => {
+    const active = b.goals.filter((g) => g.status === 'active').length;
+    $('#b-goals-count', el).textContent = `${active} of 3 active`;
+    $('#b-goals', el).innerHTML = b.goals.length ? b.goals.map(goalRow).join('')
+      : '<tr><td colspan="7" class="faint">No goals yet. The CEO sets up to three while planning, or add one below.</td></tr>';
+  };
+
+  // ---- contacts: a table with a stage filter; the stage changes inline.
+  const contactRow = (c) => {
+    if (isEditing('contacts', c.id)) return `<tr class="editing"><td colspan="6">${editForm('contacts', c)}</td></tr>`;
+    return `<tr>${td('Name', `<b>${esc(c.name || '(no name)')}</b>${c.unsubscribed ? ' <span class="badge warn">unsubscribed</span>' : ''}${c.company ? `<div class="small muted">${esc(c.company)}${c.role ? `, ${esc(c.role)}` : ''}</div>` : ''}`)}
+      ${td('Email', c.email ? esc(c.email) : '<span class="faint">none</span>')}
+      ${td('Stage', `<select data-b-stage="${c.id}" aria-label="Stage of ${esc(c.name || c.email || 'contact')}">${CONTACT_STAGES.map((s) => opt(s, capFirst(s), c.stage)).join('')}</select>`)}
+      ${td('Last touch', c.last_touch ? esc(day(c.last_touch)) : '<span class="faint">never</span>')}${td('Source', esc(c.source || ''))}
+      <td class="acts-cell">${acts('contacts', c.id)}</td></tr>`;
+  };
+  const drawContacts = () => {
+    const count = (s) => b.contacts.filter((c) => c.stage === s).length;
+    $('#b-stage', el).innerHTML = opt('', `All stages (${b.contacts.length})`, stage) + CONTACT_STAGES.map((s) => opt(s, `${capFirst(s)} (${count(s)})`, stage)).join('');
+    const rows = b.contacts.filter((c) => !stage || c.stage === stage);
+    const list = cut('contacts', rows);
+    $('#b-contacts', el).innerHTML = rows.length ? list.map(contactRow).join('')
+      + (rows.length > list.length ? `<tr class="more-row"><td colspan="6"><button class="btn sm ghost" data-act="b-more" data-section="contacts">Show all ${rows.length}</button></td></tr>` : '')
+      : `<tr><td colspan="6" class="faint">${b.contacts.length ? 'No contacts at this stage.' : 'No contacts yet. Sales and support agents add the people they talk to.'}</td></tr>`;
+  };
+
+  // ---- proposals: changes the team suggested. The CEO reviews them while planning; those that touch the price,
+  // offer, positioning or customer went to the owner as a decision ("In your Inbox"). Either can be decided here.
+  const drawProposals = () => {
+    const open = b.proposals.filter((p) => p.status === 'pending' || p.status === 'owner');
+    const closed = b.proposals.filter((p) => p.status !== 'pending' && p.status !== 'owner').slice(0, 5);
+    const item = (p) => `<li><div class="grow"><div><b>#${p.id}</b> by ${esc(p.agent_name)} <span class="badge">${esc(p.label)}</span>
+        ${p.status === 'owner' ? ' <a class="badge warn" href="#/inbox" title="It changes the price, offer, positioning or customer, so it waits for your decision">In your Inbox</a>'
+        : p.status === 'pending' ? ' <span class="badge accent" title="The CEO reviews it in the next planning cycle">For the CEO</span>'
+          : ` <span class="badge ${p.status === 'accepted' ? 'good' : ''}">${esc(p.status)}</span>`}</div>
+      ${p.summary ? `<div>${esc(p.summary)}</div>` : ''}${p.reason ? `<div class="small muted">Reason: ${esc(p.reason)}</div>` : ''}
+      <div class="small faint">${when(p.created_at)}</div></div>
+      ${p.status === 'pending' || p.status === 'owner' ? `<div class="row-acts"><button class="btn sm" data-act="b-proposal" data-d="reject" data-id="${p.id}">Reject</button>
+        <button class="btn sm good" data-act="b-proposal" data-d="accept" data-id="${p.id}">Accept</button></div>` : ''}</li>`;
+    $('#b-proposals', el).innerHTML = (open.length ? open.map(item).join('') : '<li class="faint">Nothing waiting. When an agent suggests a change to the brain, it shows up here.</li>')
+      + (closed.length ? `<li class="sub-head small faint">Recently decided</li>${closed.map(item).join('')}` : '');
+    $('#b-proposals-count', el).innerHTML = open.length ? `<span class="badge warn">${open.length} waiting</span>` : '';
+  };
+
+  // ---- decisions, experiments, lessons: lists with inline edit and delete.
+  const drawDecisions = () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const item = (r) => (isEditing('decisions', r.id) ? `<li class="editing">${editForm('decisions', r)}</li>` : `<li><div class="grow">
+      <div><b>#${r.id}</b> ${esc(r.what)}${Number(r.reversible ?? 1) ? '' : ' <span class="badge warn">Cannot be undone</span>'}</div>
+      ${r.expected ? `<div class="small"><b>Expected:</b> ${esc(r.expected)}</div>` : ''}
+      ${r.outcome ? `<div class="small"><b>Outcome:</b> ${esc(r.outcome)}</div>`
+        : r.review_at ? `<div class="small ${day(r.review_at) <= today ? 'warn-text' : 'faint'}">${day(r.review_at) <= today ? `Review was due ${esc(shortDate(r.review_at))}; no outcome logged yet` : `Review on ${esc(shortDate(r.review_at))}`}</div>` : ''}
+      ${r.why ? `<details class="fold"><summary class="small">Why</summary><p class="small muted">${esc(r.why)}</p></details>` : ''}
+      <div class="small faint">Decided by ${esc(decider(r.decided_by))}, ${when(r.created_at)}</div></div>${acts('decisions', r.id)}</li>`);
+    $('#b-decisions', el).innerHTML = b.decisions.length ? cut('decisions', b.decisions).map(item).join('') + more('decisions', b.decisions.length)
+      : '<li class="faint">No decisions logged yet. The CEO logs its own; the ones you make in the Inbox land here too.</li>';
+  };
+  const drawExperiments = () => {
+    const item = (r) => {
+      if (isEditing('experiments', r.id)) return `<li class="editing">${editForm('experiments', r)}</li>`;
+      const v = VERDICT_BADGE[r.verdict] || ['', r.verdict];
+      return `<li><div class="grow"><div><b>#${r.id}</b> ${esc(r.hypothesis)} <span class="badge ${v[0]}">${esc(v[1])}</span></div>
+        <div class="small muted">${r.goal_id ? `Goal #${esc(r.goal_id)}, ` : ''}${r.metric ? `<code>${esc(r.metric)}</code>, ` : ''}${esc(day(r.start) || '?')} to ${esc(day(r.stop) || '?')}</div>
+        ${r.result ? `<div class="small"><b>Result:</b> ${esc(r.result)}</div>` : ''}</div>${acts('experiments', r.id)}</li>`;
+    };
+    $('#b-experiments', el).innerHTML = b.experiments.length ? cut('experiments', b.experiments).map(item).join('') + more('experiments', b.experiments.length)
+      : '<li class="faint">No experiments yet. The CEO starts one for each bet that could move a goal.</li>';
+  };
+  const drawLessons = () => {
+    const item = (r) => (isEditing('lessons', r.id) ? `<li class="editing">${editForm('lessons', r)}</li>`
+      : `<li><div class="grow"><div>${esc(r.text)}</div><div class="small faint">${when(r.created_at)}</div></div>${acts('lessons', r.id)}</li>`);
+    $('#b-lessons', el).innerHTML = b.lessons.length ? cut('lessons', b.lessons).map(item).join('') + more('lessons', b.lessons.length)
+      : '<li class="faint">No lessons yet. Agents save short rules here when something worked or failed.</li>';
+  };
+
+  const draw = () => {
+    if (!b || !el) return;
+    $('#b-empty', el).innerHTML = b.empty ? `<div class="banner"><div class="grow"><b>Brain not written yet; the CEO fills it in the next planning cycle.</b> You can also fill in the strategy yourself below.</div>
+      ${data().company.status === 'active' ? '<button class="btn" data-act="plan">Plan now</button>' : ''}</div>` : '';
+    drawStrategy(); drawGoals(); drawContacts(); drawProposals(); drawDecisions(); drawExperiments(); drawLessons();
+    const over = b.digest_chars > b.digest_cap;
+    $('#b-foot', el).innerHTML = `<span class="${over ? 'warn-text' : ''}">Digest: ${Number(b.digest_chars).toLocaleString()} of ${Number(b.digest_cap).toLocaleString()} characters.</span>
+      Every agent reads it at the start of each session and looks up the rest.
+      <details class="raw"><summary class="small muted">Exactly what the agents read</summary><pre class="small">${esc(b.digest)}</pre></details>`;
+    stale = false;
+  };
+  const load = async () => {
+    b = await GET(`/api/companies/${cid}/brain`);
+    if (editing) { stale = true; drawStrategy(); return; }   // keep the open form; redraw once it closes
+    draw();
+  };
+  const loadSoon = debounce(() => load().catch(() => {}), 700);
+  const closeEdit = () => { editing = null; draw(); };
+  const patch = async (section, id, body, okText = 'Saved. Agents see it in their next session.') => {
+    await api('PATCH', `/api/brain/${section}/${id}`, body);
+    toast(okText);
+  };
+
+  return {
+    async mount(holder) {
+      el = holder;
+      // Strategy beside the proposals (what may need you); the goals and contacts tables take the full width.
+      el.innerHTML = `<div id="b-empty"></div><div class="brain">
+        <div class="cols">
+          <section class="panel"><div class="panel-head"><h2>Strategy</h2><span class="small faint" id="b-strategy-when"></span></div>
+            <form class="panel-body form-stack" data-form="b-strategy" id="b-strategy"></form></section>
+          <section class="panel"><div class="panel-head"><h2>Proposals</h2><span id="b-proposals-count"></span></div><ul class="rows" id="b-proposals" style="padding-top:8px"></ul></section>
+        </div>
+        <section class="panel"><div class="panel-head"><h2>Goals</h2><span class="small faint" id="b-goals-count"></span></div>
+          <div class="btable-wrap"><table class="btable"><thead><tr><th>Goal</th><th>Metric</th><th>Current / target</th><th>Deadline</th><th>Owner</th><th>Status</th><th><span class="sr">Actions</span></th></tr></thead>
+            <tbody id="b-goals"></tbody>
+            <tfoot><tr class="add-row">
+              <td data-label="Goal"><div class="cell"><input form="b-add-goal" type="text" name="title" required maxlength="200" placeholder="10 paying customers" aria-label="New goal"></div></td>
+              <td data-label="Metric"><div class="cell"><input form="b-add-goal" type="text" name="metric" required maxlength="60" placeholder="stripe.customers" aria-label="Metric"></div></td>
+              <td data-label="Target"><div class="cell"><input form="b-add-goal" type="number" name="target" required step="any" placeholder="10" aria-label="Target"></div></td>
+              <td data-label="Deadline"><div class="cell"><input form="b-add-goal" type="date" name="deadline" required aria-label="Deadline"></div></td>
+              <td data-label="Owner"><div class="cell"><select form="b-add-goal" name="owner_role" aria-label="Owner">${roles().map((r) => opt(r, r, 'ceo')).join('')}</select></div></td>
+              <td></td><td class="acts-cell"><button form="b-add-goal" class="btn sm primary" type="submit">Add goal</button></td></tr></tfoot></table></div>
+          <form id="b-add-goal" data-form="b-add-goal"></form></section>
+        <div class="brain-pair">
+          <section class="panel"><div class="panel-head"><h2>Decisions</h2></div><ul class="rows" id="b-decisions" style="padding-top:8px"></ul></section>
+          <div class="stack">
+            <section class="panel"><div class="panel-head"><h2>Experiments</h2></div><ul class="rows" id="b-experiments" style="padding-top:8px"></ul></section>
+            <section class="panel"><div class="panel-head"><h2>Lessons</h2></div><ul class="rows" id="b-lessons" style="padding-top:8px"></ul>
+              <form class="b-add-lesson" data-form="b-add-lesson"><input type="text" name="text" required maxlength="300" placeholder="Add a lesson: one short rule the team should follow" aria-label="New lesson"><button class="btn" type="submit">Add</button></form></section>
+          </div></div>
+        <section class="panel"><div class="panel-head"><h2>Contacts</h2><select id="b-stage" class="b-filter" aria-label="Show contacts at this stage"></select></div>
+          <div class="btable-wrap"><table class="btable"><thead><tr><th>Name</th><th>Email</th><th>Stage</th><th>Last touch</th><th>Source</th><th><span class="sr">Actions</span></th></tr></thead>
+            <tbody id="b-contacts"></tbody></table></div></section>
+        </div>
+        <div class="brain-foot small faint" id="b-foot"></div>`;
+      // Inline selects: a goal's status, a contact's stage, the contacts filter.
+      el.addEventListener('change', async (e) => {
+        const t = e.target;
+        if (t.id === 'b-stage') { stage = t.value; drawContacts(); return; }
+        const goal = t.dataset.bStatus;
+        const contact = t.dataset.bStage;
+        if (!goal && !contact) return;
+        const [section, id, body] = goal ? ['goals', goal, { status: t.value }] : ['contacts', contact, { stage: t.value }];
+        const row = b[section].find((r) => r.id === +id);
+        try {
+          await patch(section, id, body, goal ? `Goal #${id} is ${t.value} now.` : 'Stage saved.');
+          if (row) Object.assign(row, body);
+          await load();
+        } catch (err) { fail(err); if (row) t.value = goal ? row.status : row.stage; }
+      });
+      await load();
+    },
+    live(ev) { if (ev.type === 'event' && ['brain', 'decision'].includes(ev.kind)) loadSoon(); },
+    async act(name, t) {
+      const section = t.dataset.section;
+      const id = +t.dataset.id;
+      if (name === 'b-edit') { editing = { section, id }; draw(); $('form.brain-edit input, form.brain-edit textarea', el)?.focus(); return; }
+      if (name === 'b-cancel') { closeEdit(); return; }
+      if (name === 'b-more') { shown[section] = true; draw(); return; }
+      if (name === 'b-del') {
+        const what = { goals: 'goal', contacts: 'contact', decisions: 'decision', experiments: 'experiment', lessons: 'lesson' }[section] || 'row';
+        if (!confirm(`Delete this ${what}? Agents stop seeing it at once. This cannot be undone.`)) return;
+        try {
+          await api('DELETE', `/api/brain/${section}/${id}`, {});
+          if (isEditing(section, id)) editing = null;
+          toast(`${capFirst(what)} deleted.`);
+          await load();
+        } catch (e) { fail(e); }
+        return;
+      }
+      if (name === 'b-proposal') {
+        $$('button', t.closest('li')).forEach((x) => { x.disabled = true; });
+        try {
+          const r = await api('POST', `/api/brain/changes/${id}`, { decision: t.dataset.d });
+          toast(r.status === 'accepted' ? `Accepted${r.applied ? `: ${r.applied}` : ''}.` : 'Rejected.');
+          await load();
+          refreshState();   // a proposal that was in the Inbox is answered there too
+        } catch (e) { fail(e); $$('button', t.closest('li')).forEach((x) => { x.disabled = false; }); }
+      }
+    },
+    async submit(name, form) {
+      const btn = $('button[type=submit]', form) || $(`button[type=submit][form="${form.id}"]`, el);
+      if (btn) btn.disabled = true;
+      try {
+        if (name === 'b-strategy') {
+          const body = {};
+          $$('[name]', form).forEach((i) => { if (i.value !== i.defaultValue) body[i.name] = i.value.trim(); });
+          if (!Object.keys(body).length) toast('Nothing changed.');
+          else {
+            await patch('strategy', cid, body);
+            $$('[name]', form).forEach((i) => { i.defaultValue = i.value; });
+            await load();
+          }
+        }
+        if (name === 'b-edit') {
+          const body = {};
+          $$('[name]', form).forEach((i) => {
+            const v = i.type === 'checkbox' ? (i.checked ? '1' : '0') : i.value;
+            if (v !== i.dataset.orig) body[i.name] = i.type === 'checkbox' ? i.checked : v.trim();
+          });
+          if (Object.keys(body).length) await patch(form.dataset.section, form.dataset.id, body);
+          closeEdit();
+          if (Object.keys(body).length || stale) await load();
+        }
+        if (name === 'b-add-goal') {
+          const f = Object.fromEntries(new FormData(form));
+          await api('POST', `/api/companies/${cid}/brain/goals`, { title: f.title.trim(), metric: f.metric.trim(), target: f.target, deadline: f.deadline, owner_role: f.owner_role });
+          form.reset();
+          toast('Goal added. Agents plan with it from their next session.');
+          await load();
+        }
+        if (name === 'b-add-lesson') {
+          await api('POST', `/api/companies/${cid}/brain/lessons`, { text: form.text.value.trim() });
+          form.reset();
+          toast('Lesson saved. Every agent reads the newest lessons.');
+          await load();
+        }
       } catch (e) { fail(e); }
+      if (btn) btn.disabled = false;
     },
   };
 }
@@ -2223,8 +2753,16 @@ function TabMind(cid, data, arg) {
 
 // ---- files
 function TabFiles(cid, data, initial) {
-  let el, files = [], current = initial || null, editing = false, content = null;
+  let el, files = [], leases = [], current = initial || null, editing = false, content = null;
   const slug = () => data().company.slug;
+  // Phase 2: a file an agent is writing right now carries a lease ("editing: Forge", the task on hover). Your own
+  // saves go through anyway: the owner is the board.
+  const leaseOf = (path) => leases.find((l) => l.path === path) || null;
+  const leaseBadge = (l) => {
+    const until = Date.parse(l.expires_at || '');
+    const title = `${l.agent_name || 'An agent'} is editing it${l.task_id ? ` for task #${l.task_id}` : ''}${Number.isFinite(until) ? ` until ${new Date(until).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}` : ''}`;
+    return `<span class="badge warn lease" title="${esc(title)}">editing: ${esc(l.agent_name || 'an agent')}</span>`;
+  };
   const drawTree = () => {
     const visible = files.filter((f) => !f.dir).sort((a, b) => a.path.localeCompare(b.path));
     let lastDir = null;
@@ -2232,7 +2770,8 @@ function TabFiles(cid, data, initial) {
       const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
       const head = dir !== lastDir ? `<div class="dir">${esc(dir || 'top level')}</div>` : '';
       lastDir = dir;
-      return `${head}<button class="${f.path === current ? 'on' : ''}" data-act="open" data-path="${esc(f.path)}" title="${esc(f.path)}">${esc(f.path.split('/').pop())}</button>`;
+      const l = leaseOf(f.path);
+      return `${head}<button class="${f.path === current ? 'on' : ''}${l ? ' leased' : ''}" data-act="open" data-path="${esc(f.path)}" title="${esc(f.path)}"><span class="fname">${esc(f.path.split('/').pop())}</span>${l ? leaseBadge(l) : ''}</button>`;
     }).join('') : '<div class="faint" style="padding:14px">No files yet. They appear as agents work.</div>';
   };
   const drawViewer = () => {
@@ -2248,7 +2787,8 @@ function TabFiles(cid, data, initial) {
     else if (editing) body = `<textarea id="file-edit">${esc(content.content)}</textarea>`;
     else if (/\.md$/i.test(current)) body = md(content.content);
     else body = `<pre class="small">${esc(content.content)}</pre>`;
-    v.innerHTML = `<div class="viewer-head"><code class="small" style="overflow-wrap:anywhere">${esc(current)}</code><div class="actions">
+    const lease = leaseOf(current);
+    v.innerHTML = `<div class="viewer-head"><span><code class="small" style="overflow-wrap:anywhere">${esc(current)}</code> <span id="file-lease">${lease ? leaseBadge(lease) : ''}</span></span><div class="actions">
       ${isSite && /\.html?$/i.test(current) ? `<a class="btn sm" target="_blank" rel="noopener" href="/preview/${encodeURIComponent(slug())}/${current.slice(5).split('/').map(encodeURIComponent).join('/')}">Open preview</a>` : ''}
       ${!isImg && content && !content.binary ? (editing ? `<button class="btn sm" data-act="cancel-edit">Cancel</button><button class="btn sm primary" data-act="save-file">Save</button>` : `<button class="btn sm" data-act="edit-file">Edit</button>`) : ''}
       <a class="btn sm ghost" href="${raw}" download>Download</a></div></div><div class="viewer-body">${body}</div>`;
@@ -2262,7 +2802,14 @@ function TabFiles(cid, data, initial) {
       drawViewer();
     }
   };
-  const loadTree = async () => { files = (await GET(`/api/companies/${cid}/files`)).files; drawTree(); };
+  const loadTree = async () => {
+    const r = await GET(`/api/companies/${cid}/files`);
+    files = r.files;
+    leases = Array.isArray(r.leases) ? r.leases : [];
+    drawTree();
+    const badge = el && $('#file-lease', el);   // only the badge: the open file keeps its scroll and edits
+    if (badge) { const l = current && leaseOf(current); badge.innerHTML = l ? leaseBadge(l) : ''; }
+  };
   const loadSoon = debounce(() => loadTree().catch(() => {}), 800);
   return {
     async mount(holder) {
@@ -2276,6 +2823,7 @@ function TabFiles(cid, data, initial) {
         loadSoon();
         if (ev.data?.path === current && !editing) open(current);
       }
+      if (ev.type === 'agents') loadSoon();   // a finished session releases its leases
     },
     async act(name, t) {
       if (name === 'open') open(t.dataset.path);
@@ -2407,6 +2955,7 @@ function TabSettings(cid, data, arg) {
     const pol = s.policies || {};
     const val = (k) => esc(s[k] ?? '');
     const used = plan && plan.budget ? plan.budget.used : null;
+    const bud = data().budgets || null;   // Phase 2: what each budget has used (GET /api/companies/<id>)
     const detected = !s.archetype && plan && plan.archetype ? ` (now: ${archetypeLabel(plan.archetype)})` : '';
     const provider = EMAIL_PROVIDERS.some(([k]) => k === s.email_provider) ? s.email_provider : 'auto';
     $('#co-set-form', el).innerHTML = `<form class="panel" data-form="co-settings">
@@ -2415,7 +2964,6 @@ function TabSettings(cid, data, arg) {
           <textarea name="directives" rows="5" placeholder="Never offer discounts. Write in British English. Focus on cafés in Manchester first.">${val('directives')}</textarea></label>
         <div class="form-grid" style="margin-top:14px">
           <label class="field">CEO re-plans every (minutes)<input type="number" name="cycle_minutes" min="5" value="${val('cycle_minutes')}"></label>
-          <label class="field">Emails per day, max<input type="number" name="daily_email_limit" min="1" value="${val('daily_email_limit')}"></label>
           <label class="field">Company name<input type="text" name="name" value="${esc(c.name)}"></label>
         </div>
         <div class="form-grid" style="margin-top:14px">
@@ -2423,6 +2971,19 @@ function TabSettings(cid, data, arg) {
             <select name="archetype"><option value="">Detect automatically${esc(detected)}</option>${ARCHETYPES.map(([k, l]) => `<option value="${k}" ${s.archetype === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
           <label class="field">Daily token budget<span class="hint">Background work stops for the day once this is used; chat and your own tasks still run. 0 = no limit.${used !== null ? ` Used today: ${esc(Number(used).toLocaleString())}.` : ''}</span>
             <input type="number" name="daily_token_budget" min="0" step="100000" value="${val('daily_token_budget')}"></label>
+        </div></div>
+      <div class="section" id="budgets"><h2>Budgets</h2><p class="muted">Limits for this company. Once one is used up, agents stop that kind of work until it resets; chat and tasks you create still run.</p>
+        <div class="form-grid">
+          <label class="field">GPU hours per day<span class="hint">Model time this company may use each day. Agents pick up no new work once it is used, until midnight UTC.${bud ? ` Used today: ${esc(fmtHours(bud.gpu_hours_today))} h.` : ''}</span>
+            <input type="number" name="gpu_hours_per_day" min="0.25" step="0.25" value="${val('gpu_hours_per_day')}"></label>
+          <label class="field">Steps per task<span class="hint">Tool calls an agent may make per attempt at a task. 0 means the app default (${esc(global.settings.max_steps_per_run)}, from Settings).</span>
+            <input type="number" name="steps_per_task" min="0" max="60" value="${val('steps_per_task')}"></label>
+          <label class="field">Posts per week<span class="hint">Social posts approved or waiting in the last 7 days.${bud ? ` This week: ${esc(bud.posts_this_week)}.` : ''}</span>
+            <input type="number" name="posts_per_week" min="0" value="${val('posts_per_week')}"></label>
+          <label class="field">Emails per day<span class="hint">New domains should start around 20.${bud ? ` Sent today: ${esc(bud.emails_today)}.` : ''}</span>
+            <input type="number" name="daily_email_limit" min="1" value="${val('daily_email_limit')}"></label>
+          <label class="field">Money budget, USD (display only)<span class="hint">Holdco never spends money: every purchase asks you and you buy it yourself.${bud ? ` $${esc(fmtValue(bud.money_approved_month))} approved this month.` : ''}</span>
+            <input type="number" name="money_usd" min="0" value="${val('money_usd')}"></label>
         </div></div>
       <div class="section"><h2>Approvals for this company</h2><p class="muted">Override your global defaults.</p>
         <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
@@ -2476,6 +3037,7 @@ function TabSettings(cid, data, arg) {
       global = g;
       plan = pl && pl.planning;
       draw();
+      if (arg === 'budgets') $('#budgets', el)?.scrollIntoView({ block: 'start' });   // from the Overview's GPU line
       await connsReady;
     },
     live(ev) { conns.live(ev); },
@@ -2491,6 +3053,11 @@ function TabSettings(cid, data, arg) {
       dropUntouchedSecrets(form, settings);
       const budget = parseInt(settings.daily_token_budget, 10);
       if (Number.isFinite(budget)) settings.daily_token_budget = Math.max(0, budget); else delete settings.daily_token_budget;   // empty keeps the stored value
+      // Phase 2 budgets: an empty box keeps the stored value, like the token budget.
+      ['gpu_hours_per_day', 'steps_per_task', 'posts_per_week', 'daily_email_limit', 'money_usd'].forEach((k) => {
+        const n = k === 'gpu_hours_per_day' ? parseFloat(settings[k]) : parseInt(settings[k], 10);
+        if (Number.isFinite(n)) settings[k] = n; else delete settings[k];
+      });
       if (typeof settings.postal_address === 'string') settings.postal_address = settings.postal_address.trim();
       try {
         const r = await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
