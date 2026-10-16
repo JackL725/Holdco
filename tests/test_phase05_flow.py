@@ -28,7 +28,7 @@ os.environ.setdefault("HOLDCO_DATA", tempfile.mkdtemp(prefix="holdco-flow-"))
 
 from holdco import (actions, agents, bus, context, db, doctor, llm, notify, planning, roles, routing,  # noqa: E402
                     scheduler, server, tools, truth, web, workspace)  # noqa: F401  (server registers routes)
-from tests.fake_ollama import CHARTER  # noqa: E402
+from tests.fake_ollama import CHARTER, STRATEGY  # noqa: E402
 
 db.init()
 
@@ -741,9 +741,12 @@ class TestFoundingStageChecks(Base):
         self.assertTrue(results[0][1].startswith("Not finished yet: the company record has no complete charter "
                                                  "yet (missing or empty: One-liner"), results[0][1])
         c = self.founding("charter")
-        results, run, _s = self.run_stage(c, [("update_charter", {"charter": CHARTER}),
-                                              ("finish", {"summary": "Charter saved."})])
-        self.assertEqual((results[1][1], run["status"]), ("Session ended.", "done"))
+        # Phase 2: the charter stage also writes the brain (the strategy and a goal) before it finishes
+        goal = {"title": "20 signups", "metric": "signups", "target": 20,
+                "deadline": (_dt.date.today() + _dt.timedelta(days=30)).isoformat()}
+        results, run, _s = self.run_stage(c, [("update_charter", {"charter": CHARTER}), ("set_strategy", STRATEGY),
+                                              ("set_goal", goal), ("finish", {"summary": "Charter saved."})])
+        self.assertEqual((results[3][1], run["status"]), ("Session ended.", "done"))
 
     def test_the_plan_needs_three_tasks(self):
         c = self.founding("plan")

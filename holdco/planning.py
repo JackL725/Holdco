@@ -864,7 +864,9 @@ def cycle_header(company: dict, requested: bool = False) -> str:
 # =============================================================== 4.1, 4.4 staged founding
 
 FOUNDING_STAGES = ("research", "charter", "critic", "plan")
-STAGE_STEPS = {"research": 12, "charter": 10, "critic": 6, "plan": 12}
+# Phase 2: the charter stage also writes the strategy and one to three goals (two more calls than before, plus room
+# for one refused attempt).
+STAGE_STEPS = {"research": 12, "charter": 12, "critic": 6, "plan": 12}
 STAGE_TEXT = {"research": "researching the market", "charter": "writing the charter",
               "critic": "a skeptical investor is reviewing the charter", "plan": "planning the first week"}
 STAGE_THINK = {"research": "medium", "charter": "high", "critic": "high", "plan": "high"}
@@ -978,7 +980,7 @@ def founding_prompt(company: dict, context: str, stage: str, roles_list: str, na
     if stage == "critic":
         return head + _critic_text(steps)
     if stage == "plan":
-        return head + _plan_text(steps)
+        return head + _plan_text(company, steps)
     return head + _research_text(steps, search_down)
 
 
@@ -1079,10 +1081,30 @@ def stage_problem(company: dict, stage: str) -> str | None:
     if stage == "charter":
         missing = validate_charter(company.get("charter") or "")
         if not missing:
-            return None
+            return brain_problem(company)
         return ("the company record has no complete charter yet (missing or empty: " + "; ".join(missing)
                 + "). Call update_charter with the full charter, one '## ' heading per section, then call finish "
                   "again.")
+    return None
+
+
+def brain_problem(company: dict) -> str | None:
+    """Phase 2: what the charter stage has not written into the brain yet (the strategy, a goal), or None. Like
+    every stage check it is said once (tools.finish); after that founding moves on, and a company that still has
+    no strategy or goals gets them in the CEO's first planning cycle."""
+    if not (_tool_ready("set_strategy") and _tool_ready("set_goal")):
+        return None
+    from . import brain   # imported here: brain imports tools, which imports this module
+    row = brain.get_strategy(company["id"]) or {}
+    empty = [f for f in brain.STRATEGY_FIELDS if not str(row.get(f) or "").strip()]
+    goals = int(db.scalar("SELECT COUNT(*) FROM goals WHERE company_id=? AND status='active'", (company["id"],)) or 0)
+    if empty:
+        return ("the brain has no strategy yet (missing: " + ", ".join(empty) + "). Call set_strategy with all "
+                "seven fields taken from the charter" + ("" if goals else ", then set_goal one to three times (each "
+                                                             "a number with a date)") + ", then call finish again.")
+    if not goals:
+        return ("the brain has no goals yet. Call set_goal one to three times (each a number to reach by a date), "
+                "then call finish again.")
     return None
 
 
@@ -1110,8 +1132,9 @@ def _charter_text(company: dict, named: bool, steps: int) -> str:
         lines.append("Your last attempt did not save a complete charter. Missing or empty: " + "; ".join(missing)
                      + ". Fix exactly these and call update_charter again.")
     elif saved and not missing:
-        lines.append("A complete charter is already saved (see The company section). Check it against the list "
-                     "below; call update_charter only to fix something thin or wrong, then finish.")
+        lines.append("A complete charter is already saved (docs/charter.md). Check it against the list below; call "
+                     "update_charter only to fix something thin or wrong, then write the brain (below) if it is "
+                     "not written yet.")
     elif saved:
         lines.append("A draft charter is saved but incomplete. Missing or empty: " + "; ".join(missing) + ".")
     research_note = str(db.company_settings(company).get("founding_research_note") or "").strip()
@@ -1128,7 +1151,30 @@ def _charter_text(company: dict, named: bool, steps: int) -> str:
         lines.append("Use this playbook for the type of business: build its riskiest assumption and first "
                      "experiments into the charter.\n" + pb)
     lines.append(("" if named else "Give the company a short, memorable name with company_name. ")
-                 + "Pass one_liner and stage 'building'. Then call finish.")
+                 + "Pass one_liner and stage 'building'.")
+    lines.append(_brain_steps(company))
+    return "\n".join(lines)
+
+
+def _brain_steps(company: dict) -> str:
+    """Phase 2: after update_charter, the charter stage writes the brain every agent reads first."""
+    from . import brain   # imported here: brain imports tools, which imports this module
+    cid = company["id"]
+    goals = brain.active_goals(cid)
+    deadline = (_dt.date.today() + _dt.timedelta(days=60)).isoformat()
+    lines = ["Then write the company brain from the charter (every agent reads it first):",
+             "1. Call set_strategy with all seven fields, one or two sentences each: one_liner, icp (the customer "
+             "who buys), problem, offer, price, positioning (why us and not the alternatives) and voice (how we "
+             "sound).",
+             "2. Call set_goal one to three times. Each goal is a number to reach by a date in the next 30 to 90 "
+             "days, measured by one metric, with the role that owns it. The first goal is evidence of demand, for "
+             f'example set_goal(title="20 waitlist signups", metric="waitlist_signups", target=20, '
+             f'deadline="{deadline}", owner_role="marketing"). Write down the goal numbers it returns.',
+             "3. Call finish."]
+    if brain.has_strategy(cid) or goals:
+        lines.append("Already in the brain: " + ("the strategy" if brain.has_strategy(cid) else "no strategy")
+                     + "; goals: " + ("; ".join(brain.goal_line(g) for g in goals) or "none")
+                     + ". Add only what is missing.")
     return "\n".join(lines)
 
 
@@ -1148,16 +1194,29 @@ def _critic_text(steps: int) -> str:
     )
 
 
-def _plan_text(steps: int) -> str:
+def _plan_goals(company: dict) -> str:
+    """Phase 2: the goals the first tasks serve, one goal_line each (the numbers are the goal_id to use)."""
+    from . import brain   # imported here: brain imports tools, which imports this module
+    goals = brain.active_goals(company["id"])
+    if not goals:
+        return ("\nThe company has no goals yet: leave goal_id out, but still give every task its expected effect. "
+                "The CEO sets the goals in its first planning cycle.\n")
+    return ("\nGoals (the numbers set_goal returned in the charter stage; use them as goal_id):\n"
+            + "\n".join(brain.goal_line(g) for g in goals) + "\n")
+
+
+def _plan_text(company: dict, steps: int) -> str:
     return (
         f"\nThis stage: plan the first week. You have {steps} tool calls.\n"
-        "Do this, in order:\n"
+        + _plan_goals(company)
+        + "\nDo this, in order:\n"
         f"1. Read docs/charter.md and {CRITIQUE_PATH}.\n"
         "2. Create 5 to 8 first tasks with create_task across the team (assign by role), each with a deliverable "
-        "(a file path, or an action like 'email queued') and 3 to 5 acceptance criteria. Test demand before "
-        "building product: the first week must include contact with real customers or providers. The first "
-        "engineering task is a landing page at site/index.html with a clear offer and a working signup form. "
-        "Never create a task whose only output is a status file.\n"
+        "(a file path, or an action like 'email queued'), 3 to 5 acceptance criteria, goal_id (the goal it "
+        "serves, from the list above) and expected (what it should move and by how much, for example '10 "
+        "waitlist signups'). Test demand before building product: the first week must include contact with real "
+        "customers or providers. The first engineering task is a landing page at site/index.html with a clear "
+        "offer and a working signup form. Never create a task whose only output is a status file.\n"
         f"3. Turn each risk in {CRITIQUE_PATH} into a task, or into an acceptance criterion of one, or name it in "
         "the welcome brief as a risk we accept and why.\n"
         "4. Send the owner a short welcome brief with report_to_owner: the plan for week one, the riskiest "

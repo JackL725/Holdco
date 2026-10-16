@@ -205,7 +205,10 @@ class TestPresets(unittest.TestCase):
             self.assertIn(p["category"], presets.CATEGORIES)
             self.assertIn(p["reasoning"], ("low", "medium", "high"))
             self.assertIn(p["creativity"], llm.CREATIVITY_TEMPS)
-            self.assertLessEqual(len(p["tools"]), 15, f"{key} has too many tools for a small model")
+            # Phase 2: planning needs the brain tools (brain_lookup, propose_brain_change, add_lesson; the CEO's
+            # set_strategy, set_goal and the rest), so the cap rose from 15 to 18 for executors and 24 for the CEO.
+            cap = 24 if key == "ceo" else 18
+            self.assertLessEqual(len(p["tools"]), cap, f"{key} has too many tools for a small model")
             unknown = [t for t in p["tools"] if t not in tools.REGISTRY]
             self.assertFalse(unknown, f"{key} uses unknown tools {unknown}")
             self.assertIn("finish", p["tools"])
@@ -213,7 +216,8 @@ class TestPresets(unittest.TestCase):
             self.assertLess(len(presets.render(key)), 4500, f"{key} role prompt is too long")
             for r in p["routines"]:
                 self.assertGreater(r["every_hours"], 0)
-                self.assertIn(r["requires"], ("", "imap", "smtp"))
+                self.assertIn(r["requires"], ("", "imap", "smtp", "no_analyst"))
+                self.assertIn(r["at_hour"], (None, *range(24)))
             self.assertTrue(all(u.startswith("https://") for u in p["sources"]))
 
     def test_templates(self):

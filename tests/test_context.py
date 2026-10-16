@@ -241,7 +241,8 @@ class TestIndex(Base):
 
     def test_new_memory_and_task_updates_are_found(self):
         context.reindex(self.c)
-        tools.execute(self.ctx, "remember", {"content": "The owner prefers the capybara brand name."})
+        # Phase 2 took remember off every belt; the memory table still gets rows (owner notes, decision records)
+        tools.remember(self.ctx, "The owner prefers the capybara brand name.")
         self.assertIn("capybara", self.tool("search", query="capybara", scope="memory"))   # the tool reindexes first
         ceo = ctx_for(self.c, "ceo")
         out = tools.execute(ceo, "create_task", {"title": "Survey roofers", "assign_to": "engineering"})

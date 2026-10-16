@@ -11,13 +11,16 @@ from __future__ import annotations
 
 # A routine is a recurring duty: the scheduler creates the task when it is due.
 #   every_hours: how often; first_after_hours: company age before the first one;
-#   requires: "imap" / "smtp" when it only makes sense with email connected.
+#   requires: "imap" / "smtp" when it only makes sense with email connected, "no_analyst" when only a company
+#   without an enabled analyst needs it (Phase 2: the CEO writes the evening brief then);
+#   at_hour (Phase 2): the local hour (0-23) the duty waits for, so "morning" and "evening" mean something.
 
 
-def R(title, description, every_hours, first_after_hours=None, priority=3, deliverable="", requires=""):
+def R(title, description, every_hours, first_after_hours=None, priority=3, deliverable="", requires="",
+      at_hour=None):
     return {"title": title, "description": description, "every_hours": every_hours,
             "first_after_hours": first_after_hours if first_after_hours is not None else every_hours,
-            "priority": priority, "deliverable": deliverable, "requires": requires}
+            "priority": priority, "deliverable": deliverable, "requires": requires, "at_hour": at_hour}
 
 
 PRESETS: dict[str, dict] = {
@@ -34,7 +37,7 @@ PRESETS: dict[str, dict] = {
         ),
         "done": [
             "Every open task has one owner, a deliverable path and 3-5 checkable acceptance criteria.",
-            "At most 3 priorities are active, each tied to an objective in the charter.",
+            "At most 3 goals are active (set_goal), and every open task names the goal it serves.",
             "Work reported as done was checked against evidence: the file exists and meets its criteria, the page "
             "loads, the request was approved.",
         ],
@@ -52,8 +55,8 @@ PRESETS: dict[str, dict] = {
             "chains of more than two dependent steps.",
             "Write each task like the example below: objective, inputs and out-of-scope in the description, plus a "
             "deliverable path and acceptance criteria.",
-            "Record important decisions in docs/decisions.md (date, decision, options considered, why, reversible "
-            "or not).",
+            "Record important decisions with log_decision (what, why, the result you expect, reversible or not), "
+            "review the team's brain proposals with review_brain_change, and save lessons with add_lesson.",
             "Message the owner only when something changed, a decision is needed or something went wrong. Then finish.",
         ],
         "rules": [
@@ -80,19 +83,34 @@ PRESETS: dict[str, dict] = {
         ),
         "kpis": ["the North Star metric in the charter", "weekly growth of that metric", "tasks verified done per week",
                  "owner decisions waiting"],
-        "tools": ["list_tasks", "create_task", "update_task", "read_file", "write_file", "web_search", "remember",
-                  "recall", "record_metric", "report_to_owner", "ask_owner", "update_charter", "hire_agent", "finish"],
+        # Phase 2: the brain tools (the CEO writes the brain directly) and the decisions queue; remember and
+        # record_metric left (connectors and the analyst feed the metrics). write_brief: the CEO writes the evening
+        # brief when no analyst exists, and the weekly and monthly memos.
+        "tools": ["list_tasks", "create_task", "update_task", "read_file", "write_file", "web_search", "recall",
+                  "report_to_owner", "ask_owner", "update_charter", "hire_agent", "find_tool", "brain_lookup",
+                  "add_lesson", "set_strategy", "set_goal", "drop_goal", "log_decision", "start_experiment",
+                  "conclude_experiment", "review_brain_change", "ask_decision", "write_brief", "finish"],
         "routines": [
-            R("Morning report",
-              "Send the owner a short morning report with report_to_owner: what shipped in the last 24 hours (with "
-              "file paths), what's blocked, numbers that moved, today's top 3 priorities and anything you need from "
-              "them. Keep it under 200 words and only include things you can point to.",
-              24, 20, priority=2),
+            # Phase 2 rhythms: code gathers the numbers (rhythms.task_data_section puts them in the task) and the
+            # brief rows are the deliverables.
+            R("Morning plan",
+              "Plan today from the data in this task: the top 3 priorities per goal, added at the top of "
+              "docs/daily-plan.md. Queue the tasks they need with create_task (goal_id and expected on each) and "
+              "raise blockers with ask_decision or ask_owner.",
+              24, 20, priority=2, deliverable="docs/daily-plan.md", at_hour=7),
+            R("Evening brief",
+              "Write today's one-page brief with write_brief(kind=\"daily\"), using only the numbers in this task's "
+              "data.",
+              24, 20, priority=2, requires="no_analyst", at_hour=18),
             R("Weekly review",
-              "Review the week. Compare KPIs with last week (use ops/kpi-report.md if it exists), score each "
-              "objective from 0 to 1, list 3 wins and 3 misses with causes, and append the review to "
-              "docs/weekly-review.md. Update the charter if the strategy changed.",
-              168, 160, priority=2, deliverable="docs/weekly-review.md"),
+              "Review the week from the data in this task: conclude experiments that are due, log decision outcomes, "
+              "attach a goal to every open task or cancel it, adjust the goals, then write the board memo with "
+              "write_brief(kind=\"weekly\").",
+              168, 160, priority=2, at_hour=9),
+            R("Monthly strategy check",
+              "Judge the month from the data in this task: write_brief(kind=\"monthly\"), then one ask_decision: keep, "
+              "change or kill the company, with your recommendation.",
+              720, 700, priority=2),
         ],
         "reasoning": "high", "creativity": "precise",
         "sources": [
@@ -140,7 +158,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["experiments run", "hypotheses resolved", "activation rate"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "list_tasks", "create_task",
-                  "remember", "recall", "ask_owner", "finish"],
+                  "recall", "ask_owner", "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [
             R("Roadmap review",
               "Re-score open bets in docs/roadmap.md with RICE using the latest metrics, judge any bet whose test "
@@ -183,7 +201,7 @@ PRESETS: dict[str, dict] = {
             "Size markets bottom-up: reachable customers x yearly revenue per customer. Use top-down figures only as "
             "a sanity check.",
             "If two searches in a row find nothing useful, stop searching: write what you have and list the gaps.",
-            "Save the file, remember the 1-3 most important findings, and finish.",
+            "Save the file, record the 1-3 most important prices or numbers with record_fact, and finish.",
         ],
         "rules": [
             "Never invent a source, quote, statistic or price. A clearly marked gap is better than a guess; models "
@@ -194,12 +212,12 @@ PRESETS: dict[str, dict] = {
             "Say when figures mix currencies or years.",
         ],
         "kpis": ["share of claims with sources (target 100%)", "findings used in decisions"],
-        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "remember", "recall",
-                  "create_task", "ask_owner", "finish"],
+        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "recall", "create_task",
+                  "ask_owner", "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [
             R("Competitor watch",
               "Revisit the websites and pricing pages in research/competitors.md. Record any changes to prices, "
-              "features or positioning with today's date, update the file, and remember notable changes.",
+              "features or positioning with today's date, update the file, and record changed prices with record_fact.",
               168, 120, deliverable="research/competitors.md"),
         ],
         "reasoning": "medium", "creativity": "precise",
@@ -233,7 +251,8 @@ PRESETS: dict[str, dict] = {
             "Group by tag and count independent sources per pain. A real problem shows up across several sources, "
             "with emotion, and with people paying for workarounds.",
             "When asked for interviews, write 3 learning goals, then questions about specific past events.",
-            "Save, remember the top 3 pains, and finish.",
+            "Save; if the top 3 pains change who our customer is or what problem we solve, propose it with "
+            "propose_brain_change; then finish.",
         ],
         "rules": [
             "Interview questions follow The Mom Test: ask about their life and past behaviour (\"Tell me about the "
@@ -246,8 +265,8 @@ PRESETS: dict[str, dict] = {
             "Never contact anyone yourself; the owner runs interviews.",
         ],
         "kpis": ["independent sources per top pain", "pains validated by real behaviour"],
-        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "remember", "recall",
-                  "create_task", "finish"],
+        "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "recall", "create_task",
+                  "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [
             R("Fresh customer voices",
               "Find reviews and posts from the last 30 days about our problem space and competitors and add them to "
@@ -303,7 +322,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["audit blockers (0)", "page weight", "visitor-to-signup rate"],
         "tools": ["read_file", "write_file", "list_files", "delete_file", "audit_page", "check_contrast", "web_search",
-                  "fetch_url", "run_code", "deploy_site", "create_task", "remember", "finish", "browser_check"],
+                  "fetch_url", "run_code", "deploy_site", "create_task", "brain_lookup", "propose_brain_change",
+                  "add_lesson", "finish", "browser_check"],
         "routines": [],
         "reasoning": "high", "creativity": "precise",
         "sources": [
@@ -347,7 +367,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["blockers caught before publishing", "time to fix"],
         "tools": ["list_tasks", "read_file", "list_files", "audit_page", "check_contrast", "review_text", "fetch_url",
-                  "write_file", "create_task", "remember", "finish", "browser_check"],
+                  "write_file", "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "finish",
+                  "browser_check"],
         "routines": [
             R("Daily review",
               "Review work finished in the last 24 hours that hasn't been reviewed yet (see list_tasks with status "
@@ -403,7 +424,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["contrast failures (0)", "consistency issues found in review"],
         "tools": ["read_file", "write_file", "list_files", "check_contrast", "audit_page", "review_text", "web_search",
-                  "fetch_url", "create_task", "remember", "finish", "browser_check"],
+                  "fetch_url", "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "finish",
+                  "browser_check"],
         "routines": [],
         "reasoning": "medium", "creativity": "balanced",
         "sources": [
@@ -448,7 +470,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["visitor-to-signup rate (median landing page: 6.6%)", "signups by channel", "experiments completed"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "social_post", "create_task",
-                  "remember", "recall", "record_metric", "ask_owner", "finish"],
+                  "recall", "record_metric", "ask_owner", "brain_lookup", "propose_brain_change", "add_lesson",
+                  "finish"],
         "routines": [
             R("Weekly growth plan",
               "Review last week's signups by channel and experiment results, pick the single best channel to double "
@@ -496,7 +519,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["indexed pages", "search impressions and clicks", "signups from organic search"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "review_text", "audit_page",
-                  "create_task", "remember", "finish", "browser_check"],
+                  "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "finish", "browser_check"],
         "routines": [
             R("Weekly article",
               "Research and write one high-quality article for a question our customers search for, following your "
@@ -541,8 +564,8 @@ PRESETS: dict[str, dict] = {
             "No fake accounts, bought followers, fake engagement or automated DMs.",
         ],
         "kpis": ["engagement rate", "clicks to the site", "signups from social"],
-        "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "social_post", "remember",
-                  "recall", "create_task", "finish"],
+        "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "social_post", "recall",
+                  "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [
             R("Weekly posts",
               "Draft 3-5 posts for the coming week on our best platforms, following your workflow, and queue them "
@@ -592,7 +615,8 @@ PRESETS: dict[str, dict] = {
         "kpis": ["welcome-email click rate (about 4% is typical)", "activation rate", "unsubscribes under 0.5%",
                  "complaints under 0.1%"],
         "tools": ["read_file", "write_file", "review_text", "send_email", "web_search", "fetch_url", "create_task",
-                  "remember", "record_metric", "finish"],
+                  "record_metric", "brain_lookup", "propose_brain_change", "add_lesson", "add_contact",
+                  "update_contact", "finish"],
         "routines": [
             R("Newsletter draft",
               "Write next week's newsletter issue in marketing/email/newsletter.md (one main idea, real news only, "
@@ -639,7 +663,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["CPA vs target", "click-through rate", "landing-page conversion", "payback period"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "request_purchase",
-                  "create_task", "remember", "ask_owner", "finish"],
+                  "create_task", "ask_owner", "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [],
         "reasoning": "high", "creativity": "balanced",
         "sources": [
@@ -673,7 +697,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["partners contacted", "replies", "signups from partners"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "send_email", "check_inbox",
-                  "remember", "recall", "create_task", "finish"],
+                  "recall", "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "add_contact",
+                  "update_contact", "finish"],
         "routines": [],
         "reasoning": "medium", "creativity": "balanced",
         "sources": [
@@ -722,7 +747,8 @@ PRESETS: dict[str, dict] = {
         "kpis": ["reply rate (3%+)", "positive replies", "meetings per 100 leads", "bounces under 2%",
                  "complaints under 0.1%"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "review_text", "send_email", "check_inbox",
-                  "mark_email_handled", "remember", "recall", "create_task", "finish"],
+                  "mark_email_handled", "recall", "create_task", "brain_lookup", "propose_brain_change", "add_lesson",
+                  "add_contact", "update_contact", "finish"],
         "routines": [
             R("Follow-ups and replies",
               "Check sales/pipeline.md for leads contacted 3 or more days ago with no reply and fewer than 4 touches, "
@@ -778,8 +804,9 @@ PRESETS: dict[str, dict] = {
             "deadlines (one month under GDPR, 45 days under CCPA), so escalate them the same day.",
         ],
         "kpis": ["first response time", "resolved without reopening", "satisfaction (75-85% is healthy)", "escalations"],
-        "tools": ["check_inbox", "read_file", "write_file", "send_email", "mark_email_handled", "recall", "remember",
-                  "ask_owner", "create_task", "finish"],
+        "tools": ["check_inbox", "read_file", "write_file", "send_email", "mark_email_handled", "recall", "ask_owner",
+                  "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "add_contact", "update_contact",
+                  "finish"],
         "routines": [
             R("Inbox sweep",
               "Use check_inbox and handle every unhandled email following your workflow.",
@@ -832,8 +859,9 @@ PRESETS: dict[str, dict] = {
             "payment processor.",
         ],
         "kpis": ["activation rate (SaaS median about 30%)", "monthly churn", "failed-payment recovery"],
-        "tools": ["read_file", "write_file", "check_inbox", "send_email", "review_text", "recall", "remember",
-                  "record_metric", "create_task", "ask_owner", "finish"],
+        "tools": ["read_file", "write_file", "check_inbox", "send_email", "review_text", "recall", "record_metric",
+                  "create_task", "ask_owner", "brain_lookup", "propose_brain_change", "add_lesson", "add_contact",
+                  "update_contact", "finish"],
         "routines": [
             R("Churn review",
               "Review churn signals and recent cancellations, update support/churn-signals.md, and queue check-ins for "
@@ -885,7 +913,8 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["runway (months)", "gross margin (SaaS ~70%+)", "net burn", "payback on acquisition cost (<12 months)"],
         "tools": ["read_file", "write_file", "list_files", "record_metric", "request_purchase", "web_search",
-                  "fetch_url", "run_code", "remember", "recall", "create_task", "ask_owner", "finish"],
+                  "fetch_url", "run_code", "recall", "create_task", "ask_owner", "brain_lookup", "propose_brain_change",
+                  "add_lesson", "finish"],
         "routines": [
             R("Monthly close",
               "Run the monthly close from your workflow for the month that just ended and write "
@@ -937,7 +966,7 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["open compliance risks", "days to fix"],
         "tools": ["web_search", "fetch_url", "read_file", "write_file", "list_files", "audit_page", "create_task",
-                  "remember", "ask_owner", "report_to_owner", "finish"],
+                  "ask_owner", "report_to_owner", "brain_lookup", "propose_brain_change", "add_lesson", "finish"],
         "routines": [
             R("Compliance check",
               "Re-check the website and recent outbound messages against ops/compliance.md, update statuses with "
@@ -990,8 +1019,13 @@ PRESETS: dict[str, dict] = {
         ],
         "kpis": ["report delivered on time", "data problems fixed"],
         "tools": ["read_file", "write_file", "list_files", "record_metric", "http_request", "run_code", "recall",
-                  "remember", "report_to_owner", "create_task", "finish"],
+                  "report_to_owner", "create_task", "brain_lookup", "propose_brain_change", "add_lesson", "write_brief",
+                  "finish"],
         "routines": [
+            R("Evening brief",
+              "Write today's one-page brief with write_brief(kind=\"daily\"), using only the numbers in this task's "
+              "data.",
+              24, 20, priority=2, at_hour=18),
             R("Weekly KPI report",
               "Write this week's KPI report following your workflow and send the owner a 3-line summary.",
               168, 160, priority=2, deliverable="ops/kpi-report.md"),
@@ -1044,8 +1078,9 @@ TEMPLATES: dict[str, dict] = {
 DEFAULT_TEMPLATE = "launch"
 
 # Tools every custom (non-preset) agent gets.
+# Phase 2: remember gave way to the brain (lessons and facts are proposed to it; recall still reads memory).
 CUSTOM_TOOLS = ["web_search", "fetch_url", "read_file", "write_file", "list_files", "review_text", "send_email",
-                "social_post", "create_task", "remember", "recall", "ask_owner", "finish"]
+                "social_post", "create_task", "recall", "ask_owner", "brain_lookup", "propose_brain_change", "finish"]
 
 
 def get(key: str) -> dict | None:
@@ -1059,8 +1094,8 @@ def summary_list() -> list[dict]:
         out.append({"key": key, **{k: p[k] for k in ("name", "title", "category", "summary", "mission", "done",
                                                     "workflow", "rules", "kpis", "tools", "reasoning", "creativity",
                                                     "sources")},
-                    "routines": [{"title": r["title"], "every_hours": r["every_hours"], "requires": r["requires"]}
-                                 for r in p["routines"]]})
+                    "routines": [{"title": r["title"], "every_hours": r["every_hours"], "requires": r["requires"],
+                                  "at_hour": r.get("at_hour")} for r in p["routines"]]})
     return out
 
 

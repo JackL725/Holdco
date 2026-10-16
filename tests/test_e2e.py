@@ -184,7 +184,7 @@ class EndToEnd(unittest.TestCase):
         db.commit()
         db.close()
         wait_for(lambda: {t["routine"] for t in self.tasks(self.cid) if t["routine"]} >=
-                 {"ceo:Morning report", "qa:Daily review", "qa:Weekly site audit", "research:Competitor watch"},
+                 {"ceo:Morning plan", "qa:Daily review", "qa:Weekly site audit", "research:Competitor watch"},
                  30, what="recurring duties")
         routines = {t["routine"] for t in self.tasks(self.cid) if t["routine"]}
         self.assertNotIn("support:Inbox sweep", routines)          # needs email connected
