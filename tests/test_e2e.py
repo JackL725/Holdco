@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fake_ollama import FakeModelServer  # noqa: E402
-from tests.helpers import HoldcoProcess, wait_for  # noqa: E402
+from tests.fake_telegram import FakeTelegram  # noqa: E402
+from tests.helpers import HoldcoProcess, free_port, wait_for  # noqa: E402
 
 
 class EndToEnd(unittest.TestCase):
@@ -245,6 +247,128 @@ class EndToEnd(unittest.TestCase):
         self.api.delete(f"/api/companies/{self.cid2}", {"confirm": "BrewBuzz"})
         self.assertNotIn(self.cid2, [c["id"] for c in self.api.get("/api/state")["companies"]])
         self.assertTrue((Path(self.app.data_dir) / "trash").exists())
+
+    # ---------------------------------------------------------------- phase 0: stabilize
+    def test_16_doctor(self):
+        d = self.api.get("/api/doctor")
+        rows = {r["key"]: r for r in d["checks"]}
+        self.assertIn("model_server", rows)
+        self.assertEqual(rows["model_server"]["status"], "ok", rows["model_server"])
+        for key in ("key", "label", "status", "detail", "fix", "checked_at"):
+            self.assertIn(key, rows["model_server"])
+        self.assertTrue({"ok", "warn", "bad", "checked_at"} <= set(d["summary"]), d["summary"])
+        self.assertIn("doctor", self.api.get("/api/state"))
+        r = self.api.post("/api/doctor/run", {})
+        self.assertTrue(r["checks"])
+        self.assertEqual(next(x for x in r["checks"] if x["key"] == "model_server")["status"], "ok")
+        self.assertTrue(all(x["status"] in ("ok", "warn", "bad") for x in r["checks"]))
+        # a backup on demand shows up in the list and on disk
+        b = self.api.post("/api/backup")
+        self.assertTrue(b["name"].startswith("holdco-") and b["name"].endswith(".zip"), b)
+        listed = self.api.get("/api/backups")
+        self.assertIn(b["name"], [x["name"] for x in listed["backups"]])
+        self.assertTrue((Path(self.app.data_dir) / "backups" / b["name"]).exists())
+        self.assertEqual(listed["keep"], 14)
+        self.assertEqual(next(x for x in self.api.get("/api/doctor")["checks"] if x["key"] == "backup")["status"], "ok")
+
+    def test_17_preflight(self):
+        body = {"idea": "A weekly newsletter for home bakers", "template": "minimal", "name": "Preflight Co"}
+        self.api.put("/api/settings", {"llm_base_url": f"http://127.0.0.1:{free_port()}"})
+        try:
+            r = self.api.post("/api/companies", body, expect=409)
+            self.assertIn("Fix this before founding", r["error"])
+            checks = {c["key"]: c for c in r["checks"]}
+            self.assertEqual(checks["model_server"]["status"], "bad", checks)
+            self.assertEqual(checks["model_server"]["fix"]["kind"], "link")
+        finally:
+            self.api.put("/api/settings", {"llm_base_url": self.model.url})
+        # the preflight merged its bad row into the cache; a fresh run clears it
+        fresh = self.api.post("/api/doctor/run", {})["checks"]
+        self.assertEqual(next(x for x in fresh if x["key"] == "model_server")["status"], "ok")
+        # with the model back, founding works again without force (no company is founded on a dead model)
+        c = self.api.post("/api/companies", body)["company"]
+        wait_for(lambda: self.api.get(f"/api/companies/{c['id']}")["company"]["status"] == "active", 60,
+                 what="Preflight Co founding")
+        self.assertEqual(self.api.get(f"/api/companies/{c['id']}")["company"]["name"], "Preflight Co")
+        self.api.delete(f"/api/companies/{c['id']}", {"confirm": "Preflight Co"})
+        self.assertNotIn(c["id"], [x["id"] for x in self.api.get("/api/state")["companies"]])
+
+    def test_18_kill_switch(self):
+        self.assertTrue(self.api.post("/api/kill", {"on": True})["kill_switch"])
+        self.assertTrue(self.api.get("/api/state")["kill_switch"])
+        # sessions already running end at their next step; wait for that so the run count is stable
+        wait_for(lambda: self.api.get("/api/state")["running"] == 0, 30, what="agents to stop")
+        echo = self.agent(self.cid, "marketing")
+        before = len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"])
+        t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Write launch post while stopped",
+                                                              "agent_id": echo["id"], "priority": 1})["task"]
+        time.sleep(4)
+        self.assertEqual(len(self.api.get(f"/api/companies/{self.cid}/runs")["runs"]), before)
+        self.assertEqual(next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"], "todo")
+        requests = [a for a in self.pending() if a["action"] != "question"]
+        if requests:
+            r = self.api.post(f"/api/approvals/{requests[0]['id']}", {"decision": "approve"}, expect=400)
+            self.assertIn("kill switch", r["error"].lower())
+        # (no pending request means every one was decided earlier; TestKillSwitch covers decide() directly)
+        self.assertFalse(self.api.post("/api/kill", {"on": False})["kill_switch"])
+        self.assertFalse(self.api.get("/api/state")["kill_switch"])
+        wait_for(lambda: next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"] != "todo", 60,
+                 what="the task to run after resume")
+
+    def test_19_phone(self):
+        fake = FakeTelegram().start()
+        try:
+            self.api.put("/api/settings", {"telegram_bot_token": fake.token, "telegram_chat_id": str(fake.chat_id),
+                                           "telegram_api_base": fake.url, "notify_level": "all"})
+            r = self.api.post("/api/notify/test")
+            self.assertTrue(r["ok"], r)
+            tests = [m for m in fake.sent if "Holdco test" in m.get("text", "")]
+            self.assertEqual(len(tests), 1, fake.sent)
+            self.assertEqual(tests[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "noop")
+            # a pending post with the same text would be deduplicated instead of announced: clear the way
+            for a in self.pending(self.cid):
+                if a["action"] == "social_post":
+                    self.api.post(f"/api/approvals/{a['id']}", {"decision": "reject"})
+            echo = self.agent(self.cid, "marketing")
+            self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Write launch post for the phone",
+                                                              "agent_id": echo["id"], "priority": 1})
+
+            def approve_button():
+                ids = {a["id"] for a in self.pending(self.cid) if a["action"] == "social_post"}
+                for m in fake.sent:
+                    for row in (m.get("reply_markup") or {}).get("inline_keyboard", []):
+                        for b in row:
+                            parts = str(b.get("callback_data", "")).split(":")
+                            if len(parts) == 3 and parts[0] == "a" and parts[2] == "approve" and int(parts[1]) in ids:
+                                return m, b["callback_data"]
+                return None
+            m, data = wait_for(approve_button, 60, what="the post request to reach the phone")
+            aid = int(data.split(":")[1])
+            self.assertIn("PawPlan", m["text"])
+            fake.push_callback(data, message_id=m["message_id"])
+            wait_for(lambda: any(a["id"] == aid and a["status"] == "done"
+                                 for a in self.api.get("/api/approvals?status=decided")["approvals"]),
+                     60, what="the phone button to approve the request")
+            wait_for(lambda: fake.answered and any(e["method"] == "editMessageText" for e in fake.edits), 10,
+                     what="callback answered and message edited")
+            self.assertIn("You:", next(e for e in fake.edits if e["method"] == "editMessageText")["text"])
+        finally:
+            self.api.put("/api/settings", {"telegram_bot_token": "", "telegram_chat_id": "",
+                                           "telegram_api_base": "https://api.telegram.org", "notify_level": "important"})
+            time.sleep(2)   # the poller sees the change on its next loop and exits before the fake goes away
+            fake.stop()
+
+    def test_20_audit(self):
+        rows = self.api.get("/api/audit")["audit"]
+        self.assertTrue(rows)
+        self.assertTrue(any(r["approved_by"] == "owner" for r in rows), [r["approved_by"] for r in rows])
+        self.assertTrue(all(isinstance(r["payload"], dict) for r in rows))
+        self.assertTrue(all(r["company_name"] for r in rows if r["company_id"]))
+        self.assertEqual([r["id"] for r in rows], sorted((r["id"] for r in rows), reverse=True))
+        mine = self.api.get(f"/api/audit?company_id={self.cid}&limit=5")["audit"]
+        self.assertTrue(mine and len(mine) <= 5 and all(r["company_id"] == self.cid for r in mine))
+        phone = next(r for r in rows if r["action"] == "social_post" and r["approved_by"] == "owner")
+        self.assertIn("content", phone["payload"])
 
 
 if __name__ == "__main__":

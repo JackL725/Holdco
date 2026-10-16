@@ -3,14 +3,25 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import threading
 import traceback
 
-from . import bus, config, db, llm, presets, roles, tools, workspace
+from . import bus, config, db, doctor, llm, presets, roles, tools, watchdog, workspace
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
 _running_lock = threading.Lock()
+
+# Loop guard bookkeeping. Re-reading or re-checking a file after it changed is progress, not a loop,
+# so a successful change to the workspace forgets the earlier read-only calls.
+_WORKSPACE_CHANGERS = {"write_file", "delete_file", "run_code"}
+_WORKSPACE_READERS = ("read_file", "list_files", "review_text", "audit_page")
+
+
+def _forget_reads(seen_calls: dict[str, int]) -> None:
+    for fp in [k for k in seen_calls if k.startswith(_WORKSPACE_READERS)]:
+        del seen_calls[fp]
 
 
 def is_running(agent_id: int) -> bool:
@@ -69,6 +80,10 @@ def _shared_rules(kind: str, max_steps: int) -> str:
         rules[0] = (f"You have {max_steps} tool calls for this reply; use them only if they help, then answer in "
                     "plain text.")
     else:
+        if kind == "task":
+            # Working notes are the retry's memory; without this nudge agents never think to call note_progress.
+            rules.append("If an approach fails or you are running low on steps, save what you learned with "
+                         "note_progress so the next attempt continues from it.")
         rules.append("Before finishing, read your deliverable back and check it against the acceptance criteria. "
                      "Then call finish with summary, status, deliverable, evidence, open_issues and next_step.")
     return "# Operating rules\n" + "\n".join(f"- {r}" for r in rules)
@@ -168,8 +183,16 @@ def cycle_prompt(company: dict) -> str:
 
 def task_prompt(company: dict, task: dict) -> str:
     prior = f"\nNotes from earlier attempts or reviews:\n{task['result'][-1500:]}\n" if task.get("result") else ""
-    retry = (f"\n(This is attempt {task['attempts']}. Earlier attempts didn't finish, so keep the scope tight and "
-             f"save progress early.)\n") if task.get("attempts", 0) > 1 else ""
+    notes = f"\nWorking notes from earlier attempts (continue from here):\n{task['notes'][-3000:]}\n" \
+        if task.get("notes") else ""
+    retry = ""
+    if task.get("attempts", 0) > 1:
+        try:
+            retry = "\n" + watchdog.retry_guidance(task) + "\n"
+        except NotImplementedError:
+            retry = (f"\n(This is attempt {task['attempts']}. Earlier attempts didn't finish, so keep the scope tight "
+                     f"and save progress early.)\n")
+    prior += notes
     deliverable = task.get("deliverable") or "(not specified: choose a sensible file path and name it in finish)"
     acceptance = task.get("acceptance") or "(none given: use your role's definition of done)"
     routine = "\nThis is one of your recurring duties.\n" if task.get("routine") else ""
@@ -188,13 +211,25 @@ def founding_prompt(company: dict, context: str) -> str:
     named = db.company_settings(company).get("name_locked")
     roles_list = ", ".join(a["role"] for a in db.q("SELECT role FROM agents WHERE company_id=? AND enabled=1",
                                                        (company["id"],)))
+    search_down = False
+    try:   # a health check must never stop a prompt from being built
+        row = doctor.search_status()
+        search_down = bool(row and row.get("status") == "bad")
+    except Exception:
+        pass
+    search_note = (
+        "\nWeb search is down right now. Skip the research step: write the charter from the idea and what you "
+        "already know, mark the research gaps in research/market.md, and ask the owner with report_to_owner to "
+        "tell you about the market. Do not call web_search more than once.\n"
+    ) if search_down else ""
     return (
         "You are founding a brand-new company. The owner's idea:\n"
         f'"""{company.get("idea")}"""\n'
         + (f"\nAbout the owner and their constraints:\n{context}\n" if context else "")
         + (f"\nThe owner already chose the name: {company['name']}. Keep it.\n" if named else "")
         + f"\nYour team's roles: {roles_list}.\n"
-        "\nDo this, in order:\n"
+        + search_note
+        + "\nDo this, in order:\n"
         "1. Research the market with web_search and fetch_url (3-6 searches): who the customers are, what they pay "
         "for today, real competitors and their prices, and where these customers can be reached.\n"
         "2. Save the findings, with source URLs, to research/market.md.\n"
@@ -335,6 +370,9 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     try:
         with slot:
             for step in range(max_steps):
+                if kind != "chat" and db.get_settings().get("kill_switch"):
+                    status, error = "stopped", "Kill switch: the owner stopped all agents."
+                    break
                 if kind in ("task", "cycle"):
                     c = db.get_company(company["id"])
                     a = db.get_agent(agent_id)
@@ -368,6 +406,8 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                             result = "Session stopped: repeated action."
                         else:
                             result = tools.execute(ctx, c.name, c.arguments)
+                            if c.name in _WORKSPACE_CHANGERS and not result.startswith("ERROR"):
+                                _forget_reads(seen_calls)
                         messages.append({"role": "tool", "name": c.name, "tool_call_id": c.id or f"call_{step}_{i}",
                                          "content": result})
                         bus.emit(company["id"], "result", f"{c.name}: {result[:200]}".replace("\n", " "), agent_id,
@@ -404,6 +444,111 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, tokens, steps)
 
 
+def _auto_note(agent: dict, task: dict, ctx, messages: list[dict], status: str, error: str) -> str:
+    """What an attempt that did not finish cleanly leaves behind for the next one."""
+    how = ctx.finish_status if ctx.finished else (status or "unknown")
+    calls = [tc for m in messages if m.get("role") == "assistant" for tc in (m.get("tool_calls") or [])]
+    last = "; ".join(f"{c['name']}({json.dumps(c.get('arguments') or {}, default=str)[:80]})" for c in calls[-3:])
+    parts = [f"Attempt {task.get('attempts') or 1} ended: {how}" + (f" ({error})" if error else "")]
+    if ctx.written:
+        parts.append("Files written: " + ", ".join(sorted(ctx.written)[:12]))
+    if last:
+        parts.append("Last tool calls: " + last)
+    errors = [m["content"][:160] for m in messages if m.get("role") == "tool" and str(m.get("content", "")).startswith(("ERROR", "FAILED"))]
+    if errors:
+        parts.append("Last error: " + errors[-1])
+    return "\n".join(parts)
+
+
+def _give_attempt_back(t: dict, error: str, ts: str) -> None:
+    """A run that could not reach the model server is nobody's failure: the task goes back to the queue with the
+    attempt uncounted and one short note, and the watchdog is not told (the stalled pattern covers outages)."""
+    n = int(t["attempts"] or 1)
+    db.update("tasks", t["id"], status="todo", attempts=max(0, n - 1), updated_at=ts)
+    try:
+        watchdog.add_note(t["id"], f"Attempt {n} ended: stopped (the model server could not be reached, so this "
+                                   f"attempt is not counted: {' '.join((error or '').split())[:120]})", "auto")
+    except NotImplementedError:
+        pass
+
+
+_ONE_LINER_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:#{1,6}\s*|\*\*|__)?\s*one[- ]liner\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$",
+                           re.I)
+
+
+def _strip_markdown(line: str) -> str:
+    """Plain text from one Markdown line: list and quote markers, emphasis, code ticks and link syntax removed."""
+    s = re.sub(r"^\s*(?:[-*+]|\d+[.)]|>)\s+", "", line or "")
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)
+    s = re.sub(r"[*_`]+", "", s)
+    return " ".join(s.split())
+
+
+def mission_from_charter(text: str) -> str:
+    """The one-liner in a charter: the text after "One-liner:" on the same line, else the first non-empty line
+    under a "One-liner" heading, as plain text."""
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        m = _ONE_LINER_RE.match(line)
+        if not m:
+            continue
+        rest = _strip_markdown(m.group(1))
+        if rest:
+            return rest[:300]
+        for nxt in lines[i + 1:]:
+            if nxt.strip().startswith("#"):
+                break   # the section was empty
+            plain = _strip_markdown(nxt)
+            if plain:
+                return plain[:300]
+    return ""
+
+
+def _sync_charter(company: dict | None) -> bool:
+    """When the charter column is empty but docs/charter.md exists, the file becomes the charter of record, and
+    the one-liner and stage are filled from it. The CEO sometimes writes the file with write_file and never calls
+    update_charter (the first real founding did exactly that). Returns True when something changed."""
+    if not company or (company.get("charter") or "").strip():
+        return False
+    try:
+        p = workspace.safe_path(company, "docs/charter.md")
+        if not p.is_file():
+            return False
+        text = p.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return False
+        fields: dict = {"charter": text[:200_000]}
+        if not (company.get("mission") or "").strip():
+            mission = mission_from_charter(text)
+            if mission:
+                fields["mission"] = mission
+        if (company.get("stage") or "idea") == "idea":
+            fields["stage"] = "building"
+        db.update("companies", company["id"], **fields)
+        bus.emit(company["id"], "charter", "took the charter from docs/charter.md (the CEO wrote the file but did "
+                 "not call update_charter)")
+        bus.notify("company", company_id=company["id"])
+        return True
+    except Exception:  # a file problem must never change how the founding run itself is recorded
+        traceback.print_exc()
+        return False
+
+
+def _tell_phone_founding(company: dict, thin: bool) -> None:
+    """Founding finished: one important message on the phone. A phone problem never touches the run."""
+    try:
+        from . import notify   # imported here: notify is loaded after this module
+        name = notify.escape(company["name"])
+        if thin:
+            text = f"<b>{name}</b>: founding ended partial; see your inbox."
+        else:
+            n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status='todo'", (company["id"],)) or 0
+            text = f"<b>{name}</b> is up and running: {n} task{'s' if n != 1 else ''} queued."
+        notify.send_later(text, kind="important")   # queued after any question announced in this run
+    except Exception as e:
+        print(f"notify failed: {e}")
+
+
 def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, tokens, steps) -> None:
     ts = db.now()
     cid, aid = company["id"], agent["id"]
@@ -417,7 +562,10 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
             bus.notify("messages", company_id=cid)
         if task:
             t = db.get_task(task["id"])
-            if t and t["status"] == "in_progress":
+            if (t and t["status"] == "in_progress" and status == "error" and not ctx.finished
+                    and watchdog.is_model_connection_error(error)):
+                _give_attempt_back(t, error, ts)
+            elif t and t["status"] == "in_progress":
                 if ctx.finished and ctx.finish_status != "partial":
                     new_status = {"done": "done", "blocked": "blocked", "waiting": "waiting"}[ctx.finish_status]
                 elif ctx.finished:
@@ -432,15 +580,36 @@ def _finalize(company, agent, kind, run_id, task, ctx, messages, status, error, 
                 if ctx.deliverable and not t.get("deliverable"):
                     fields["deliverable"] = ctx.deliverable[:200]
                 db.update("tasks", t["id"], **fields)
+                clean = ctx.finished and ctx.finish_status in ("done", "waiting", "blocked")
+                if not clean:
+                    # Phase 0: keep what this attempt learned, and let the watchdog decide whether to retry
+                    # differently or ask the owner.
+                    try:
+                        watchdog.add_note(t["id"], _auto_note(agent, t, ctx, messages, status, error), "auto")
+                        watchdog.task_failed(db.get_task(t["id"]), note, status if not ctx.finished else ctx.finish_status)
+                    except NotImplementedError:
+                        pass
             bus.notify("tasks", company_id=cid)
         if kind == "founding":
+            _sync_charter(db.get_company(cid))   # before the watchdog looks at whether a charter exists
             c = db.get_company(cid)
             if status in ("done", "out_of_steps") and c["status"] == "founding":
                 db.update("companies", cid, status="active", last_cycle_at=ts)
                 bus.emit(cid, "founding", f"{c['name']} is up and running. The team is starting on the first tasks.", aid)
+                thin = status == "out_of_steps" or (ctx.finished and ctx.finish_status != "done")
+                if thin:
+                    try:
+                        watchdog.founding_ended(db.get_company(cid), ctx.finish_status if ctx.finished else status, summary)
+                    except NotImplementedError:
+                        pass
+                _tell_phone_founding(c, thin)
             elif status == "error":
                 bus.emit(cid, "error", f"Founding stopped: {error}. Fix the model connection in Settings, then press "
                          "“Retry founding”.", aid)
+            elif status == "stopped":
+                # The company stays in "founding"; the scheduler restarts the run once the kill switch is off.
+                bus.emit(cid, "info", "Founding paused by the kill switch. It resumes on its own once the switch is "
+                         "turned off.", aid)
         if kind == "cycle":
             db.update("companies", cid, last_cycle_at=ts)
         db.run("UPDATE companies SET tokens_used = tokens_used + ? WHERE id=?", (tokens, cid))
@@ -507,9 +676,11 @@ def create_company(idea: str, name: str = "", context: str = "", template: str =
 
 
 def found(company_id: int) -> bool:
+    """Start a founding run for the company's CEO. Returns False when there is no CEO or the CEO is mid-run: the
+    status only becomes "founding" when a run really starts, so a busy CEO never leaves the company stuck there."""
     company = db.get_company(company_id)
     ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (company_id,))
-    if not company or not ceo:
+    if not company or not ceo or is_running(ceo["id"]):
         return False
     cs = db.company_settings(company)
     db.update("companies", company_id, status="founding")

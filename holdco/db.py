@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import sqlite3
 import threading
 from typing import Any
@@ -60,7 +61,12 @@ CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, name TEXT, value REAL, note TEXT DEFAULT '',
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY, created_at TEXT, company_id INTEGER, action TEXT, proposed_by TEXT DEFAULT '',
+    approved_by TEXT DEFAULT '', payload TEXT DEFAULT '{}', result TEXT DEFAULT '', approval_id INTEGER
+);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
+CREATE INDEX IF NOT EXISTS ix_audit_company ON audit(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_tasks_company ON tasks(company_id, status);
 CREATE INDEX IF NOT EXISTS ix_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS ix_memory_company ON memory(company_id);
@@ -105,7 +111,9 @@ def minutes_since(s: str | None) -> float:
 # Columns added after the first release; added to older databases on start.
 MIGRATIONS = {
     "agents": {"preset": "TEXT DEFAULT ''", "reasoning": "TEXT DEFAULT ''", "routines_on": "INTEGER DEFAULT 1"},
-    "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''"},
+    "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''",
+              # Phase 0: working notes that survive retries, and how often a task changed hands (watchdog)
+              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0"},
 }
 
 
@@ -168,6 +176,19 @@ def update(table: str, row_id: int, **fields) -> None:
     run(f"UPDATE {table} SET {cols} WHERE id=?", [*fields.values(), row_id])
 
 
+def backup_to(path) -> None:
+    """Copy the live database to `path` with SQLite's online backup, so the copy is consistent even in WAL mode
+    with writers active (a plain file copy could miss the WAL). Used by backup.run_backup."""
+    if _conn is None:
+        raise RuntimeError("The database is not open.")
+    with _lock:
+        dest = sqlite3.connect(str(path))
+        try:
+            _conn.backup(dest)
+        finally:
+            dest.close()
+
+
 # ---------- settings ----------
 
 def get_settings() -> dict:
@@ -186,7 +207,50 @@ def get_settings() -> dict:
     return s
 
 
+NOTIFY_LEVELS = ("important", "all")
+# Whole-number settings and the range they are clamped into (None = no upper bound). Out-of-range values are
+# pulled back silently because the form cannot produce anything harmful here, only something useless.
+SETTING_RANGES = {
+    "max_task_attempts": (1, 5),
+    "backup_keep": (1, 90),
+    "num_ctx": (2048, None),
+    "max_concurrent_runs": (1, 8),
+}
+_CHAT_ID_RE = re.compile(r"^-?\d+$")   # a Telegram chat id is a number; groups and channels are negative
+
+
+def validate_settings(values: dict) -> dict:
+    """Normalise the settings being saved and refuse the ones that would fail quietly later.
+
+    Numbers in SETTING_RANGES are clamped. A Telegram chat id is stripped and must be digits (with an optional
+    leading minus); notify_level must be "important" or "all". Those two raise ValueError, which the API turns
+    into a 400, because a wrong chat id makes every send fail with "chat not found" and an unknown level
+    would silently drop escalations.
+    """
+    out = {}
+    for k, v in values.items():
+        if k in SETTING_RANGES:
+            try:
+                n = v if isinstance(v, int) else int(float(str(v).strip()))
+            except (TypeError, ValueError):
+                raise ValueError(f"{k} must be a whole number") from None
+            low, high = SETTING_RANGES[k]
+            v = max(low, n if high is None else min(n, high))
+        elif k == "notify_level":
+            v = str(v or "").strip().lower()
+            if v not in NOTIFY_LEVELS:
+                raise ValueError("notify_level must be 'important' or 'all'")
+        elif k == "telegram_chat_id":
+            v = str(v or "").strip()
+            if v and not _CHAT_ID_RE.match(v):
+                raise ValueError("The Telegram chat id is a number (for example 123456789, or -100123456789 "
+                                 "for a group). Message your bot, press Send test message, and copy it from there.")
+        out[k] = v
+    return out
+
+
 def set_settings(values: dict) -> dict:
+    values = validate_settings(values)
     allowed = set(config.DEFAULT_SETTINGS) | {"policies"}
     for k, v in values.items():
         if k in allowed:

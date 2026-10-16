@@ -13,37 +13,11 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, bus, config, db, emailer, llm, presets, roles, workspace
+from . import actions, agents, backup, bus, config, db, doctor, emailer, llm, notify, presets, roles, watchdog, workspace  # noqa: F401
+from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
-ROUTES: list[tuple[str, re.Pattern, callable]] = []
-
-
-class HTTPError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-def route(method: str, pattern: str):
-    def deco(fn):
-        ROUTES.append((method, re.compile("^" + pattern + "$"), fn))
-        return fn
-    return deco
-
-
-def _int(v, default=0):
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _company_or_404(cid) -> dict:
-    c = db.get_company(_int(cid))
-    if not c:
-        raise HTTPError(404, "Company not found")
-    return c
+_int = to_int
+_company_or_404 = company_or_404
 
 
 def _public_company(c: dict) -> dict:
@@ -82,6 +56,8 @@ def api_state(h, m, body):
         "approvals": db.scalar("SELECT COUNT(*) FROM approvals WHERE status='pending'") or 0,
         "running": agents.running_count(False),
         "scheduler_enabled": s.get("scheduler_enabled", True),
+        "kill_switch": bool(s.get("kill_switch")),
+        "doctor": doctor.summary(),
         "model": s.get("default_model"),
         "agents": db.q("SELECT id, company_id, name, role, preset, title, status, enabled FROM agents ORDER BY id"),
         "version": __import__("holdco").__version__,
@@ -97,7 +73,10 @@ def api_settings(h, m, body):
 
 @route("PUT", "/api/settings")
 def api_settings_put(h, m, body):
-    s = db.set_settings(body or {})
+    try:
+        s = db.set_settings(body or {})
+    except ValueError as e:   # a malformed chat id or an unknown notify level: tell the owner, save nothing
+        raise HTTPError(400, str(e))
     bus.notify("settings")
     return {"settings": s}
 
@@ -113,19 +92,8 @@ def api_models(h, m, body):
 @route("POST", "/api/llm/test")
 def api_llm_test(h, m, body):
     s = db.get_settings()
-    model = (body or {}).get("model") or s["default_model"]
-    try:
-        t = llm.chat([{"role": "system", "content": "Reply briefly."},
-                      {"role": "user", "content": "Call the ping tool with message 'ok'."}],
-                     tools=[{"name": "ping", "description": "Reply to a ping",
-                             "parameters": {"type": "object", "properties": {"message": {"type": "string"}},
-                                            "required": ["message"]}}], model=model, settings=s)
-        if t.tool_calls:
-            return {"ok": True, "message": f"{model} is working and can call tools ({t.mode} mode)."}
-        return {"ok": True, "message": f"{model} replied, but didn't call the test tool. Agents may struggle; "
-                                       "a model with stronger tool use (e.g. gpt-oss:20b) is recommended."}
-    except llm.LLMError as e:
-        return {"ok": False, "message": str(e)}
+    ok, message = llm.tool_ping((body or {}).get("model") or s["default_model"], s)
+    return {"ok": ok, "message": message}
 
 
 @route("GET", "/api/presets")
@@ -156,8 +124,48 @@ def api_company_create(h, m, body):
     idea = (b.get("idea") or "").strip()
     if len(idea) < 8:
         raise HTTPError(400, "Describe the idea in at least a sentence.")
+    if not b.get("force"):
+        # Phase 0 preflight: refuse to found on a broken dependency and say why (the page offers "Found anyway").
+        try:
+            pf = doctor.preflight()
+        except NotImplementedError:
+            pf = {"ok": True, "checks": [], "soft": []}
+        if not pf["ok"]:
+            bad = [r for r in pf["checks"] if r["status"] == "bad"]
+            raise PreflightError("Fix this before founding: " + "; ".join(r["label"] + ": " + r["detail"] for r in bad),
+                                 pf["checks"])
     c = agents.create_company(idea, b.get("name", ""), b.get("context", ""), b.get("template", ""))
     return {"company": _public_company(c)}
+
+
+class PreflightError(HTTPError):
+    def __init__(self, message: str, checks: list[dict]):
+        super().__init__(409, message)
+        self.checks = checks
+
+
+@route("POST", "/api/kill")
+def api_kill(h, m, body):
+    # One helper for the dashboard button and the Telegram /stop and /resume commands: it saves the setting,
+    # emits the event and confirms on the phone without the identical-text rule, so a second ON within the
+    # hour is confirmed too (and the send runs in the background, so this answers at once).
+    on = notify.set_kill_switch(bool((body or {}).get("on", True)), by="owner")
+    return {"kill_switch": on}
+
+
+@route("GET", "/api/audit")
+def api_audit(h, m, body):
+    cid = _int(h.query.get("company_id", [0])[0])
+    limit = max(1, min(_int(h.query.get("limit", [100])[0], 100), 500))
+    sql = "SELECT a.*, c.name AS company_name FROM audit a LEFT JOIN companies c ON c.id=a.company_id"
+    params: list = []
+    if cid:
+        sql += " WHERE a.company_id=?"
+        params.append(cid)
+    rows = db.q(sql + f" ORDER BY a.id DESC LIMIT {limit}", params)
+    for r in rows:
+        r["payload"] = db.loads(r["payload"], {})
+    return {"audit": rows}
 
 
 @route("GET", r"/api/companies/(\d+)")
@@ -659,6 +667,8 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/preview/") or path.startswith("/files/"):
                 return self._company_file(path)
             return self._static(path)
+        except PreflightError as e:
+            self._send(e.status, {"error": e.message, "checks": e.checks})
         except HTTPError as e:
             self._send(e.status, {"error": e.message})
         except (BrokenPipeError, ConnectionResetError):
@@ -666,7 +676,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             try:
-                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                # An unexpected error may quote a URL; the bot token must not travel to the browser in it.
+                self._send(500, {"error": notify.scrub(f"{type(e).__name__}: {e}")})
             except OSError:
                 pass
 
@@ -748,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             bus.unsubscribe(qu)
+
 
 
 class Server(ThreadingHTTPServer):

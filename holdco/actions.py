@@ -56,14 +56,19 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    killed = False
+    if policy == "auto" and db.get_settings().get("kill_switch"):
+        policy, killed = "approve", True   # the kill switch freezes outbound actions: queue instead of running
     if policy == "auto":
         try:
             result = execute(company, action, payload)
         except Exception as e:  # report failures back to the agent
             bus.emit(company["id"], "error", f"{ACTION_LABELS.get(action, action)} failed: {e}", agent["id"])
+            audit(company["id"], action, agent["name"], "policy:auto", payload, f"FAILED: {e}")
             return f"FAILED: {e}"
         bus.emit(company["id"], "action", f"{ACTION_LABELS.get(action, action)}: {_summary(action, payload)}",
                  agent["id"], {"action": action})
+        audit(company["id"], action, agent["name"], "policy:auto", payload, result)
         return result
 
     # approve: queue it (deduplicated)
@@ -79,9 +84,20 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     verb = "asked the owner" if action == "question" else "requested approval"
     bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
     bus.notify("approvals")
+    from . import notify  # imported here: notify and watchdog import tools, which imports this module
+    try:
+        notify.approval_requested(db.one("SELECT * FROM approvals WHERE id=?", (aid,)))
+    except NotImplementedError:
+        pass
+    except Exception as e:  # a phone that cannot be reached never blocks an agent
+        print(f"notify failed: {e}")
     if action == "question":
         return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
                 f"without it, finish with status 'waiting'.")
+    if killed:
+        # The agent should know this was not the normal policy: nothing outbound runs until the owner resumes.
+        return (f"Kill switch is on: queued for the owner as request #{aid}. Don't resubmit it. Continue with "
+                f"other work; the decision will appear in your notes.")
     return (f"Queued for the owner's approval as request #{aid}. Don't resubmit it. Continue with other work; "
             f"the decision will appear in your notes.")
 
@@ -94,6 +110,8 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
         raise ValueError("Request not found")
     if row["status"] != "pending":
         raise ValueError(f"Request #{approval_id} is already {row['status']}")
+    if decision == "approve" and row["action"] != "question" and db.get_settings().get("kill_switch"):
+        raise ValueError("The kill switch is on. Turn it off to run approvals.")
     company = db.get_company(row["company_id"])
     p = db.loads(row["payload"], {})
     if payload:
@@ -111,6 +129,8 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
             status = "done"
         except Exception as e:
             result, status = str(e), "failed"
+        proposer = (db.get_agent(row["agent_id"]) or {}).get("name", "") if row["agent_id"] else ""
+        audit(company["id"], row["action"], proposer, "owner", p, result, approval_id)
         note = f"Owner APPROVED request #{approval_id} ({label}: {_summary(row['action'], p)}). Outcome: {result}"
     else:
         status, result = "rejected", ""
@@ -138,11 +158,26 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
                 f"Original request ({label}):\n{details}\n\nRevise it to address the feedback and submit it again.",
                 agent["role"], agent["id"], "todo", 1, "owner", ts, ts))
         bus.notify("tasks", company_id=company["id"])
+    if row["action"] == "question" and (p.get("pattern") or p.get("options")):
+        from . import watchdog
+        try:
+            watchdog.resolve(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result)
+        except NotImplementedError:
+            pass
     db.update("companies", company["id"], cycle_requested=1)
     kind = "decision" if status != "failed" else "error"
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payload: dict, result: str,
+          approval_id: int | None = None) -> int:
+    """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent."""
+    return db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
+                  "approval_id) VALUES(?,?,?,?,?,?,?,?)",
+                  (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
+                   default=str)[:20000], str(result or "")[:4000], approval_id))
 
 
 # ---------------- executors ----------------

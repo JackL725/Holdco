@@ -38,6 +38,17 @@ DEFAULT_SETTINGS: dict = {
     "searxng_url": "",
     "brave_api_key": "",
     "owner_name": "the owner",
+    # Phone notifications (Phase 0): a Telegram bot (approve from your phone) and/or an ntfy topic (notify only).
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "telegram_api_base": "https://api.telegram.org",   # tests point this at a fake server
+    "ntfy_topic": "",
+    "ntfy_server": "https://ntfy.sh",
+    "notify_level": "important",      # important = requests, escalations, errors, briefs; all = also run summaries
+    # Reliability (Phase 0)
+    "kill_switch": False,             # stops every agent and freezes outbound actions until turned off
+    "max_task_attempts": 2,           # failed attempts before a task is blocked and escalated to you
+    "backup_keep": 14,                # nightly backups to keep
 }
 
 # What happens when an agent tries an outbound action.

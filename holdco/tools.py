@@ -154,8 +154,18 @@ def web_search(ctx: Ctx, query: str, max_results: int = 6) -> str:
     _log(ctx, "tool", f"searched the web for “{query}”")
     try:
         results = web.search(query, max_results, ctx.settings)
+    except web.WebError as e:
+        # Every provider failed. Tell the agent once and clearly (each retry would waste a step) and tell the
+        # owner once per company per half hour instead of once per search.
+        reasons = str(e).removeprefix("All search providers failed: ")
+        if web.search_alert_due(ctx.company["id"]):
+            _log(ctx, "error", f"Web search is unavailable: {reasons}")
+        return (f"ERROR: web search is unavailable right now ({reasons}).\n"
+                "Do not retry web_search this session. Continue with URLs you already know (fetch_url still works), "
+                "note the gap with note_progress when you have that tool, and say in your finish summary that "
+                "research was skipped.")
     except Exception as e:
-        return f"Search failed ({e}). Try a different query or fetch a known URL directly."
+        return f"ERROR: search failed ({type(e).__name__}: {e}). Try other words or fetch a known URL directly."
     if not results:
         return "No results. Try different words."
     return "\n\n".join(f"{i + 1}. {r['title']}\n{r['url']}\n{r['snippet']}" for i, r in enumerate(results))
@@ -305,6 +315,8 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         if role not in team:
             raise ToolError(f"No teammate with role '{assign_to}'.")
         fields.update(role=role, agent_id=team[role]["id"])
+        if role != (t["role"] or ""):
+            fields["reassigned"] = int(t.get("reassigned") or 0) + 1   # the watchdog spots tasks that keep bouncing
     db.update("tasks", task_id, **fields)
     _log(ctx, "task", f"updated task #{task_id}{' → ' + status if status else ''}", task_id=task_id)
     bus.notify("tasks", company_id=ctx.company["id"])
@@ -660,3 +672,8 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
 
 def role_tools(agent: dict, kind: str) -> list[dict]:
     return specs(roles.tools_for(agent, kind))
+
+
+# Feature modules register extra tools with @tool when imported. Keep this at the very end so `tool`, `S`,
+# `I`, `Ctx` and `ToolError` exist before they run.
+from . import watchdog  # noqa: E402,F401  (note_progress lives with the working-notes logic)

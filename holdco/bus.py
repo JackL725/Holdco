@@ -44,7 +44,18 @@ def emit(company_id: int | None, kind: str, message: str, agent_id: int | None =
     ev = {"type": "event", "id": eid, "company_id": company_id, "agent_id": agent_id, "kind": kind,
           "message": message, "data": data or {}, "created_at": created}
     publish(ev)
+    if kind == "error":
+        _tell_phone(company_id, message)
     return ev
+
+
+def _tell_phone(company_id: int | None, message: str) -> None:
+    """Phase 0: errors reach the owner's phone (notify rate-limits them to one per distinct message per hour)."""
+    try:
+        from . import notify   # imported here: notify imports bus
+        notify.error(db.get_company(company_id) if company_id else None, message)
+    except Exception:
+        pass   # the phone must never break the activity feed
 
 
 def notify(kind: str, **data) -> None:

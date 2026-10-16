@@ -28,8 +28,24 @@ No cloud AI, no API bills, no pip installs.
 - **Live feed** of everything every agent does, plus full transcripts of every work session.
 - **Thinking tab.** Watch each agent's reasoning, the tool it picks and what the tool returns, live, per agent.
   Shows the model's own reasoning when it shares it (gpt-oss, Qwen3 and other thinking models).
-- **Integrations:** web search (DuckDuckGo, SearXNG or Brave), company email (SMTP/IMAP; inbound mail becomes
-  support tasks), website publishing (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
+- **Doctor page.** A green, amber or red row with a fix for everything your agents depend on: model server and
+  model, GPU memory fit, web search, each connector, disk space, the last backup and the last 24 hours of
+  errors. Founding runs the same checks first and refuses to start while the model server is down, telling you why.
+- **Watchdog.** When something is stuck (a task that failed twice, the same error three times in an hour, a
+  task bouncing between agents, a connector that stays down, stalled agents, a founding that ended early) you
+  get one question with a recommended answer, in the dashboard and on your phone. Your answer is applied at once.
+- **Working notes and retry-differently.** Each task keeps notes on what was tried, what failed and what is
+  left. A second attempt starts from those notes and is told why the first one failed, so it tries another way.
+- **Phone notifications.** A Telegram bot sends requests and questions with buttons, so you approve, reject or
+  answer from your phone; ntfy works as a notify-only option. Nothing on your PC is opened to the internet.
+- **Kill switch.** One button stops every agent at its next step and freezes outbound actions until you
+  resume, from the sidebar or by sending `/stop` to the bot.
+- **Nightly backups and an audit log.** Once a day Holdco zips the database and every company folder and keeps
+  the newest 14. Every outbound action that ran is recorded with who proposed it and who allowed it.
+- **Search that keeps working.** Brave, SearXNG, the `ddgs` package and DuckDuckGo's HTML pages are tried in
+  order; a provider that fails or is blocked is skipped for ten minutes while the others carry on.
+- **Integrations:** company email (SMTP/IMAP; inbound mail becomes support tasks), website publishing (Netlify),
+  and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
 
 ## Quick start
 
@@ -56,6 +72,10 @@ loop. You can switch models any time in **Settings**, which lists everything you
 - **Linux:** `./start_linux.sh`
 
 The dashboard opens at <http://127.0.0.1:8420>. Click **Start a company**.
+
+When something does not work, open **Doctor** in the sidebar: every failing row says what is wrong and how to
+fix it. Founding refuses to start while the model server is down or the model is missing, and the New company
+page shows the failing check with its fix (you can still press *Found anyway*).
 
 ## Agent presets
 
@@ -137,9 +157,35 @@ Agents work while Holdco is running and your PC is awake.
 - **Stop the PC from sleeping** (Windows: *Settings → System → Power → Sleep: Never* when plugged in).
 - **Autopilot switch:** the button at the bottom of the sidebar stops or starts all agents at once.
   Each company also has its own Pause button.
+- **Kill switch:** **Stop everything** under the autopilot switch (or `/stop` to your Telegram bot) stops every
+  agent at its next step and freezes outbound actions: nothing is sent, published, run or bought, and requests
+  cannot be approved until you press **Resume** (or send `/resume`). Questions can still be answered.
+- **Backups:** once a day Holdco zips the database and every company folder into `data/backups/` and keeps the
+  newest 14 (Settings → Reliability changes the number; **Back up now** on the Doctor page writes one at once).
+  To restore by hand: stop Holdco, unzip the archive over the `data/` folder, start Holdco again.
 - **Check from your phone:** start with `HOLDCO_HOST=0.0.0.0` and `HOLDCO_PASSWORD=something-long`, then open
   `http://<your-pc's-ip>:8420` on your home Wi-Fi. For access away from home, use a private network such as
-  Tailscale rather than opening a port on your router.
+  Tailscale rather than opening a port on your router. Approvals alone need none of this: see the next section.
+
+## Running it from your phone
+
+1. In Telegram, open **@BotFather**, send `/newbot` and follow the prompts. Copy the token it gives you.
+2. In **Settings → Phone notifications**, paste the token and your chat id, save, and press **Send test
+   message**. No chat id yet? Leave it empty, send your bot any message, and press the button: it reports the
+   chat id for you to paste in. Once both are saved, a test message with an OK button arrives.
+
+What arrives: every request waiting for your approval, with **Approve** and **Reject** buttons; every question
+from an agent or the watchdog, with one button per option and the recommended one marked; and errors, once per
+distinct error per hour (*Notify me about* widens this to everything). A button press decides it as the Inbox would.
+
+Commands: `/status` (one line per company with open tasks, agents working and requests waiting, plus the kill
+switch and the Doctor summary), `/stop` (kill switch on) and `/resume` (kill switch off).
+
+**ntfy** is the notify-only option: install the ntfy app, pick a topic name nobody would guess, enter it in
+Settings and subscribe to it in the app. The same messages arrive as plain text, without buttons.
+
+Nothing on your PC is exposed to the network: Holdco asks Telegram for new messages (long polling), so no port
+is opened and no address is published. Messages from any chat other than yours are ignored.
 
 ## Connecting the outside world (per company, in its Settings tab)
 
@@ -148,7 +194,7 @@ Agents work while Holdco is running and your PC is awake.
 | Email | Any mailbox with SMTP + IMAP (Gmail with an app password, Zoho, Fastmail…). Inbound mail becomes tasks for the support agent. | Sales and support write drafts only |
 | Website | A Netlify personal access token. Holdco creates the site on the first approved deploy. | The site still previews locally at `/preview/<company>/` |
 | Social posts | A webhook URL (Zapier, Make, n8n, Discord…). Approved posts are sent there as JSON. | You get a one-click "post on X" link with the text filled in |
-| Search | DuckDuckGo works with no key. For heavy use, run SearXNG locally or add a Brave Search API key in Settings. Optional: `pip install ddgs` makes DuckDuckGo searches more reliable. | |
+| Search | Works with no key. Holdco tries the provider you picked in Settings first, then Brave (needs an API key), SearXNG (needs its address), the optional `ddgs` package and DuckDuckGo's HTML pages, in that order. A provider that fails or is blocked is skipped for ten minutes while the others carry on. The Doctor's *Web search* row shows which provider works. | Agents are told search is down and carry on with what they know |
 
 ## How it works
 
@@ -169,9 +215,15 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - **Standing orders** (company Settings) are injected into every agent's every session: brand rules,
   things to avoid, priorities.
 - **Memory**: agents save facts, decisions and lessons. Your approvals, rejections and answers are saved
-  too, so agents learn what you accept. Pin notes that must never be forgotten.
+  too, so agents learn what you accept. Pin notes that must never be forgotten. Phase 2 of the plan adds a
+  structured company brain (goals, metrics, customers, decisions) as the first thing agents read.
 - **Approval policies**: per action type, globally and per company: *Ask me first* (default),
   *Let agents do it*, or *Never allow*. Purchases are always *Ask me first*.
+- **Watchdog**: a task that fails twice is blocked and becomes a question in your Inbox and on your phone (skip
+  it, retry once with your note, or pause the company). The second attempt is told what failed the first time
+  and must try something else. It also catches repeated errors, bouncing tasks, dead connectors and stalled agents.
+- **Working notes**: agents save what they tried, what failed and what is left with `note_progress`, and Holdco
+  adds a note of its own when a run ends badly. The next attempt starts from those notes instead of from scratch.
 
 ## Safety notes
 
@@ -179,7 +231,11 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - Agent-built web pages are served sandboxed so they can't control the dashboard.
 - **Run code** really runs Python or shell commands on your PC (inside the company's folder, with a time
   limit, but not in a sandbox). Leave it on *Ask me first* unless you're comfortable with that.
-- Passwords and tokens you enter are stored in plain text in `data/holdco.db` on your PC. Protect that folder.
+- **Audit log** (Inbox page): every outbound action that ran, with who proposed it, who allowed it (you, or a
+  *Let agents do it* policy), the exact payload and the result, failures included. Nothing in Holdco edits it.
+- **Kill switch.** One press (sidebar, or `/stop` from your phone) stops every agent and freezes outbound actions.
+- Passwords and tokens you enter, including the Telegram bot token, are stored in plain text in `data/holdco.db`
+  (and in the backups under `data/backups/`). Protect that folder; a credential vault arrives in Phase 1.
 - You are the owner of these companies. Laws about marketing email (CAN-SPAM, GDPR), business registration,
   taxes and refunds apply to you, not the AI. Review outreach before you approve it.
 
@@ -192,18 +248,24 @@ Session transcripts (Team → Sessions) show exactly what each agent did and why
 
 ## Your data
 
-Everything lives in the `data/` folder next to this README: the database (`holdco.db`) and one folder per
-company under `data/companies/`. Back it up by copying the folder. Deleted companies are moved to
-`data/trash/`. Set `HOLDCO_DATA` to keep data somewhere else.
+Everything lives in the `data/` folder next to this README: the database (`holdco.db`), one folder per
+company under `data/companies/` and nightly backups under `data/backups/`. Copy the folder or one of the zips
+to back it up elsewhere. Deleted companies go to `data/trash/`. Set `HOLDCO_DATA` to keep data somewhere else.
 
 ## Troubleshooting
 
+- **Start with the Doctor page** (sidebar). Each failing row says what is wrong and how to fix it. *Run checks*
+  retests at once; *Deep check* also asks the model to call a tool and runs a live search.
 - **"Can't reach the model server"**: start Ollama (Windows: it lives in the tray; Linux: `systemctl status ollama`).
 - **Model not installed**: `ollama pull <model>`, or pick an installed one in Settings.
 - **Agents talk instead of acting**: use a model with tool support; Settings → *Test connection* checks it.
   For models without native tool calling, set *Tool calling* to *Prompt-based*.
 - **Port 8420 in use**: Holdco is probably already running; open <http://127.0.0.1:8420>, or start with `--port 8421`.
-- **Search returns nothing**: DuckDuckGo may be rate-limiting you. Install `ddgs`, or switch to SearXNG or Brave.
+- **Search returns nothing**: Brave, SearXNG, `ddgs` and DuckDuckGo are tried in turn and a blocked one is skipped
+  for ten minutes; the Doctor's *Web search* row shows each provider's state. Add a Brave key or run SearXNG.
+- **Nothing reaches my phone**: press *Send test message* under Settings → Phone notifications. With a token but
+  no chat id it reports your chat id once you have messaged the bot. Check *Notify me about*: at the default
+  level only requests, questions and errors are sent. The Doctor's *Telegram bot* row shows whether the token works.
 
 ## Running the tests
 
@@ -211,15 +273,32 @@ company under `data/companies/`. Back it up by copying the folder. Deleted compa
 python -m unittest discover -s tests -t . -v
 ```
 
-No GPU or model needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the OpenAI-compatible
-API) so the whole app runs end to end. The suite covers the quality checks, the model client, preset
-integrity, file and network safety, tools and approvals, and a full run of the real server: founding from a
-template, the 24/7 scheduler, approvals, chat, QA review with the deliverable check, recurring duties, restart
-recovery, the prompt-based tool fallback, the OpenAI-compatible backend, pausing and deletion. GitHub Actions
-runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
+No GPU, model or network needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the
+OpenAI-compatible API) and `tests/fake_telegram.py` for the Telegram Bot API and ntfy, so the whole app runs end
+to end. The suite has about 170 tests: unit suites for the quality checks, the model client, preset integrity,
+file and network safety, tools and approvals, and each Phase 0 module (Doctor, search chain, watchdog and working
+notes, Telegram and ntfy); and a full run of the real server: founding from a template, the 24/7 scheduler,
+approvals, chat, QA review with the deliverable check, recurring duties, restart recovery, the prompt-based tool
+fallback, the OpenAI-compatible backend, pausing and deletion, the founding preflight, the kill switch, phone
+notifications and the audit log. GitHub Actions runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
 
 To click around the dashboard without a GPU, run `python tests/fake_ollama.py 11999`, start Holdco, and set the
 server address in Settings to `http://127.0.0.1:11999`.
+
+## Roadmap
+
+Holdco is being built against the plan in [docs/plan.md](docs/plan.md), in five phases, each its own pull
+request. Each phase document under `docs/phases/` says what was built and how to try it on your PC.
+
+1. **Phase 0: Stabilize** (built in this pull request): Doctor and founding preflight, the search fallback chain,
+   the watchdog, working notes, Telegram and ntfy, the kill switch, nightly backups and the audit log.
+2. **Phase 1: Connect** (planned): an MCP client, a credential vault, risk tags on every tool, connector health
+   checks, and the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave).
+3. **Phase 2: Organize** (planned): the company brain with measured goals, task contracts with dependencies,
+   daily and weekly rhythms, a daily brief and a decisions queue.
+4. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
+   structured tool calls, a code sandbox, taint tracking and a trust ladder for approvals.
+5. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
 
 ## Project layout
 
@@ -231,11 +310,18 @@ holdco/
   presets.py        the agent library: 19 roles and 6 team templates
   checks.py         audit_page, check_contrast and review_text
   tools.py          every tool agents can call
-  actions.py        approval inbox and outbound actions (email, posts, deploys, code, purchases)
-  scheduler.py      24/7 loop: CEO cycles, task dispatch, inbox polling
+  actions.py        approval inbox, outbound actions (email, posts, deploys, code, purchases), audit log
+  scheduler.py      24/7 loop: CEO cycles, task dispatch, inbox polling, housekeeping
+  doctor.py         health checks, the Doctor page and the founding preflight
+  watchdog.py       stuck-pattern detection, questions for you, working notes and retry guidance
+  notify.py         Telegram bot (long polling, buttons, commands) and ntfy
+  backup.py         nightly zip backups of the data folder
+  routing.py        route registry shared by server.py and the feature modules
   llm.py            Ollama / OpenAI-compatible client with tool-call fallbacks
   roles.py          maps agents to presets and tool belts
-  web.py, emailer.py, workspace.py, db.py, bus.py, server.py, config.py
+  web.py            search fallback chain and page fetching
+  emailer.py, workspace.py, db.py, bus.py, server.py, config.py
   static/           the dashboard (plain HTML, CSS and JavaScript)
-tests/              unit and end-to-end tests, plus the fake model server
+tests/              unit and end-to-end tests, plus the fake model server and fake Telegram
+docs/               the improvement plan and design documents; see docs/README.md
 ```

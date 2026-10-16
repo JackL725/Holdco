@@ -30,6 +30,14 @@ def script(messages: list[dict], tools: list[dict]):
     names = {t["function"]["name"] for t in tools}
     stamp = int(time.time() * 1000) % 100000
     if user.startswith("You are founding"):
+        if "[partial]" in user:
+            # A thin founding, the way the first real run went: the charter lands in a file through write_file,
+            # update_charter is never called, no tasks are created and the CEO finishes with status partial.
+            seq = [tc("write_file", path="docs/charter.md",
+                      content="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n\n## Problem\nOwners guess.\n"),
+                   tc("finish", summary="Drafted the charter in docs/charter.md; stopped before creating tasks.",
+                      status="partial")]
+            return seq[min(step, len(seq) - 1)]
         seq = [tc("web_search", query="dog meal plan subscription market"),
                tc("write_file", path="research/market.md", content="# Market\n\n- FACT: example (source: https://example.com)\n"),
                tc("update_charter", charter="# PawPlan\n\n## One-liner\nWeekly meal plans for dogs.\n",
@@ -106,6 +114,10 @@ class FakeModelServer:
     def __init__(self, port: int = 0, delay: float = 0.05):
         self.delay = delay
         self.calls: list[dict] = []
+        # What GET /api/ps reports (Ollama's "loaded models"). size_vram == size means fully on the GPU;
+        # tests lower size_vram to simulate a model spilling into system RAM.
+        self.ps: list[dict] = [{"name": "gpt-oss:20b", "model": "gpt-oss:20b",
+                                "size": 14_000_000_000, "size_vram": 14_000_000_000}]
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -128,6 +140,8 @@ class FakeModelServer:
                     return self._json(200, {"models": [{"name": "gpt-oss:20b"}, {"name": "notools:latest"}]})
                 if self.path == "/v1/models":
                     return self._json(200, {"data": [{"id": "local-model"}]})
+                if self.path == "/api/ps":
+                    return self._json(200, {"models": outer.ps})
                 self._json(404, {"error": "not found"})
 
             def do_POST(self):
