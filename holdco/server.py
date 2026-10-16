@@ -263,8 +263,10 @@ def api_company_patch(h, m, body):
                 continue
             if isinstance(v, str) and v == vault.MASK:
                 continue  # unchanged secret
-            if k in ("cycle_minutes", "daily_email_limit", "smtp_port", "imap_port"):
+            if k in ("cycle_minutes", "smtp_port", "imap_port"):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
+            if k == "daily_email_limit":
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # Phase 2 budgets: 0 means agents send none
             if k == "daily_token_budget":
                 v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # 0 = no limit
             if k in ("gpu_hours_per_day",):

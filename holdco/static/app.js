@@ -2981,7 +2981,7 @@ function TabSettings(cid, data, arg) {
           <label class="field">Posts per week<span class="hint">Social posts approved or waiting in the last 7 days.${bud ? ` This week: ${esc(bud.posts_this_week)}.` : ''}</span>
             <input type="number" name="posts_per_week" min="0" value="${val('posts_per_week')}"></label>
           <label class="field">Emails per day<span class="hint">New domains should start around 20.${bud ? ` Sent today: ${esc(bud.emails_today)}.` : ''}</span>
-            <input type="number" name="daily_email_limit" min="1" value="${val('daily_email_limit')}"></label>
+            <input type="number" name="daily_email_limit" min="0" value="${val('daily_email_limit')}"></label>
           <label class="field">Money budget, USD (display only)<span class="hint">Holdco never spends money: every purchase asks you and you buy it yourself.${bud ? ` $${esc(fmtValue(bud.money_approved_month))} approved this month.` : ''}</span>
             <input type="number" name="money_usd" min="0" value="${val('money_usd')}"></label>
         </div></div>

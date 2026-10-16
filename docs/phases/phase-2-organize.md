@@ -456,7 +456,8 @@ the end; when a task's `tokens_used` already exceeds `budget_tokens` at the star
 to `blocked` with the note "Token budget exhausted" and the watchdog pattern `task_failed_twice` options apply.
 
 UI. Company Settings tab gets a "Budgets" section with the five fields. `PATCH /api/companies/<id>` accepts them
-(integers, minimum 1 for hours and steps, 0 allowed for posts and emails).
+(GPU hours as a number of at least 0.25 so a short trial is possible; steps, posts, emails and money as whole
+numbers of at least 0, where 0 steps means the app default).
 
 Code touch points: `config.DEFAULT_COMPANY_SETTINGS`, `server.api_company_patch` (integer coercion list),
 `scheduler.Scheduler.tick` and `_maybe_cycle`, `agents.run`, `tools.social_post`, `static/app.js` `TabSettings`
@@ -464,7 +465,8 @@ and `TabOverview`.
 
 ## Files
 
-New: `holdco/brain.py`, `holdco/rhythms.py`, `tests/test_phase2.py`.
+New: `holdco/brain.py`, `holdco/contracts.py`, `holdco/rhythms.py`, `holdco/decisions.py`, `tests/test_phase2_brain.py`,
+`tests/test_phase2_contracts.py`, `tests/test_phase2_rhythms.py`.
 
 Changed: `holdco/db.py` (SCHEMA: `strategy`, `goals`, `contacts`, `decisions`, `experiments`, `lessons`,
 `brain_changes`, `leases`, `briefs`; MIGRATIONS: tasks `goal_id`, `expected`, `inputs`, `depends_on`, `due_at`,
@@ -483,7 +485,8 @@ cycle script with `goal_id`, "Evening brief" and "Weekly review" scripts that ca
 
 ## Tests
 
-Unit (`tests/test_phase2.py`, using `make_company` and `ctx_for` from `test_unit.py`):
+Unit (`tests/test_phase2_brain.py`, `tests/test_phase2_contracts.py` and `tests/test_phase2_rhythms.py`, one per
+area, using `make_company` and `ctx_for` from `test_unit.py`):
 
 | Test | Proves |
 |---|---|
@@ -501,14 +504,15 @@ Unit (`tests/test_phase2.py`, using `make_company` and `ctx_for` from `test_unit
 | `test_decision_deadline` | A reversible decision past its deadline is resolved with the recommended option, `decided_by = "deadline"`, the waiting task reopened, one notification sent, and a `decisions` row with `decided_by = "deadline"` and `reversible = 1` written; an owner answer writes one with `decided_by = "owner"`; an irreversible one stays pending |
 | `test_budgets` | `social_post` refuses at `posts_per_week`; `agents.run` uses `min(steps_per_task, budget_steps)`; a company over `gpu_hours_per_day` gets no dispatch but still gets routine tasks |
 
-End to end (`tests/test_e2e.py`, new tests numbered after Phase 1's `test_24`):
-`test_25_founding_writes_brain` (founding with the fake model writes a strategy row and two goals, and every
-founding task has a `goal_id`); `test_26_rhythms_and_briefs` (forcing the routines, by setting
+End to end (`tests/test_e2e.py`, new tests numbered after Phase 1's `test_29`):
+`test_30_founding_writes_brain` (founding with the fake model writes a strategy row and two goals, and every
+founding task has a `goal_id`); `test_31_rhythms_and_briefs` (forcing the routines, by setting
 `companies.created_at` back and the fake clock past `at_hour`, creates "Evening brief" and "Weekly review"
 tasks; after they run, `GET /api/briefs/latest?company_id=` returns a daily and a weekly brief whose
 `data.metrics` entries carry `source: "stripe"`, rows injected through the Phase 1 fake Stripe metrics poll);
-`test_27_decision_in_inbox` (the Inbox endpoint lists a `decision` row created by the fake CEO's `ask_decision`,
-and the dashboard Brain tab assets load).
+`test_32_decision_in_inbox` (the Inbox endpoint lists a `decision` row created by the fake CEO's `ask_decision`,
+and the dashboard Brain tab assets load); `test_33_dependency_and_lease` (a task that depends on an
+open task is not dispatched until that task is done, and the task list shows `blocked_by`).
 
 Fakes: `tests/fake_ollama.py` gains the scripts above. No new fake services; the Phase 0 fake Telegram and the
 Phase 1 fake Stripe are reused.
