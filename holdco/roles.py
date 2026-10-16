@@ -6,10 +6,11 @@ from . import presets
 # Phase 0.5: founding runs in stages, each with a small belt of its own (design 4.1). Research cannot create tasks
 # or write the charter, so it cannot eat the whole founding; the critic may only write docs/critique.md (enforced
 # by planning.charter_write_hook). Research gets remember instead of the design's note_progress: founding runs
-# have no task, and note_progress only writes a task's working notes.
+# have no task, and note_progress only writes a task's working notes. Phase 2: the charter stage also writes the
+# brain (the strategy and the first goals) so the plan stage can give every first task a goal.
 FOUNDING_STAGE_TOOLS = {
     "research": ["web_search", "fetch_url", "search", "read_file", "write_file", "record_fact", "remember", "finish"],
-    "charter": ["read_file", "search", "update_charter", "record_fact", "finish"],
+    "charter": ["read_file", "search", "update_charter", "set_strategy", "set_goal", "record_fact", "finish"],
     "critic": ["read_file", "search", "web_search", "fetch_url", "write_file", "finish"],
     "plan": ["read_file", "search", "create_task", "ask_owner", "report_to_owner", "finish"],
 }

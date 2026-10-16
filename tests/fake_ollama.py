@@ -8,6 +8,7 @@ follows a short script of tool calls; the step is the number of assistant turns 
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import sys
@@ -77,6 +78,37 @@ The waitlist landing page with the price shown.
 """
 
 
+# Phase 2: the brain the charter stage writes after update_charter (set_strategy needs all seven fields there).
+STRATEGY = {"one_liner": "Weekly meal plans for dog owners, delivered as a printable plan.",
+            "icp": "Dog owners who cook for their dogs and feel unsure about portions.",
+            "problem": "Owners guess portions and recipes and worry about allergies.",
+            "offer": "A personalised weekly meal plan with a shopping list.",
+            "price": "$9 per month (to test).",
+            "positioning": "The plan your vet would write, without the vet bill.",
+            "voice": "Warm, practical, no hype."}
+
+
+def _in_days(n: int) -> str:
+    return (datetime.date.today() + datetime.timedelta(days=n)).isoformat()
+
+
+def goal_ids(user: str) -> list[int]:
+    """The goal numbers a prompt lists under its goals heading (founding plan stage, planning cycle)."""
+    m = re.search(r"^(?:## )?Goals[^\n]*\n((?:#\d+ [^\n]*\n?)+)", user, re.M)
+    return [int(x) for x in re.findall(r"^#(\d+) ", m.group(1), re.M)] if m else []
+
+
+def with_goals(call: dict, user: str, n: int = 0, expected: str = "") -> dict:
+    """Phase 2: a create_task call gains goal_id (the n-th goal the prompt lists) and expected. Holdco drops the
+    arguments a tool does not declare (tools.clean_args), so the calls also work where create_task lacks them."""
+    ids = goal_ids(user)
+    args = call["function"]["arguments"]
+    if ids:
+        args["goal_id"] = ids[min(n, len(ids) - 1)]
+    args["expected"] = expected or "moves its goal"
+    return call
+
+
 def founding_step(user: str, step: int):
     """Staged founding (Phase 0.5): each stage is its own run, recognised by "Stage: <name>" in the prompt."""
     stage = (re.search(r"Stage: (\w+)", user[:200]) or [None, "research"])[1]
@@ -102,18 +134,26 @@ def founding_step(user: str, step: int):
             "charter": [tc("read_file", path="research/market.md"),
                         tc("update_charter", charter=CHARTER, company_name="PawPlan",
                            one_liner="Weekly meal plans for dog owners", stage="building"),
-                        tc("finish", summary="Charter saved.")],
+                        tc("set_strategy", **STRATEGY),
+                        tc("set_goal", title="200 waitlist signups", metric="waitlist_signups", target=200,
+                           deadline=_in_days(45), owner_role="marketing"),
+                        tc("set_goal", title="10 paying customers", metric="stripe.customers", target=10,
+                           deadline=_in_days(60), owner_role="sales"),
+                        tc("finish", summary="Charter saved; the strategy and two goals are in the brain.")],
             "critic": [tc("read_file", path="docs/charter.md"),
                        tc("write_file", path="docs/critique.md", content=CRITIQUE),
                        tc("finish", summary="Critique saved to docs/critique.md.", deliverable="docs/critique.md")],
-            "plan": [tc("create_task", title="Build landing page", assign_to="engineering", priority=1,
-                        description="Waitlist page", deliverable="site/index.html", acceptance="- labelled form"),
-                     tc("create_task", title="Write launch post", assign_to="marketing",
-                        deliverable="marketing/launch.md"),
-                     tc("create_task", title="Find 20 leads", assign_to="sales", deliverable="sales/leads.md"),
-                     tc("create_task", title="Competitor pricing scan", assign_to="research",
-                        deliverable="research/competitors.md"),
-                     tc("create_task", title="Set up KPI tracking", assign_to="ops"),
+            "plan": [with_goals(tc("create_task", title="Build landing page", assign_to="engineering", priority=1,
+                                   description="Waitlist page", deliverable="site/index.html",
+                                   acceptance="- labelled form"), user, 0, "a page that collects waitlist signups"),
+                     with_goals(tc("create_task", title="Write launch post", assign_to="marketing",
+                                   deliverable="marketing/launch.md"), user, 0, "30 waitlist signups"),
+                     with_goals(tc("create_task", title="Find 20 leads", assign_to="sales",
+                                   deliverable="sales/leads.md"), user, 1, "20 pet shops to contact"),
+                     with_goals(tc("create_task", title="Competitor pricing scan", assign_to="research",
+                                   deliverable="research/competitors.md"), user, 1, "a price we can defend"),
+                     with_goals(tc("create_task", title="Set up KPI tracking", assign_to="ops"), user, 0,
+                                "signups counted every day"),
                      tc("report_to_owner", message="**Welcome!** PawPlan is founded. I need a company email account."),
                      tc("finish", summary="Founded PawPlan: research, charter, critique, 5 tasks.")],
         }
@@ -137,6 +177,33 @@ def payment_link_step(messages: list[dict], step: int):
     return seq[min(step, len(seq) - 1)]
 
 
+# Phase 2 rhythms: a brief may only use numbers from its data block, so these bodies state none.
+BRIEF = ("## What moved\nNo connector numbers moved today.\n## What shipped\n- site/index.html\n## What is stuck\n"
+         "Nothing.\n## Decisions needed\nNone.\n## Tomorrow's focus\nTalk to dog owners.")
+BRIEF_KINDS = {"Evening brief": "daily", "Weekly review": "weekly", "Monthly strategy check": "monthly"}
+
+
+def rhythm_step(user: str, step: int):
+    """The CEO's and the analyst's rhythm tasks (Phase 2): the morning plan writes docs/daily-plan.md; the briefs
+    are stored with write_brief; the monthly check also files its keep, change or kill decision."""
+    title = (re.search(r"^Your assignment: task #\d+: (.+)$", user, re.M) or [None, ""])[1].strip()
+    if title == "Morning plan":
+        seq = [tc("write_file", path="docs/daily-plan.md",
+                  content="# Daily plan\n\n## Today\n- Talk to dog owners\n- Ship the waitlist page\n"),
+               tc("finish", summary="Morning plan written.", deliverable="docs/daily-plan.md")]
+    elif title in BRIEF_KINDS:
+        kind = BRIEF_KINDS[title]
+        seq = [tc("write_brief", kind=kind, body=BRIEF)]
+        if kind == "monthly":
+            seq.append(tc("ask_decision", question="Keep, change or kill PawPlan after this month?",
+                          options="Keep\nChange: focus on dog walkers\nKill (pause the company)", recommended="Keep",
+                          reversible=False, context="The month's numbers are in the monthly brief."))
+        seq.append(tc("finish", summary=f"{title} written.", status="done"))
+    else:
+        return None
+    return seq[min(step, len(seq) - 1)]
+
+
 def script(messages: list[dict], tools: list[dict]):
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -147,8 +214,8 @@ def script(messages: list[dict], tools: list[dict]):
         return founding_step(user, step)
     if user.startswith("Run a planning cycle"):
         seq = [tc("list_tasks"),
-               tc("create_task", title=f"Follow up on leads batch {stamp}", assign_to="sales",
-                  deliverable=f"sales/followups-{stamp}.md", priority=3),
+               with_goals(tc("create_task", title=f"Follow up on leads batch {stamp}", assign_to="sales",
+                             deliverable=f"sales/followups-{stamp}.md", priority=3), user, 0, "2 replies"),
                tc("finish", summary="Reviewed progress, queued follow-ups.")]
         return seq[min(step, len(seq) - 1)]
     if user.startswith("The owner is talking"):
@@ -157,6 +224,9 @@ def script(messages: list[dict], tools: list[dict]):
                       deliverable=f"marketing/request-{stamp}.md")
         return "Got it. I've queued that for Echo in marketing as a priority task."
     role = system.split(",")[0].replace("You are ", "")
+    rhythm = rhythm_step(user, step)
+    if rhythm:
+        return rhythm
     if role == "Forge" and "Create a payment link for the Starter plan" in user:
         return payment_link_step(messages, step)
     if "Echo through the test MCP server" in user:   # Phase 1: a tool loaded from an OAuth-signed-in MCP server
@@ -182,7 +252,7 @@ def script(messages: list[dict], tools: list[dict]):
                    tc("finish", summary="Leads saved; first email queued.", deliverable="sales/leads.md")],
         "Scout": [tc("web_search", query="dog meal plan app pricing"),
                   tc("write_file", path="research/competitors.md", content="# Competitors\n\n| Name | Price |\n|---|---|\n"),
-                  tc("remember", content="Competitors charge $9-15/month", kind="fact"),
+                  tc("add_lesson", text="Competitors charge $9-15/month; lead with the plan, not the price."),
                   tc("finish", summary="Competitor scan saved.", deliverable="research/competitors.md")],
         "Ledger": [tc("record_metric", name="waitlist_signups", value=0, note="baseline"),
                    tc("request_purchase", item="pawplan.co domain", amount_usd=12, vendor="Namecheap", reason="Brand domain"),
