@@ -7,6 +7,10 @@ background sender thread and return at once; flush() waits for that thread (test
 
 The bot token is never printed: scrub() replaces the token, and any bot URL that carries it, with "[token]"
 in every error text before it reaches the console, an event, a Doctor row or an API reply.
+
+Phase 2: a decision shows one button per option (the recommended one marked) and its deadline ("auto in 31 h" or
+"waits for you"); its buttons answer it the way a question's do, recorded as decided by "telegram". Daily, weekly
+and monthly briefs are sent as kind "brief" through brief_text().
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import bus, db
+from . import bus, config, db
 from .routing import route
 
 # Tunables. Module constants rather than settings: the owner has no reason to change them.
@@ -359,7 +363,7 @@ def _labels() -> dict:
     except Exception:
         return {"send_email": "Send email", "social_post": "Social post", "deploy_site": "Deploy website",
                 "http_post": "Outside request", "run_code": "Run code", "spend_money": "Purchase",
-                "question": "Question"}
+                "question": "Question", "decision": "Decision"}
 
 
 def _payload_lines(action: str, p: dict) -> list[str]:
@@ -388,6 +392,18 @@ def _payload_lines(action: str, p: dict) -> list[str]:
     return []
 
 
+def deadline_text(p: dict, now: float | None = None) -> str:
+    """A decision's deadline as the owner reads it: "auto in 31 h" for a reversible one, "waits for you" when it
+    cannot be undone (or has no deadline)."""
+    deadline = db.parse_time(str(p.get("deadline_at") or ""))
+    if not p.get("reversible", True) or deadline is None:
+        return "waits for you"
+    left = deadline.timestamp() - (time.time() if now is None else now)
+    if left <= 0:
+        return "auto now"
+    return f"auto in {max(1, int(-(-left // 3600)))} h"
+
+
 def build_approval(row: dict) -> tuple[str, list[list[dict]] | None, str]:
     """The message, buttons and kind for an approvals row. Pure, so tests can check the rendering."""
     p = db.loads(row.get("payload"), {}) or {}
@@ -414,6 +430,22 @@ def build_approval(row: dict) -> tuple[str, list[list[dict]] | None, str]:
             buttons = None
             lines.append("Answer it in the dashboard (Inbox).")
         return "\n".join(lines), buttons, "escalation" if escalation else "request"
+    if action == "decision":
+        # Phase 2: one button per option (the recommended one marked) and when it resolves on its own, if ever.
+        options = [str(o).strip() for o in (p.get("options") or []) if str(o).strip()]
+        rec = str(p.get("recommended") or "").strip()
+        lines = [f"<b>{aname}</b> at <b>{cname}</b> asks you to decide (decision #{aid}):",
+                 escape(p.get("question") or row.get("summary") or "")]
+        if p.get("context"):
+            lines += ["", escape(str(p["context"])[:400])]
+        if rec and rec in options:
+            lines.append(f"Recommended: {escape(rec)}")
+        when = deadline_text(p)
+        lines.append(f"Deadline: {when}" + (" (then the recommended option is taken)" if when.startswith("auto")
+                                            else " (it cannot be undone)"))
+        buttons = [[{"text": (CHECK if o == rec else "") + o[:56], "data": f"q:{aid}:{i}"}]
+                   for i, o in enumerate(options)] or None
+        return "\n".join(lines), buttons, "request"
     label = _labels().get(action, action.replace("_", " ").title())
     lines = [f"<b>{aname}</b> at <b>{cname}</b> wants to: <b>{escape(label)}</b> (request #{aid})"]
     detail = [ln for ln in _payload_lines(action, p) if ln]
@@ -491,6 +523,73 @@ def set_kill_switch(on: bool, by: str = "owner") -> bool:
     return on
 
 
+# ---------------- briefs (Phase 2) ----------------
+
+BRIEF_MAX = 3500   # characters of a brief's body on the phone; the dashboard has the whole brief
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+_MD_BULLET = re.compile(r"^\s*[-*+•]\s+(.*)$")
+_MD_NUMBERED = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
+_MD_RULE = re.compile(r"^\s*([-*_]\s*){3,}$")
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+
+
+def dashboard_url(fragment: str = "") -> str:
+    """The dashboard address for a message: http://<host>:<port>/#/<fragment>. A server listening on every
+    interface (HOLDCO_HOST=0.0.0.0) is linked through 127.0.0.1, the address that always works on this PC."""
+    host = config.HOST if config.HOST not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{config.PORT}/#/{fragment.lstrip('/')}"
+
+
+def _md_inline(text: str) -> str:
+    out = escape(text)
+    out = _MD_BOLD.sub(lambda m: f"<b>{m.group(1) or m.group(2)}</b>", out)
+    return _MD_CODE.sub(lambda m: f"<code>{m.group(1)}</code>", out)
+
+
+def markdown_html(body: str, limit: int = BRIEF_MAX) -> str:
+    """Markdown as Telegram HTML: headings bold, list items as lines ("• item", "2. item"), **bold** and `code`
+    kept, anything else as plain text. Cut at a line boundary (so no tag is left open) to at most limit
+    characters."""
+    out: list[str] = []
+    size = 0
+    for raw in (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.rstrip()
+        if not line.strip() or _MD_RULE.match(line):
+            if out and out[-1] != "":
+                out.append("")   # one blank line between blocks
+            continue
+        if m := _MD_HEADING.match(line):
+            html = f"<b>{escape(m.group(1).strip('*_ '))}</b>"
+            if out and out[-1] != "":
+                out.append("")
+        elif m := _MD_BULLET.match(line):
+            html = "• " + _md_inline(m.group(1).strip())
+        elif m := _MD_NUMBERED.match(line):
+            html = f"{m.group(1)}. " + _md_inline(m.group(2).strip())
+        else:
+            html = _md_inline(line.strip())
+        if size + len(html) + 1 > limit:
+            if not any(out):
+                out.append(escape(_plain(html))[:max(0, limit - 1)])   # one huge line: plain text, cut
+            out.append("…")
+            break
+        out.append(html)
+        size += len(html) + 1
+    return "\n".join(out).strip()
+
+
+def brief_text(title: str, body: str, link: str = "") -> str:
+    """A brief for the phone (send kind "brief"): the title in bold, the body as Telegram HTML of at most
+    BRIEF_MAX characters, and the dashboard link, where the whole brief is."""
+    text = f"<b>{escape(title)}</b>\n\n{markdown_html(body)}"
+    if link:
+        text += f"\n\nDashboard: {escape(link)}"
+    return text
+
+
 STATUS_MAX_COMPANIES = 15   # companies listed by /status; the summary lines always come first
 
 
@@ -499,17 +598,22 @@ def format_status() -> str:
     busiest first. Telegram caps a message at 4096 characters, so with many companies the list is cut, never
     the summary."""
     s = db.get_settings()
-    rows, pending_total = [], 0
+    rows, pending_total, decisions_total = [], 0, 0
     for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
         open_n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN "
                            "('todo','in_progress','blocked','waiting')", (c["id"],)) or 0
         working = db.scalar("SELECT COUNT(*) FROM agents WHERE company_id=? AND status='working'", (c["id"],)) or 0
         pend = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'", (c["id"],)) or 0
         pending_total += pend
+        if pend:   # Phase 2: decisions are counted with the requests and named in the summary
+            decisions_total += db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending' "
+                                         "AND action='decision'", (c["id"],)) or 0
         rows.append((pend, working, open_n, c))
     lines = ["Kill switch: " + ("ON (send /resume to turn it off)" if s.get("kill_switch") else "off")
              + ("" if s.get("scheduler_enabled", True) else "; autopilot is off"),
-             f"Requests waiting for you: {pending_total}"]
+             f"Requests waiting for you: {pending_total}"
+             + (f", {decisions_total} of them decision{'s' if decisions_total != 1 else ''}" if decisions_total
+                else "")]
     try:
         from . import doctor
         d = doctor.summary()
@@ -538,7 +642,7 @@ def apply_callback(data: str) -> str:
     if parts[0] == "a":
         if parts[2] not in ("approve", "reject"):
             raise ValueError("That button is not recognised")
-        actions.decide(aid, parts[2])
+        actions.decide(aid, parts[2], decided_by="telegram")
         return "Approved" if parts[2] == "approve" else "Rejected"
     row = db.one("SELECT * FROM approvals WHERE id=?", (aid,))
     if not row:
@@ -547,7 +651,8 @@ def apply_callback(data: str) -> str:
     if not parts[2].isdigit() or int(parts[2]) >= len(options):
         raise ValueError("That option no longer exists")
     answer = options[int(parts[2])]
-    actions.decide(aid, "approve", answer=answer)   # decide treats a question as answered
+    # decide treats a question or a decision as answered; the brain records who chose (Phase 2)
+    actions.decide(aid, "approve", answer=answer, decided_by="telegram")
     return answer
 
 

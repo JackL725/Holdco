@@ -91,13 +91,18 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     blob = json.dumps(payload, sort_keys=True)
     for row in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND action=? AND status='pending'",
                     (company["id"], action)):
-        if json.dumps(db.loads(row["payload"], {}), sort_keys=True) == blob:
+        old = db.loads(row["payload"], {}) or {}
+        if action == "decision" and _same_question(old.get("question"), payload.get("question")):
+            # A decision carries its own deadline, so the same question asked again rarely has an identical payload.
+            return (f"Already waiting for the owner as decision #{row['id']}. Don't resubmit; continue with other "
+                    f"work, or finish with status 'waiting'.")
+        if json.dumps(old, sort_keys=True) == blob:
             return f"Already waiting for the owner as request #{row['id']}. Don't resubmit; continue with other work."
     summary = _summary(action, payload)
     aid = db.run("INSERT INTO approvals(company_id, agent_id, task_id, action, summary, payload, status, created_at)"
                  " VALUES(?,?,?,?,?,?,?,?)",
                  (company["id"], agent["id"], task_id, action, summary, blob, "pending", db.now()))
-    verb = "asked the owner" if action == "question" else "requested approval"
+    verb = {"question": "asked the owner", "decision": "asked the owner to decide"}.get(action, "requested approval")
     bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
     bus.notify("approvals")
     _records_changed(company["id"])
@@ -111,6 +116,14 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     if action == "question":
         return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
                 f"without it, finish with status 'waiting'.")
+    if action == "decision":
+        if not payload.get("reversible", True):
+            return (f"Decision #{aid} sent to the owner. It cannot be undone, so it waits for the owner's answer. "
+                    f"Continue with work that does not depend on it, or finish with status 'waiting'.")
+        deadline = str(payload.get("deadline_at") or "").replace("T", " ")[:16]
+        return (f"Decision #{aid} sent to the owner. If it is reversible and unanswered by {deadline} UTC, "
+                f"'{payload.get('recommended', '')}' will be taken. Continue with work that does not depend on it, "
+                f"or finish with status 'waiting'.")
     if killed:
         # The agent should know this was not the normal policy: nothing outbound runs until the owner resumes.
         return (f"Kill switch is on: queued for the owner as request #{aid}. Don't resubmit it. Continue with "
@@ -137,11 +150,28 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     ts = db.now()
     label = ACTION_LABELS.get(row["action"], row["action"])
 
-    if row["action"] in ("question", "decision"):
+    update = ""   # Phase 2: the line a decision adds to its waiting task, when it differs from the memory note
+    if row["action"] == "decision" and decision == "reject" and not answer.strip():
+        # Dismissed without choosing: nothing was decided, so the brain records nothing.
+        status, result = "rejected", ""
+        note = f"Owner dismissed decision #{approval_id} (\"{p.get('question', '')[:200]}\") without choosing."
+        update = (f"Owner dismissed decision #{approval_id} without choosing an option. Decide within your own "
+                  f"authority, or ask again differently.")
+        if feedback.strip():
+            note += f" Owner's note: {feedback.strip()}"
+            update += f" Owner's note: {feedback.strip()}"
+    elif row["action"] == "decision":
+        status, result = "answered", answer.strip() or feedback.strip() or "(no answer)"
+        if decided_by == "deadline":
+            update = f"No answer by the deadline, so decision #{approval_id} took the recommended option: {result}"
+        else:
+            update = f"Owner decided #{approval_id}: {result}"
+        if feedback.strip() and feedback.strip() != result:
+            update += f". Owner's note: {feedback.strip()}"
+        note = f"{update} (decision: \"{p.get('question', '')[:200]}\")"
+    elif row["action"] == "question":
         status, result = "answered", answer or feedback or "(no answer)"
-        word = "decided" if row["action"] == "decision" else "answered question"
-        who = "The deadline" if decided_by == "deadline" else "Owner"
-        note = f"{who} {word} #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
+        note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
     elif decision == "approve":
         db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
         try:
@@ -161,7 +191,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
               feedback=feedback, decided_by=decided_by,
               summary=_summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"])
-    if row["action"] == "decision":
+    if row["action"] == "decision" and status == "answered":
         from . import decisions   # imported here: decisions imports tools, which imports this module
         try:
             decisions.on_decided(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result, decided_by)
@@ -173,9 +203,9 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
         t = db.get_task(row["task_id"])
         if t and t["status"] in ("waiting", "blocked"):
             db.update("tasks", t["id"], status="todo", updated_at=ts,
-                      description=(t["description"] or "") + f"\n\n[Update] {note}")
+                      description=(t["description"] or "") + f"\n\n[Update] {update or note}")
     agent = db.get_agent(row["agent_id"]) if row["agent_id"] else None
-    if status == "rejected" and feedback.strip() and agent and agent["enabled"]:
+    if status == "rejected" and feedback.strip() and agent and agent["enabled"] and row["action"] != "decision":
         # Rejected with feedback: the agent gets a task to revise and resubmit.
         details = json.dumps(p, ensure_ascii=False, indent=1)[:3000]
         db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
@@ -198,6 +228,13 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+def _same_question(a, b) -> bool:
+    """Phase 2: decisions are deduplicated on the question text (case and spacing ignored)."""
+    def norm(s):
+        return " ".join(str(s or "").lower().split())
+    return bool(norm(a)) and norm(a) == norm(b)
 
 
 _WAITING_ON_RE = re.compile(r"Waiting on the owner: #(\d+)")

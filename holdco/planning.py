@@ -172,6 +172,21 @@ def _pending(company_id: int) -> list[dict]:
     return rows
 
 
+def pending_agent_questions(company_id: int) -> list[dict]:
+    """The team's questions and decisions (Phase 2) waiting on the owner; watchdog escalations do not count. At
+    most MAX_PENDING_QUESTIONS of them may wait at once."""
+    return [r for r in _pending(company_id) if r["action"] in ("question", "decision") and not r["p"].get("pattern")]
+
+
+def cap_refusal(mine: list[dict]) -> str:
+    """The refusal when the team already has MAX_PENDING_QUESTIONS questions or decisions waiting."""
+    listed = "; ".join(f"#{r['id']}: {str(r['p'].get('question') or r['summary'])[:120]}" for r in mine)
+    return (f"ERROR: {len(mine)} questions from the team are already waiting on the owner ({listed}). Do not "
+            f"queue another: continue with work that does not need an answer, or finish with status "
+            f"'blocked' and say what you need from the owner. When one is answered, fold this into your next "
+            f"question.")
+
+
 def _same_topic(shared: list[str], mine: set, their_text: str) -> bool:
     """Do two questions that share these topics ask the same thing? One specific topic (deploy, analytics,
     domain, money, pricing, legal) is enough; generic ones need a second shared topic or real word overlap."""
@@ -186,7 +201,7 @@ def find_duplicate(company_id: int, question: str, topics: list[str]) -> dict | 
     """The pending question or request that already covers this question, as {"id", "reason", "label",
     "text"}, or None. Topics are checked first, then pending requests of the same kind, then word overlap."""
     rows = _pending(company_id)
-    questions = [r for r in rows if r["action"] == "question"]
+    questions = [r for r in rows if r["action"] in ("question", "decision")]   # Phase 2: decisions too
     wanted = set(topics)
     mine = content_words(question)
     for r in questions:
@@ -277,15 +292,11 @@ def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "",
         _deduped(ctx, question, topics, dup["reason"], dup["id"],
                  f"question not queued: already waiting as #{dup['id']} ({dup['label']})")
         return dup["text"]
-    mine = [r for r in _pending(cid) if r["action"] == "question" and not r["p"].get("pattern")]
+    mine = pending_agent_questions(cid)   # Phase 2: the team's pending decisions count too
     if len(mine) >= MAX_PENDING_QUESTIONS:
-        listed = "; ".join(f"#{r['id']}: {str(r['p'].get('question') or r['summary'])[:120]}" for r in mine)
         _deduped(ctx, question, topics, "cap", None,
                  f"question not queued: {len(mine)} questions are already waiting on the owner")
-        return (f"ERROR: {len(mine)} questions from the team are already waiting on the owner ({listed}). Do not "
-                f"queue another: continue with work that does not need an answer, or finish with status "
-                f"'blocked' and say what you need from the owner. When one is answered, fold this into your next "
-                f"question.")
+        return cap_refusal(mine)
     return actions.gate(ctx.company, ctx.agent, ctx.task["id"] if ctx.task else None, "question", payload)
 
 
