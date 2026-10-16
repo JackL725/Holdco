@@ -287,9 +287,9 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - **Task contracts**: a task names its goal, the expected effect, files to read first, the tasks it waits on, a due
   date, a tool-call and token budget, and the checks to run on the result. The scheduler starts a task only when
   everything it depends on is done or cancelled, and a file being written by one agent is leased to it.
-- **Rhythms**: the morning plan (7:00), the evening brief (18:00) and the weekly review (9:00, once a week from the end of the first
-  week) follow your PC's clock; the data for each is gathered by code and handed to the agent as the only numbers it
-  may use. "Run now" on the Overview starts any of them at once.
+- **Rhythms**: the morning plan (7:00), the evening brief (18:00) and the weekly review (9:00, once a week from the
+  end of the first week) follow your PC's clock; the data for each is gathered by code and handed to the agent as
+  the only numbers it may use. "Run now" on the Overview starts any of them at once.
 - **Approval policies**: per action type, globally and per company: *Ask me first* (default),
   *Let agents do it*, or *Never allow*. Purchases are always *Ask me first*.
 - **Watchdog**: a task that fails twice is blocked and becomes a question in your Inbox and on your phone (skip
