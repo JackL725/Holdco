@@ -52,13 +52,14 @@ function debounce(fn, ms) {
   return (...a) => { clearTimeout(id); id = setTimeout(() => fn(...a), ms); };
 }
 
-// Minimal, safe Markdown (escapes everything first).
+// Minimal, safe Markdown (escapes everything first). A link's address may not contain "(": the bare-URL pass below
+// runs over the HTML the link pass made, and a "(https://" inside an href would put a second href in it.
 function inline(s) {
   return esc(s)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,!?:;]|$)/g, '$1<em>$2</em>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s()"<>]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
 }
 function md(src) {

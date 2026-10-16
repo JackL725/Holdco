@@ -767,8 +767,19 @@ def _written_for_task(ctx: Ctx, rel_path: str, is_dir: bool) -> bool:
 
 def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     """None if fine, otherwise what's wrong. Only checks things that look like file paths."""
+    # Phase 2: the deliverable of a brief rhythm (evening brief, weekly review, monthly check) is the brief it
+    # stores with write_brief, in this session or an earlier attempt at the same task. Without one the owner gets
+    # no brief, so finishing as done is refused once like a missing file.
+    task = ctx.task or {}
+    kind = rhythms.KIND_OF.get(task.get("routine") or "", "")
+    if kind:
+        if ctx.brief_written == kind or db.one("SELECT id FROM briefs WHERE company_id=? AND kind=? AND created_at>=?",
+                                               (ctx.company["id"], kind, task.get("created_at") or "")):
+            return None
+        return (f"this task's deliverable is the {rhythms.BRIEF_LABEL[kind]}, and none is stored yet: write it with "
+                f"write_brief(kind=\"{kind}\", body=...)")
     if ctx.brief_written:
-        return None   # Phase 2: a rhythm's deliverable is the brief it stored with write_brief
+        return None   # a brief stored outside its routine is a deliverable too
     d = (deliverable or "").strip().strip("`'\"")
     if not d or " " in d or not re.fullmatch(r"[\w./-]+", d) or not ("/" in d or "." in d):
         return None

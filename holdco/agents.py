@@ -189,6 +189,8 @@ def _goal_label(t: dict, goals: dict[int, str]) -> str:
         return f"Goal #{t['goal_id']}" + ("" if goals.get(t["goal_id"]) == "active" else " (closed)")
     if t.get("routine"):
         return "Recurring duty"
+    if t.get("created_by") == "inbox":   # a reply to a customer's email: never cancelled for having no goal
+        return "No goal (reply to an inbound email)"
     return "No goal (owner's task)" if t.get("created_by") == "owner" else "No goal"
 
 
@@ -205,7 +207,8 @@ def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: 
         goals = {g["id"]: g["status"] for g in db.q("SELECT id, status FROM goals WHERE company_id=? ORDER BY id",
                                                     (company["id"],))}
         # By goal, then tasks with no goal, the owner's, routines; priority order within a group (a stable sort).
-        rank = {"No goal": 1, "No goal (owner's task)": 2, "Recurring duty": 3}
+        rank = {"No goal": 1, "No goal (owner's task)": 2, "No goal (reply to an inbound email)": 2,
+                "Recurring duty": 3}
         rows.sort(key=lambda t: (0, t["goal_id"]) if t.get("goal_id") else (rank[_goal_label(t, goals)], 0))
     out = []
     for t in rows:

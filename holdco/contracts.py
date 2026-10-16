@@ -19,6 +19,7 @@ OPEN = ("todo", "in_progress", "blocked", "waiting")
 CHECK_TOOLS = ("browser_check", "audit_page", "review_text", "check_contrast", "fetch_url")
 DUE_DAYS = (1, 90)
 BUDGET_STEPS = (3, 60)
+PROPOSAL_LINE_CAP = 500   # characters of one brain proposal in the planning prompt (brain_lookup shows as much)
 
 
 class ContractError(ValueError):
@@ -333,7 +334,7 @@ def cycle_sections(company: dict) -> str:
     """Goals (with open tasks per goal and the no-goal line), experiments, brain proposals and decisions due, placed
     after Phase 0.5's header and before the open tasks in the planning prompt. The lists and their lines come from
     brain.py, so the planning prompt, the digest and brain_lookup read the brain the same way."""
-    from . import brain   # imported here: brain imports tools, which imports this module
+    from . import brain, rhythms   # imported here: both import tools, which imports this module
     cid = company["id"]
     today = _now().date().isoformat()
     goals = brain.active_goals(cid)
@@ -344,11 +345,13 @@ def cycle_sections(company: dict) -> str:
     lines = []
     if goals:
         lines += [f"{brain.goal_line(g)}. Open tasks: {counts.get(g['id'], 0)}." for g in goals]
-        # Routines and the owner's own tasks are exempt from the goal rule (they are never cancelled for it).
+        # Routines, the owner's own tasks and replies to inbound email are exempt from the goal rule: the same
+        # tasks the weekly review cancels (rhythms.after_weekly), so the CEO is never told to cancel a reply.
+        exempt = rhythms.EXEMPT_CREATORS
         loose = [r["id"] for r in db.q(
-            f"SELECT id FROM tasks WHERE company_id=? AND goal_id IS NULL AND COALESCE(routine, '')='' AND "
-            f"created_by NOT IN ('owner', 'routine') AND status IN ({','.join('?' * len(OPEN))}) ORDER BY id",
-            (cid, *OPEN))]
+            f"SELECT id FROM tasks WHERE company_id=? AND (goal_id IS NULL OR goal_id=0) AND COALESCE(routine, '')='' "
+            f"AND COALESCE(created_by, '') NOT IN ({','.join('?' * len(exempt))}) AND status IN "
+            f"({','.join('?' * len(OPEN))}) ORDER BY id", (cid, *exempt, *OPEN))]
         line = f"(no goal) Open tasks: {len(loose)}"
         if loose:
             ids = ", ".join(f"#{i}" for i in loose[:12]) + (", ..." if len(loose) > 12 else "")
@@ -382,8 +385,9 @@ def cycle_sections(company: dict) -> str:
 
     props = brain.pending_proposals(cid, 5)
     if props:
+        # Each line capped: a proposal's text has no limit of its own, and five long ones would swamp the prompt.
         parts.append("## Brain proposals waiting for your review (review_brain_change)\n"
-                     + "\n".join(brain.proposal_line(r) for r in props))
+                     + "\n".join(brain._clip(brain.proposal_line(r), PROPOSAL_LINE_CAP) for r in props))
 
     decs = brain.decisions_due(cid)   # no outcome yet, review date today + 3 days or earlier
     if decs:

@@ -188,13 +188,29 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     if feedback and row["action"] not in ("question", "decision"):
         note += f" Owner feedback: {feedback}"
 
-    db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
-              feedback=feedback, decided_by=decided_by,
-              summary=_summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"])
-    if row["action"] == "decision" and status == "answered":
+    fields = {"status": status, "result": result, "payload": json.dumps(p), "decided_at": ts, "feedback": feedback,
+              "decided_by": decided_by,
+              "summary": _summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"]}
+    if row["action"] in ("question", "decision"):
+        # Phase 2: the owner (dashboard or phone) and the scheduler's deadline can answer the same row at the same
+        # moment. Only the first answer counts, so the brain records it and its origin acts on it once.
+        with db._lock:
+            db.run(f"UPDATE approvals SET {', '.join(f'{k}=?' for k in fields)} WHERE id=? AND status='pending'",
+                   [*fields.values(), approval_id])
+            claimed = db.scalar("SELECT changes()")
+        if not claimed:
+            now = (db.one("SELECT status FROM approvals WHERE id=?", (approval_id,)) or {}).get("status", "decided")
+            raise ValueError(f"Request #{approval_id} is already {now}")
+    else:
+        db.update("approvals", approval_id, **fields)
+    if row["action"] == "decision":
         from . import decisions   # imported here: decisions imports tools, which imports this module
         try:
-            decisions.on_decided(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result, decided_by)
+            fresh = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+            if status == "answered":
+                decisions.on_decided(fresh, result, decided_by)
+            else:
+                decisions.on_dismissed(fresh)
         except Exception as e:   # the brain record is a view; the owner's answer must stand
             print(f"decision record failed: {e}")
     db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",

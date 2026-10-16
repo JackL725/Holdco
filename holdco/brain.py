@@ -213,13 +213,17 @@ def _end(text: str) -> str:
     return text if text.endswith("...") else text.rstrip(".") + "."
 
 
-def proposal_line(row: dict, short: bool = False) -> str:
-    """'#7 by Hunter (strategy.icp): icp: "...". Reason: ...'. short: the digest's version."""
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def proposal_line(row: dict, short: bool = False, emails: bool = True) -> str:
+    """'#7 by Hunter (strategy.icp): icp: "...". Reason: ...'. short: the digest's version. emails=False hides
+    email addresses (a contact proposal carries one), for prompts of roles that do not message people."""
     label, summary = _change_text(row.get("section") or "", _change_payload(row))
     line = f"#{row['id']} by {_agent_name(row.get('agent_id'))} ({label}): {_end(_cut(summary, 'summary', short))}"
     if (row.get("reason") or "").strip():
         line += f" Reason: {_end(_cut(row['reason'], 'reason', short))}"
-    return line
+    return line if emails else _EMAIL_RE.sub("(email hidden)", line)
 
 
 def pending_proposals(company_id: int, limit: int = 50) -> list[dict]:
@@ -355,8 +359,10 @@ def digest(company: dict) -> str:
         _block("## Lessons (newest first)", [f"- {r['text']}" for r in lessons], "lessons",
                more="(older lessons: brain_lookup lessons)"),
         _block("## Contacts", _contacts_line(cid), "contacts"),
+        # Every role reads the digest, so a contact proposal's email address stays out of it (spec, Open questions 3).
         _block(f"## Brain proposals waiting for CEO review: {pending}",
-               [proposal_line(r, short=True) for r in pending_proposals(cid, SHOWN["proposals"])], "proposals"),
+               [proposal_line(r, short=True, emails=False) for r in pending_proposals(cid, SHOWN["proposals"])],
+               "proposals"),
     ]
     text = "\n".join(p for p in parts if p)
     if len(text) > DIGEST_CAP:   # safety net: cut from the bottom, at a line break
@@ -705,7 +711,7 @@ def _lookup_line(section: str, r: dict, emails: bool) -> str:
         return line + (f" Result: {r['result']}" if r.get("result") else "")
     if section == "lessons":
         return f"#{r['id']} ({(r.get('created_at') or '')[:10]}) {r.get('text') or ''}"
-    return f"[{r.get('status')}] " + proposal_line(r)
+    return f"[{r.get('status')}] " + proposal_line(r, emails=emails)
 
 
 @tool("brain_lookup", "Look up records in the company brain: strategy, goals, contacts, decisions, experiments, "
@@ -747,6 +753,30 @@ def brain_lookup(ctx: Ctx, section: str, query: str = "") -> str:
         return f"No {section} match '{query}'." if words else f"No {section} yet."
     head = f"{section.capitalize()}" + (f" matching '{query}'" if words else "") + f" (newest first, {len(rows)}):"
     return head + "\n" + "\n".join(_clip(_lookup_line(section, r, emails), 500) for r in rows)
+
+
+def _owner_proposal_problem(ctx: Ctx, data: dict, reason: str) -> str | None:
+    """A strategy change for the owner reaches the owner like a question, so Phase 0.5's rules for owner questions
+    hold: the claims gate on what the owner will read (the change and its reason), one decision per strategy field
+    at a time, and the team's questions and decisions together at most planning.MAX_PENDING_QUESTIONS. Returns the
+    refusal, or None."""
+    from . import planning, truth   # imported here: both import tools, which imports this module
+    cid = ctx.company["id"]
+    refusal = truth.claims_guard(ctx, "\n".join([_change_text("strategy", data)[1], (reason or "").strip()]), "ask")
+    if refusal:
+        return refusal
+    fields = {k for k in data if k in OWNER_FIELDS}
+    for row in db.q("SELECT * FROM brain_changes WHERE company_id=? AND section='strategy' AND status='owner' "
+                    "ORDER BY id", (cid,)):
+        shared = sorted(fields & set(_change_payload(row)))
+        if shared:
+            return (f"Proposal #{row['id']} to change the strategy's {', '.join(shared)} already waits for the "
+                    "owner's decision. Don't propose another change to it until the owner decides; continue with "
+                    "your work.")
+    waiting = planning.pending_agent_questions(cid)
+    if len(waiting) >= planning.MAX_PENDING_QUESTIONS:
+        return planning.cap_refusal(waiting)
+    return None
 
 
 def _parse_change(change: str) -> dict:
@@ -794,6 +824,10 @@ def propose_brain_change(ctx: Ctx, section: str, change: str, reason: str = "") 
     if dup:
         return f"Already proposed as #{dup['id']} ({dup['status']}). Don't resubmit; continue with your work."
     to_owner = section == "strategy" and any(k in OWNER_FIELDS for k in data)
+    if to_owner:
+        refusal = _owner_proposal_problem(ctx, data, reason)
+        if refusal:
+            return refusal
     ch_id = db.run("INSERT INTO brain_changes(company_id, agent_id, section, payload, reason, status, created_at) "
                    "VALUES(?,?,?,?,?,?,?)", (cid, ctx.agent["id"], section, payload, (reason or "").strip()[:1000],
                                              "owner" if to_owner else "pending", db.now()))
