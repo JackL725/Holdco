@@ -26,6 +26,37 @@ def _seconds_ago(n: float) -> str:
     return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _local_now() -> _dt.datetime:
+    """The PC's local time: routines with an at_hour follow the owner's day. Tests patch this function, and
+    HOLDCO_TEST_LOCAL_NOW fixes it for end-to-end runs (a time of day such as 19:00, or an ISO date and time)."""
+    fixed = os.environ.get("HOLDCO_TEST_LOCAL_NOW", "").strip()
+    if fixed:
+        try:
+            return _dt.datetime.fromisoformat(fixed.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return _dt.datetime.combine(_dt.date.today(), _dt.time.fromisoformat(fixed))
+            except ValueError:
+                pass
+    return _dt.datetime.now()
+
+
+def _at_hour_due(c: dict, key: str, r: dict) -> bool:
+    """Phase 2: a routine with an at_hour is due once local time has passed that hour today and no task for it
+    was created since then. For a routine slower than daily (the weekly review) "since then" reaches back to that
+    hour on the day the previous one was due, so it comes every_hours apart at the same hour.
+
+    The local clock only says how long ago that hour was; task times are compared with the database clock, so a
+    fixed test clock cannot make a routine come again on every check."""
+    now = _local_now()
+    at = now.replace(hour=int(r["at_hour"]) % 24, minute=0, second=0, microsecond=0)
+    if now < at:
+        return False
+    window = (now - at) + _dt.timedelta(hours=max(0.0, float(r.get("every_hours") or 24) - 24))
+    return not db.one("SELECT id FROM tasks WHERE company_id=? AND routine=? AND created_at>=? LIMIT 1",
+                      (c["id"], key, _seconds_ago(window.total_seconds())))
+
+
 class Scheduler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="scheduler")
@@ -106,7 +137,8 @@ class Scheduler(threading.Thread):
             agents.start(agent["id"], "task", task_id=t["id"])
 
     def _housekeeping(self, s: dict) -> None:
-        """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller."""
+        """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller.
+        Phase 2 adds decision deadlines (the kill switch holds them itself) and the daily portfolio brief."""
         from . import connectors   # Phase 1: connector health checks and metric pipes (both cheap when not due)
         for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller,
                      connectors.check_if_stale, connectors.poll_if_due,
@@ -196,30 +228,35 @@ class Scheduler(threading.Thread):
     def _routines(self, c: dict) -> None:
         cs = db.company_settings(c)
         age_h = db.minutes_since(c["created_at"]) / 60
+        analyst: bool | None = None   # Phase 2: is there an enabled analyst? Looked up once, when a routine asks
         for a in db.q("SELECT * FROM agents WHERE company_id=? AND enabled=1 AND routines_on=1", (c["id"],)):
             for r in roles.role_info(a).get("routines", []):
-                if r["requires"] == "imap" and not emailer.imap_configured(cs):
+                requires = r.get("requires") or ""
+                if requires == "imap" and not emailer.imap_configured(cs):
                     continue
-                if r["requires"] == "smtp" and emailer.outbound(c, cs) is None:   # SMTP, or Resend (Phase 1)
+                if requires == "smtp" and emailer.outbound(c, cs) is None:   # SMTP, or Resend (Phase 1)
                     continue
-                if age_h < r["first_after_hours"]:
+                if requires == "no_analyst":   # Phase 2: the CEO writes the evening brief only without an analyst
+                    if analyst is None:
+                        analyst = any(roles.preset_key(x) == "analyst" for x in
+                                      db.q("SELECT * FROM agents WHERE company_id=? AND enabled=1", (c["id"],)))
+                    if analyst:
+                        continue
+                if age_h < r.get("first_after_hours", r["every_hours"]):
                     continue
                 key = f"{roles.preset_key(a)}:{r['title']}"
                 if db.one("SELECT id FROM tasks WHERE company_id=? AND agent_id=? AND routine=? AND status IN "
                           "('todo','in_progress','blocked','waiting')", (c["id"], a["id"], key)):
                     continue
-                last = db.scalar("SELECT MAX(created_at) FROM tasks WHERE company_id=? AND agent_id=? AND routine=?",
-                                 (c["id"], a["id"], key))
-                if last and db.minutes_since(last) / 60 < r["every_hours"]:
-                    continue
-                ts = db.now()
-                tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, "
-                             "created_by, deliverable, routine, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (c["id"], r["title"], r["description"], a["role"], a["id"], "todo", r["priority"],
-                              "routine", r["deliverable"], key, ts, ts))
-                bus.emit(c["id"], "task", f"recurring duty for {a['name']}: {r['title']}", None,
-                         {"task_id": tid, "routine": key})
-                bus.notify("tasks", company_id=c["id"])
+                if r.get("at_hour") is not None:
+                    if not _at_hour_due(c, key, r):
+                        continue
+                else:
+                    last = db.scalar("SELECT MAX(created_at) FROM tasks WHERE company_id=? AND agent_id=? AND "
+                                     "routine=?", (c["id"], a["id"], key))
+                    if last and db.minutes_since(last) / 60 < r["every_hours"]:
+                        continue
+                rhythms.create_routine_task(c, a, r, key)
 
     def _check_inbox(self, c: dict) -> None:
         cs = db.company_settings(c)
