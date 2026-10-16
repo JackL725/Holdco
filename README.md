@@ -73,6 +73,25 @@ No cloud AI, no API bills, no pip installs.
   never in the database, and are scrubbed from the feed, transcripts, the audit log and `records/`.
 - **A browser check.** `browser_check` renders a page in a real browser (Playwright) with console errors, links,
   forms and phone-size screenshots, or runs a labelled static check when Playwright isn't installed.
+- **A company brain.** Every company keeps its strategy (one-liner, customer, problem, offer, price, positioning,
+  voice), up to three measured goals, contacts, decisions with a review date, experiments and lessons as structured
+  records. Every agent reads a one-page digest of it first, with each number's source. Other agents propose changes
+  for the CEO to review; a proposed change to price, offer, positioning or customer comes to you as a decision.
+  Edit any of it on the **Brain** tab.
+- **Top-down planning.** The CEO plans from the goals: the gap to each target, one or two bets as experiments with a
+  stop date, and tasks that name the goal they serve and the effect they should have. Tasks can depend on other
+  tasks, carry a due date, a step and token budget and the checks that will run when they finish. Two agents can't
+  overwrite the same file: the first one holds a 30-minute lease.
+- **Daily and weekly rhythms.** A morning plan, an evening brief, a weekly board memo and a monthly keep, change or
+  kill check, built from numbers Holdco gathers itself. A brief can use only numbers from its data, and the weekly
+  review scores goals only with numbers from connected services, never with numbers agents typed in. Briefs arrive
+  on your phone, the company Overview and, as one portfolio brief, at the top of the Portfolio page. After each
+  weekly review, tasks an agent created that serve no goal are cancelled.
+- **Decisions, not just approvals.** When the CEO needs you to choose, it sends a decision with options, its
+  recommendation and a deadline. Reversible decisions take the recommendation when the deadline passes; irreversible
+  ones wait for you. What you chose goes into the brain and comes back for review two weeks later.
+- **Budgets.** GPU hours per day, tool calls per task, posts per week and emails per day, per company, in its
+  Settings tab. The Overview shows how much of today's GPU budget is used.
 - **Also built in:** company email over SMTP/IMAP (inbound mail becomes support tasks), website publishing
   (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
 
@@ -250,7 +269,7 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
              idle agents pick up tasks ◄───────────────────┘
                       │
                       ▼
-   agent session: system prompt (role, standing orders, facts, charter core, playbook, your pinned context,
+   agent session: system prompt (role, standing orders, facts, brain digest, playbook, your pinned context,
                   what changed, what waits on you, relevant memory, what can be opened)
                   → model calls tools → results → … → finish
                       │
@@ -260,8 +279,17 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 - **Standing orders** (company Settings) are injected into every agent's every session: brand rules,
   things to avoid, priorities.
 - **Memory**: agents save facts, decisions and lessons. Your approvals, rejections and answers are saved
-  too, so agents learn what you accept. Pin notes that must never be forgotten. Phase 2 of the plan adds a
-  structured company brain (goals, metrics, customers, decisions) as the first thing agents read.
+  too, so agents learn what you accept. Pin notes that must never be forgotten.
+- **Company brain**: strategy, goals, contacts, decisions, experiments and lessons in their own tables, shown to
+  every agent as a digest of at most 6,000 characters (about 1,500 tokens) with each metric's source. The CEO writes
+  it directly; other agents propose changes. Goals refresh their current value from the newest metric of the same
+  name, so a goal tied to `stripe.customers` moves when Stripe reports a customer.
+- **Task contracts**: a task names its goal, the expected effect, files to read first, the tasks it waits on, a due
+  date, a tool-call and token budget, and the checks to run on the result. The scheduler starts a task only when
+  everything it depends on is done or cancelled, and a file being written by one agent is leased to it.
+- **Rhythms**: the morning plan (7:00), the evening brief (18:00) and the weekly review (9:00, once a week from the end of the first
+  week) follow your PC's clock; the data for each is gathered by code and handed to the agent as the only numbers it
+  may use. "Run now" on the Overview starts any of them at once.
 - **Approval policies**: per action type, globally and per company: *Ask me first* (default),
   *Let agents do it*, or *Never allow*. Purchases are always *Ask me first*.
 - **Watchdog**: a task that fails twice is blocked and becomes a question in your Inbox and on your phone (skip
@@ -359,11 +387,12 @@ request. Each phase document under `docs/phases/` says what was built and how to
 2. **Phase 0.5: Ground truth and context** (built): facts and records agents can't
    edit, a claims gate, one question per topic, change-driven planning, staged founding, charter validation,
    business playbooks, verified research facts, and one search over everything including your own context files.
-3. **Phase 1: Connect** (built in this pull request): an MCP client for both protocol generations, OAuth, a
+3. **Phase 1: Connect** (built): an MCP client for both protocol generations, OAuth, a
    credential vault, risk tags on every tool, connector cards with health checks and metric pipes, `find_tool`,
    the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave) and `browser_check`.
-4. **Phase 2: Organize** (planned): the company brain with measured goals, task contracts with dependencies,
-   daily and weekly rhythms, a daily brief and a decisions queue.
+4. **Phase 2: Organize** (built in this pull request): the company brain with measured goals, top-down planning,
+   task contracts with dependencies and file leases, daily and weekly rhythms with briefs built from real numbers,
+   a decisions queue with deadlines, and budgets for GPU time, steps and posts.
 5. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
    structured tool calls, a code sandbox, taint tracking and a trust ladder for approvals.
 6. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
@@ -389,6 +418,10 @@ holdco/
   context.py        search index, unified search, line reads, edit_file, your context library
   planning.py       one question per topic, change-driven cycles, budgets, staged founding, charter checks
   playbooks.py      business-type playbooks
+  brain.py          the company brain: strategy, goals, contacts, decisions, experiments, lessons, the digest
+  contracts.py      task contracts, the dependency graph, budgets (GPU hours, steps, tokens, posts)
+  rhythms.py        morning plan, evening brief, weekly review and monthly check data; briefs; portfolio brief
+  decisions.py      the decisions queue: options, a recommendation, deadlines and auto-resolution
   vault.py          the credential vault (DPAPI, keyring, encrypted file) and redaction
   mcp.py, oauth.py  MCP client (stdio and Streamable HTTP, both protocol generations) and OAuth with PKCE
   connectors.py     connector cards, health checks, metric pipes, find_tool, risk-gated calls
