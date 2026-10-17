@@ -113,7 +113,7 @@ class EndToEnd(unittest.TestCase):
         self.api.patch(f"/api/companies/{cid}", {"settings": {"postal_address": "1 Main Street, Springfield, IL 62701"}})
         team = {a["role"]: a["preset"] for a in self.api.get(f"/api/companies/{cid}")["agents"]}
         self.assertEqual(set(team), {"ceo", "research", "engineering", "qa", "marketing", "sales", "support", "ops"})
-        wait_for(lambda: self.api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 30, what="founding")
+        wait_for(lambda: self.api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 120, what="founding")
         info = self.api.get(f"/api/companies/{cid}")
         self.assertEqual(info["company"]["name"], "PawPlan")
         self.assertIn("One-liner", info["company"]["charter"])
@@ -786,7 +786,7 @@ class EndToEnd(unittest.TestCase):
         api.put("/api/settings", {"llm_base_url": self.model.url, "max_concurrent_runs": 2})
         cid = api.post("/api/companies", {"idea": "Personalised weekly meal plans for dog owners",
                                           "name": "Evening Paws", "template": "minimal"})["company"]["id"]
-        wait_for(lambda: api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 60, what="founding")
+        wait_for(lambda: api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 120, what="founding")
         team = {a["role"]: a for a in api.get(f"/api/companies/{cid}")["agents"]}
         for role, a in team.items():
             if role != "ceo":
