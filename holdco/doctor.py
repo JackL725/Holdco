@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import backup, config, db, emailer, llm, notify, web
+from . import backup, config, db, emailer, llm, notify, sandbox, web
 from .routing import route
 
 LAST: list[dict] = []          # most recent rows, newest run
@@ -336,7 +336,7 @@ def _connector_jobs(s: dict, recheck: bool) -> list[_Job]:
     """One job per configured connector per company (archived companies skipped), plus the global ones.
     Each job carries its company id, which _run_jobs stamps into the rows as "company_id"."""
     jobs: list[_Job] = []
-    for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
+    for c in db.q("SELECT * FROM companies WHERE status NOT IN ('archived', 'bench') ORDER BY id"):
         cs = db.company_settings(c)
         cid, cname = c["id"], c["name"]
         fix = _link("Company settings", f"#/c/{cid}/settings")
@@ -368,6 +368,21 @@ def _disk_free_bytes() -> tuple[int, int]:
     d = config.DATA_DIR if config.DATA_DIR.exists() else config.DATA_DIR.parent
     u = shutil.disk_usage(d)
     return u.free, u.total
+
+
+SANDBOX_DOCS = "https://docs.docker.com/get-started/get-docker/"
+
+
+def _check_sandbox() -> dict:
+    """Phase 3: run_code runs in a Docker or Podman container when one is available; without one it runs on this
+    PC, which the owner should know and can fix."""
+    key, label = "sandbox", "Code sandbox"
+    runtime = sandbox.available()
+    if runtime:
+        return _row(key, label, "ok", f"Code sandbox: {runtime}. Agents' code runs in a container with only the "
+                                      f"company folder, no network unless approved, 1 GB of memory and 1 CPU.")
+    return _row(key, label, "warn", "Code sandbox: not available. Install Docker Desktop or Podman to isolate "
+                                    "agents' code.", _link("Get Docker Desktop", SANDBOX_DOCS))
 
 
 def _check_disk() -> dict:
@@ -407,6 +422,61 @@ def _check_errors() -> dict:
     return _row("errors_24h", "Errors in the last 24 h", status, detail, _link("Open the live feed", "#/"))
 
 
+def _check_index() -> dict:
+    """Phase 0.5: the search index agents and the dashboard search use. FTS5 missing means the plain LIKE
+    fallback (search still answers, only slower and unranked); a company with nothing in the index yet means
+    search misses its files until it is indexed."""
+    from . import context   # imported here: context imports tools, which imports watchdog, which imports doctor
+    key, label = "search_index", "Search index"
+    st = context.index_status()
+    if not st.get("fts"):
+        return _row(key, label, "warn", "SQLite full-text search (FTS5) is not available in this Python, so search "
+                                        "falls back to a slower plain-text scan. Search still works.",
+                    _text("Use a Python whose SQLite includes FTS5 for ranked search"))
+    archived = {r["id"] for r in db.q("SELECT id FROM companies WHERE status='archived'")}
+    companies = [c for c in st.get("companies") or [] if c["id"] not in archived]
+    missing = [c for c in companies if not (c.get("rows") or c.get("last_indexed") or c.get("last_checked"))]
+    stamps = [c.get("last_indexed") for c in companies if c.get("last_indexed")] + \
+        ([st["global_last_indexed"]] if st.get("global_last_indexed") else [])
+    newest = max(stamps) if stamps else None
+    when = f"; last indexed {_ago(db.minutes_since(newest) / 60)}" if newest else ""
+    detail = (f"Full-text index: {st.get('rows', 0):,} entries for {len(companies)} "
+              f"compan{'y' if len(companies) == 1 else 'ies'} and {st.get('global_files', 0)} of your context "
+              f"files{when}.")
+    model = st.get("embedding_model") or ""
+    if model:
+        detail += f" Meaning search with {model}: {st.get('vectors', 0):,} vectors."
+    if missing:
+        names = ", ".join(c["name"] for c in missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
+        return _row(key, label, "warn", f"Not indexed yet: {names}. Search misses their files until they are "
+                                        f"indexed. {detail}", _action("Index now", "reindex"))
+    return _row(key, label, "ok", detail)
+
+
+def _tokens(n: int) -> str:
+    return f"{n / 1e6:.1f}M" if n >= 100_000 else f"{n:,}"
+
+
+def _check_budgets() -> dict:
+    """Phase 0.5: companies over their daily token budget get no background work until midnight."""
+    from . import planning   # imported here: planning imports tools (see _check_index)
+    key, label = "token_budgets", "Token budgets"
+    rows = planning.budget_status()
+    if not rows:
+        return _row(key, label, "ok", "No companies yet.")
+    over = [r for r in rows if r["over"]]
+    if over:
+        names = "; ".join(f"{r['name']} ({_tokens(r['used'])} of {_tokens(r['budget'])} tokens)" for r in over[:5])
+        more = f" and {len(over) - 5} more" if len(over) > 5 else ""
+        return _row(key, label, "warn", f"Over today's budget, so background work is paused until midnight: "
+                                        f"{names}{more}. Chat and tasks you create still run.",
+                    _link("Company settings", f"#/c/{over[0]['company_id']}/settings"))
+    used = "; ".join(f"{r['name']} {_tokens(r['used'])}" + (f" of {_tokens(r['budget'])}" if r["budget"] else
+                                                           " (no limit)") for r in rows[:6])
+    more = f"; and {len(rows) - 6} more" if len(rows) > 6 else ""
+    return _row(key, label, "ok", f"No company is over its daily token budget. Today: {used}{more}.")
+
+
 # ---------------------------------------------------------------- public API
 
 def run(deep: bool = False, force: bool = False) -> list[dict]:
@@ -425,11 +495,20 @@ def run(deep: bool = False, force: bool = False) -> list[dict]:
             _Job([("search", "Web search", _link("Search settings", "#/settings"))],
                  lambda: _check_search(s, deep), long),
             *_connector_jobs(s, deep or force),
+            _Job([("sandbox", "Code sandbox", _link("Get Docker Desktop", SANDBOX_DOCS))], _check_sandbox),
             _Job([("disk", "Disk space", None)], _check_disk),
             _Job([("backup", "Last backup", _action("Back up now", "backup"))], _check_backup),
             _Job([("errors_24h", "Errors in the last 24 h", None)], _check_errors),
+            _Job([("search_index", "Search index", None)], _check_index),
+            _Job([("token_budgets", "Token budgets", None)], _check_budgets),
         ]
         rows = _run_jobs(jobs)
+        for extra in ("vault", "connectors"):   # Phase 1: the vault row and one row per connector instance
+            try:
+                mod = __import__(f"holdco.{extra}", fromlist=["doctor_rows"])
+                rows.extend(mod.doctor_rows())
+            except Exception as e:
+                rows.append(_row(extra, extra.title(), "bad", notify.scrub(f"Could not check: {e}")))
     except Exception as e:  # the Doctor must never take the scheduler or the page down with it
         traceback.print_exc()
         rows = [_row("doctor", "Doctor", "bad", notify.scrub(f"The health checks could not run: {e}"))]
@@ -548,3 +627,31 @@ def api_doctor(h, m, body):
 def api_doctor_run(h, m, body):
     rows = run(deep=bool((body or {}).get("deep")), force=True)   # the owner pressed the button: test for real
     return {"checks": rows, "summary": summary(rows)}
+
+
+_reindexing = threading.Event()   # set while a rebuild started from the dashboard is running
+
+
+def _reindex_work() -> None:
+    from . import bus, context
+    try:
+        context.reindex_global()
+        context.reindex_all()
+        _merge([_check_index()])
+    except Exception:
+        traceback.print_exc()
+    finally:
+        _reindexing.clear()
+        bus.notify("doctor")
+
+
+@route("POST", "/api/index/rebuild")
+def api_index_rebuild(h, m, body):
+    """The Doctor's "Index now": bring the search index up to date for every company and the owner's library in
+    a background thread (a big data folder can take a while). The Doctor page reloads when it is done."""
+    with _lock:   # two clicks at once start one rebuild
+        if _reindexing.is_set():
+            return {"ok": True, "started": False, "message": "The search index is already being updated."}
+        _reindexing.set()
+    threading.Thread(target=_reindex_work, daemon=True, name="reindex-rebuild").start()
+    return {"ok": True, "started": True, "message": "Updating the search index in the background."}

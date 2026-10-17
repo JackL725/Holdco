@@ -165,6 +165,104 @@ class _PageParser(HTMLParser):
         self.text.append(data)
 
 
+# ======================= placeholders (Phase 0.5, design 2.6) =======================
+# The first real landing page shipped with gtag id G-PLACEHOLDER and a 1x1 data-URI social image. Each pattern
+# below is something a template or a model leaves behind that must never reach the public.
+
+_PH_LINE = [
+    (re.compile(r"\b(?:G|UA|GTM|AW|DC)-(?:PLACEHOLDER|X{3,}[\w-]*|0{4,}[\w-]*|YOUR[\w-]*|TEST[\w-]*|1234[\w-]*)\b",
+                re.I), "analytics id {0}"),
+    # Upper case only: CSS for form hints (input::placeholder) is common and harmless.
+    (re.compile(r"(?<![\w-])PLACEHOLDER(?![\w-])"), "the word {0}"),
+    (re.compile(r"\[placeholder\]", re.I), "placeholder text {0}"),
+    (re.compile(r"lorem\s+ipsum", re.I), "placeholder text '{0}'"),
+    (re.compile(r"\b(?:TODO|TBD|FIXME)\b"), "'{0}' marker"),
+    (re.compile(r"\byour text here\b", re.I), "placeholder text '{0}'"),
+    (re.compile(r"\{\{\s*[\w.\- ]{1,40}?\s*\}\}"), "template token {0}"),
+    (re.compile(r"\[(?:your |company |business |first |last |full |customer |client )?(?:name|company|company name|"
+                r"business name|email|e-mail|phone|phone number|address|city|date|link|url|website|title|product|"
+                r"price|location)\](?![(\[:])", re.I), "template token {0}"),
+    (re.compile(r"\bYOUR_[A-Z0-9_]+\b"), "template token {0}"),
+]
+_PH_EMAIL = re.compile(r"[\w.+-]*(?:placeholder|example)[\w.+-]*@[\w-]+(?:\.[\w-]+)*|[\w.+-]+@(?:[\w-]+\.)*"
+                       r"example\.(?:com|org|net)\b", re.I)
+_PH_DOMAIN = re.compile(r"(?<![\w.-])(?:[\w-]+\.)*example\.(?:com|org|net)\b", re.I)
+# The placeholder="..." attribute of a form field is a hint shown in an empty input, not leftover template text.
+_PH_ATTR = re.compile(r"""\splaceholder\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+
+
+class _PlaceholderParser(HTMLParser):
+    """Social images given as inline data URIs, and links whose destination is just '#'."""
+
+    SOCIAL = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.found: list[tuple[int, str]] = []
+        self._a: dict | None = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        line = self.getpos()[0]
+        if tag == "meta":
+            key = (a.get("property") or a.get("name") or "").lower()
+            if key in self.SOCIAL and a.get("content", "").strip().lower().startswith("data:"):
+                self.found.append((line, f"social image ({key}) is an inline data URI; link previews need a real "
+                                         "image URL"))
+        elif tag == "a" and (a.get("href") or "").strip() == "#":
+            # A '#' link with a script handler or a button role does something; one without is a dead placeholder.
+            if not any(k.startswith("on") or k in ("role", "data-action", "data-toggle", "data-bs-toggle") for k in a):
+                self._a = {"line": line, "text": ""}
+
+    def handle_data(self, data):
+        if self._a is not None:
+            self._a["text"] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._a is not None:
+            text = " ".join(self._a["text"].split())
+            if text.lower() not in ("top", "back to top", "to top", "↑"):
+                self.found.append((self._a["line"], f"link \"{text[:40] or '(icon)'}\" goes to \"#\" instead of a "
+                                                    "real page"))
+            self._a = None
+
+
+def find_placeholders(text: str, is_html: bool = False) -> list[tuple[int, str]]:
+    """(line number, what) for every placeholder left in a page or document: analytics ids like G-PLACEHOLDER or
+    G-XXXXXXX, placeholder@ and example.com addresses and links, lorem ipsum, TODO/TBD/FIXME, template tokens
+    ({{name}}, [Company Name], YOUR_...), and in HTML social images given as data URIs and links to '#'."""
+    text = text or ""
+    if is_html:
+        text = _PH_ATTR.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)   # same length keeps line numbers
+    found: list[tuple[int, str]] = []
+    for no, line in enumerate(text.splitlines(), 1):
+        spans = []
+        for m in _PH_EMAIL.finditer(line):
+            spans.append(m.span())
+            found.append((no, f"placeholder email {m.group(0)}"))
+        for m in _PH_DOMAIN.finditer(line):
+            if not any(a <= m.start() < b for a, b in spans):
+                found.append((no, f"example domain {m.group(0)}"))
+        for rx, label in _PH_LINE:
+            for m in rx.finditer(line):
+                if not any(a <= m.start() < b for a, b in spans):
+                    found.append((no, label.format(m.group(0))))
+    if is_html:
+        p = _PlaceholderParser()
+        try:
+            p.feed(text)
+            p.close()
+        except Exception:   # malformed HTML: the line checks above still ran
+            pass
+        found.extend(p.found)
+    out, seen = [], set()
+    for item in sorted(found, key=lambda x: x[0]):
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def _meta(p: _PageParser, key: str, attr: str = "name") -> str | None:
     for m in p.metas:
         if m.get(attr, "").lower() == key:
@@ -283,9 +381,11 @@ def audit_page(page: Path, site_root: Path | None, check_external: bool = False)
             add("major", f"A link to {str(href)[:60]} has no text.")
         elif label.lower() in ("click here", "here", "learn more", "read more"):
             add("minor", f"Link text \"{label}\" doesn't say where it goes.")
-        if href is None or href in ("", "#"):
+        if href is None or href == "":
             add("minor", f"Link \"{(label or '')[:30]}\" has no destination.")
             continue
+        if href == "#":
+            continue   # a dead '#' link is a placeholder blocker (find_placeholders); one with a handler is fine
         if href.startswith(("http://", "https://")):
             external.append(href)
         elif not href.startswith(("#", "mailto:", "tel:", "javascript:")) and site_root is not None:
@@ -345,9 +445,12 @@ def audit_page(page: Path, site_root: Path | None, check_external: bool = False)
         if re.search(r"(sk_live|sk-[a-z0-9]{20,}|api[_-]?key\s*[:=]\s*['\"][a-z0-9_\-]{16,})", body, re.I):
             add("blocker", "Something that looks like a secret API key is in page JavaScript.")
 
-    # content honesty
-    if re.search(r"lorem ipsum|\bTODO\b|\bTBD\b|\[placeholder\]|your text here", raw, re.I):
-        add("blocker", "Placeholder text (lorem ipsum / TODO / TBD) is still on the page.")
+    # content honesty: every placeholder is a blocker (deploy_site refuses while any remains)
+    placeholders = find_placeholders(raw, True)
+    for line_no, what in placeholders[:20]:
+        add("blocker", f"Placeholder text still on the page (line {line_no}): {what}.")
+    if len(placeholders) > 20:
+        add("blocker", f"Placeholder text: {len(placeholders) - 20} more placeholders not listed.")
     claims = re.findall(r"\b\d[\d,.]*\s*\+?\s*(?:happy\s+)?(?:customers|users|teams|companies|businesses|clients|"
                         r"downloads|members|subscribers)\b", text, re.I)
     for c in claims[:3]:
@@ -420,10 +523,23 @@ def _plain(text: str, is_html: bool) -> str:
     return text
 
 
+# Typographic punctuation local models write ("opt‑out" with a non-breaking hyphen, "won’t", a narrow no-break
+# space before a unit) mapped to the plain characters the checks' patterns are written for.
+_PUNCT = {**{c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"},
+          **{c: "'" for c in "\u2018\u2019\u201b\u2032"}, **{c: '"' for c in "\u201c\u201d\u201f\u2033"},
+          **{c: " " for c in "\u00a0\u202f\u2007\u2009\u200a"}, "\u200b": ""}
+_PUNCT_TABLE = str.maketrans(_PUNCT)
+
+
+def plain_punct(text: str) -> str:
+    """text with typographic dashes, quotes and spaces replaced by plain ones, for pattern checks."""
+    return (text or "").translate(_PUNCT_TABLE)
+
+
 def review_text(text: str, kind: str = "general", is_html: bool = False) -> str:
     kind = kind if kind in GRADE_TARGET else "general"
     raw = text
-    text = _plain(text, is_html)
+    text = plain_punct(_plain(text, is_html))
     words = re.findall(r"[A-Za-z][A-Za-z'’-]*", text)
     n = len(words)
     if not n:
@@ -473,7 +589,7 @@ def review_text(text: str, kind: str = "general", is_html: bool = False) -> str:
         elif q > 2:
             issues.append(f"{q} questions: keep to one clear ask.")
         if not re.search(r"unsubscribe|opt[ -]?out|not interested|won'?t (email|follow up|reach out)|reply .{0,12}\bno\b"
-                         r"|let me know if you'?d rather|stop hearing", low):
+                         r"|reply .{0,12}\bstop\b|let me know if you'?d rather|stop hearing", low):
             issues.append("No opt-out line (e.g. \"Not relevant? Reply 'no' and I won't follow up.\").")
         if len(re.findall(r"https?://", raw)) > 1:
             issues.append("More than one link hurts deliverability; use one or none.")
@@ -490,6 +606,11 @@ def review_text(text: str, kind: str = "general", is_html: bool = False) -> str:
             issues.append("Sign as the company's AI assistant and offer a person.")
         if re.search(r"\b(refund|discount|credit|free month)\b", low):
             issues.append("Mentions a refund/discount/credit: only if it's written policy or the owner approved it.")
+    placeholders = find_placeholders(raw, is_html)
+    if placeholders:
+        shown = "; ".join(f"line {n}: {w}" for n, w in placeholders[:10])
+        more = f" (+{len(placeholders) - 10} more)" if len(placeholders) > 10 else ""
+        issues.append(f"Placeholders to replace before this goes out: {shown}{more}")
     if kind == "social_x" and len(text.strip()) > 280:
         issues.append(f"{len(text.strip())} characters: X allows 280.")
     if kind == "landing":

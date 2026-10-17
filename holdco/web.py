@@ -32,21 +32,124 @@ class WebError(Exception):
 
 # ---------------- safety ----------------
 
+# Relay services fetch another site on an agent's behalf (a test company read a 403 page through r.jina.ai). They
+# hide where requests really go and break the sites' terms, so they are refused. Exact hosts (and their
+# subdomains), host suffixes, and host prefixes, kept in one place.
+RELAY_HOSTS = ("r.jina.ai", "s.jina.ai", "12ft.io", "allorigins.win", "corsproxy.io", "thingproxy.freeboard.io")
+RELAY_SUFFIXES = (".translate.goog",)
+RELAY_PREFIXES = ("cors-anywhere",)
+RELAY_HINT = "Use the search result's snippet, or find another source for the same information."
+BLOCKED_HINT = ("The site refuses automated readers. Use the search result's snippet or another source; do not use "
+                "relay services such as r.jina.ai (Holdco blocks them).")
+
+
+def is_relay(host: str) -> bool:
+    h = (host or "").lower().rstrip(".")
+    return (any(h == r or h.endswith("." + r) for r in RELAY_HOSTS) or h.endswith(RELAY_SUFFIXES)
+            or h.startswith(RELAY_PREFIXES))
+
+
+# Test-only: comma-separated host:port pairs (port may be *) that count as public, so fake services on 127.0.0.1
+# can stand in for Stripe and others in the test suite. Empty by default; never set it on a real install.
+ALLOW_LOCAL = [p.strip() for p in os.environ.get("HOLDCO_ALLOW_LOCAL", "").split(",") if p.strip()]
+
+
+def _allowed_local(host: str, port: int | None) -> bool:
+    for pair in ALLOW_LOCAL:
+        h, _, p = pair.partition(":")
+        if h == host and (p in ("", "*") or p == str(port)):
+            return True
+    return False
+
+
+def blocked_ip(ip) -> bool:
+    """True for an address agents may not reach: this PC (loopback, unspecified), the home or office network
+    (private, link-local), and reserved or multicast ranges. An IPv6 address that carries an IPv4 one
+    (::ffff:127.0.0.1) is judged by the IPv4 address inside it."""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+            or ip.is_unspecified)
+
+
+# One part of a host written as a number, the way browsers read it: hex (0x7f), octal (0177) or decimal (127).
+_NUM_PART = re.compile(r"^(?:0[xX][0-9a-fA-F]*|0[0-7]*|[1-9][0-9]*)$")
+
+
+def numeric_ipv4(host: str):
+    """The IPv4 address a browser reads in a host such as 2130706433, 0x7f000001, 0177.0.0.1 or 127.1, or None
+    when the host is not written as numbers (ipaddress only accepts the dotted decimal form)."""
+    parts = (host or "").split(".")
+    if len(parts) > 1 and parts[-1] == "":
+        parts = parts[:-1]   # a trailing dot
+    if not parts or len(parts) > 4 or not all(_NUM_PART.match(p) for p in parts):
+        return None
+    nums = [int(p[2:] or "0", 16) if p[:2].lower() == "0x" else int(p, 8) if p.startswith("0") else int(p)
+            for p in parts]
+    if any(n > 255 for n in nums[:-1]) or nums[-1] >= 256 ** (5 - len(nums)):
+        return None   # not an address at all: the browser refuses it
+    value = nums[-1]
+    for i, n in enumerate(nums[:-1]):
+        value += n << (8 * (3 - i))
+    return ipaddress.IPv4Address(value)
+
+
+def host_ips(host: str) -> list:
+    """The addresses a host stands for: the address itself when it is one (in any form a browser accepts), else
+    what it resolves to. [] when the name does not resolve."""
+    h = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not h:
+        return []
+    try:
+        return [ipaddress.ip_address(h.split("%")[0])]
+    except ValueError:
+        pass
+    num = numeric_ipv4(h)
+    if num is not None:
+        return [num]
+    try:
+        return [ipaddress.ip_address(i[4][0].split("%")[0]) for i in socket.getaddrinfo(h, None)]
+    except (socket.gaierror, UnicodeError, ValueError, OSError):
+        return []
+
+
+def private_host(host: str) -> str | None:
+    """The host itself when it is this PC or a private network address, or resolves to one ("localhost" and
+    *.localhost included), else None. HOLDCO_ALLOW_LOCAL does not apply here: this is for checks the test
+    exemption must not open, such as where a browser page ended up."""
+    h = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not h:
+        return None
+    if h == "localhost" or h.endswith(".localhost"):
+        return h
+    return h if any(blocked_ip(ip) for ip in host_ips(h)) else None
+
+
 def check_public_url(url: str) -> str:
-    """Agents may only reach the public internet, never this PC or your home network."""
+    """Agents may only reach the public internet, never this PC or your home network, and never through a relay."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise WebError("Only http(s) URLs are allowed.")
     host = parsed.hostname
     if not host:
         raise WebError("URL has no host.")
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        raise WebError(f"Couldn't resolve {host}.") from None
+    if is_relay(host):
+        raise WebError(f"{host} is a relay that fetches other sites for you. Relays hide where requests go and break "
+                       f"the site's terms, so Holdco blocks them. {RELAY_HINT}")
+    if _allowed_local(host, parsed.port):
+        return url   # test-only exemption (HOLDCO_ALLOW_LOCAL), so the suite's fake services count as public
+    num = numeric_ipv4(host)
+    if num is not None:   # 2130706433 or 0177.0.0.1 is 127.0.0.1 to a browser
+        infos = [(None, None, None, None, (str(num), 0))]
+    else:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            raise WebError(f"Couldn't resolve {host}.") from None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        if blocked_ip(ip):
             raise WebError("Local and private network addresses are blocked for agents.")
     return url
 
@@ -166,7 +269,8 @@ def fetch_page(url: str, max_chars: int = 9000, include_links: bool = False) -> 
     status, ctype, body, final = http_get(url)
     text = _decode(body, ctype)
     if status >= 400:
-        return f"HTTP {status} fetching {url}\n{text[:500]}"
+        hint = f"{BLOCKED_HINT}\n" if status == 403 else ""
+        return f"HTTP {status} fetching {url}\n{hint}{text[:500]}"
     if "html" in ctype or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
         title, content, links = html_to_text(text, final)
         out = f"Title: {title}\nURL: {final}\n\n{content[:max_chars]}"

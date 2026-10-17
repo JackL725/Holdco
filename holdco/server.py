@@ -13,18 +13,38 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, agents, backup, bus, config, db, doctor, emailer, llm, notify, presets, roles, watchdog, workspace  # noqa: F401
+from . import actions, agents, backup, bus, config, context, contracts, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
+from . import bench, trust  # noqa: F401  (Phase 3: their modules register the Bench and Trust routes)
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
 _company_or_404 = company_or_404
 
 
+def _masked(settings: dict, secret_keys) -> dict:
+    """Phase 1: a secret that is set reads as the mask, so its value never leaves the PC through the dashboard.
+    An unset secret stays empty, so the form shows which ones still need a value."""
+    return {k: (vault.MASK if k in secret_keys and v else v) for k, v in settings.items()}
+
+
+def _secret_field(name: str, value) -> str | None:
+    """Phase 1: one secret field from a settings form, routed to the vault. Returns what the settings table keeps:
+    the "vault:<name>" marker for a new value, "" when the owner cleared the field (the secret is deleted), or
+    None when the form sent the mask back (the secret is unchanged)."""
+    value = "" if value is None else str(value)
+    if value and set(value) <= {"•"}:
+        return None
+    if not value.strip():
+        vault.delete(name)
+        return ""
+    vault.put(name, value)
+    return vault.MARKER + name
+
+
 def _public_company(c: dict) -> dict:
     cs = db.company_settings(c)
     out = {k: v for k, v in c.items() if k != "settings"}
-    secret_keys = ("smtp_password", "imap_password", "netlify_token")
-    out["settings"] = {k: ("••••••••" if k in secret_keys and v else v) for k, v in cs.items()}
+    out["settings"] = _masked(cs, config.SECRET_COMPANY_SETTINGS)
     return out
 
 
@@ -43,42 +63,82 @@ def _stats(cid: int) -> dict:
     }
 
 
+# Phase 3: Holdco Bench companies (status 'bench') are temporary and never the owner's: rows of theirs stay out of
+# every list and count the dashboard shows. A condition on a column named company_id.
+NOT_BENCH = "company_id NOT IN (SELECT id FROM companies WHERE status='bench')"
+
 # ======================= overview & settings =======================
 
 @route("GET", "/api/state")
 def api_state(h, m, body):
     companies = []
-    for c in db.q("SELECT * FROM companies ORDER BY status='archived', id"):
+    for c in db.q("SELECT * FROM companies WHERE status!='bench' ORDER BY status='archived', id"):   # Phase 3
         companies.append({**_public_company(c), "stats": _stats(c["id"])})
     s = db.get_settings()
     return {
         "companies": companies,
-        "approvals": db.scalar("SELECT COUNT(*) FROM approvals WHERE status='pending'") or 0,
+        "approvals": db.scalar(f"SELECT COUNT(*) FROM approvals WHERE status='pending' AND {NOT_BENCH}") or 0,
         "running": agents.running_count(False),
         "scheduler_enabled": s.get("scheduler_enabled", True),
         "kill_switch": bool(s.get("kill_switch")),
         "doctor": doctor.summary(),
         "model": s.get("default_model"),
-        "agents": db.q("SELECT id, company_id, name, role, preset, title, status, enabled FROM agents ORDER BY id"),
+        "agents": db.q("SELECT id, company_id, name, role, preset, title, status, enabled FROM agents "
+                       f"WHERE {NOT_BENCH} ORDER BY id"),
         "version": __import__("holdco").__version__,
     }
 
 
+CONTEXT_RUNS = 50      # Phase 3: Settings' context use covers this many of the latest finished runs
+CONTEXT_WARN = 0.85    # ... and warns when their p95 prompt is above this share of num_ctx
+
+
+def _percentile(values: list[int], pct: int) -> int:
+    """Nearest-rank percentile of sorted values (0 for none)."""
+    if not values:
+        return 0
+    rank = -(-pct * len(values) // 100)   # ceil(pct% of n), in whole numbers
+    return values[max(1, rank) - 1]
+
+
+def context_use(settings: dict | None = None) -> dict:
+    """How full the model's context got (design section 9): p50 and p95 of runs.max_prompt_tokens over the latest
+    finished runs that reported one, the context size, and warn when p95 is above 85% of it."""
+    s = settings or db.get_settings()
+    num_ctx = int(s.get("num_ctx") or 32768)
+    values = sorted(int(r["max_prompt_tokens"]) for r in db.q(
+        "SELECT max_prompt_tokens FROM runs WHERE COALESCE(finished_at, '') != '' AND max_prompt_tokens > 0 "
+        "ORDER BY id DESC LIMIT ?", (CONTEXT_RUNS,)))
+    p95 = _percentile(values, 95)
+    return {"n": len(values), "p50": _percentile(values, 50), "p95": p95, "num_ctx": num_ctx,
+            "warn": bool(values) and p95 > CONTEXT_WARN * num_ctx}
+
+
 @route("GET", "/api/settings")
 def api_settings(h, m, body):
-    s = db.get_settings()
+    raw = db.get_settings()
+    s = _masked(raw, config.SECRET_SETTINGS)
     return {"settings": s, "policy_actions": config.POLICY_ACTIONS, "locked": sorted(config.LOCKED_POLICIES),
-            "data_dir": str(config.DATA_DIR)}
+            "data_dir": str(config.DATA_DIR), "context_use": context_use(raw)}
 
 
 @route("PUT", "/api/settings")
 def api_settings_put(h, m, body):
+    values = dict(body or {})
+    secrets = {k: values.pop(k) for k in config.SECRET_SETTINGS if k in values}
     try:
-        s = db.set_settings(body or {})
+        db.validate_settings(values)   # a malformed value saves nothing, secrets included
+        for k, v in secrets.items():   # Phase 1: secrets go to the vault; the table keeps the marker
+            stored = _secret_field(f"settings.{k}", v)
+            if stored is not None:
+                values[k] = stored
+        s = db.set_settings(values)
     except ValueError as e:   # a malformed chat id or an unknown notify level: tell the owner, save nothing
         raise HTTPError(400, str(e))
+    except vault.VaultError as e:
+        raise HTTPError(500, f"The key could not be stored safely: {e}")
     bus.notify("settings")
-    return {"settings": s}
+    return {"settings": _masked(s, config.SECRET_SETTINGS)}
 
 
 @route("GET", "/api/llm/models")
@@ -157,10 +217,11 @@ def api_kill(h, m, body):
 def api_audit(h, m, body):
     cid = _int(h.query.get("company_id", [0])[0])
     limit = max(1, min(_int(h.query.get("limit", [100])[0], 100), 500))
-    sql = "SELECT a.*, c.name AS company_name FROM audit a LEFT JOIN companies c ON c.id=a.company_id"
+    sql = ("SELECT a.*, c.name AS company_name FROM audit a LEFT JOIN companies c ON c.id=a.company_id "
+           "WHERE COALESCE(c.status, '')!='bench'")   # Phase 3: a running bench's actions are not the owner's
     params: list = []
     if cid:
-        sql += " WHERE a.company_id=?"
+        sql += " AND a.company_id=?"
         params.append(cid)
     rows = db.q(sql + f" ORDER BY a.id DESC LIMIT {limit}", params)
     for r in rows:
@@ -173,13 +234,22 @@ def api_company(h, m, body):
     c = _company_or_404(m.group(1))
     team = db.q("SELECT a.*, t.title AS task_title FROM agents a LEFT JOIN tasks t ON t.id=a.current_task_id "
                 "WHERE a.company_id=? ORDER BY a.id", (c["id"],))
-    metrics = db.q("SELECT name, value, note, created_at FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics "
-                   "WHERE company_id=? GROUP BY name) ORDER BY name", (c["id"],))
+    # Phase 1: source is the connector key that polled the number, or 'manual' when an agent typed it
+    metrics = db.q("SELECT name, value, note, created_at, COALESCE(NULLIF(source, ''), 'manual') AS source "
+                   "FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics WHERE company_id=? GROUP BY name) "
+                   "ORDER BY name", (c["id"],))
     cs = db.company_settings(c)
     return {"company": _public_company(c), "agents": team, "stats": _stats(c["id"]), "metrics": metrics,
-            "email_ready": emailer.smtp_configured(cs), "inbox_ready": emailer.imap_configured(cs),
+            "email_ready": emailer.outbound(c, cs) is not None, "inbox_ready": emailer.imap_configured(cs),
             "has_site": workspace.safe_path(c, "site/index.html").exists(),
-            "folder": str(workspace.root(c))}
+            "folder": str(workspace.root(c)),
+            "budgets": contracts.budget_status(c)}   # Phase 2: "GPU budget used: 4.2 of 6 h" and the Budgets section
+
+
+# Company settings Holdco manages itself (staged founding, notices, the one-time truth check). The dashboard never
+# sends them; refusing them here keeps any other client from moving a founding stage by hand.
+INTERNAL_COMPANY_SETTINGS = {"founding_stage", "founding_retry", "founding_research_note", "founding_context",
+                             "last_waiting_notice", "budget_notice", "truth_scan_done", "name_locked", "template"}
 
 
 @route("PATCH", r"/api/companies/(\d+)")
@@ -187,6 +257,7 @@ def api_company_patch(h, m, body):
     c = _company_or_404(m.group(1))
     b = body or {}
     fields = {}
+    caps_before = planning.capability_hash(db.company_settings(c))
     if "status" in b and b["status"] in ("active", "paused", "archived"):
         fields["status"] = b["status"]
         bus.emit(c["id"], "info", {"active": "resumed the company", "paused": "paused the company",
@@ -200,19 +271,58 @@ def api_company_patch(h, m, body):
         p.write_text(fields["charter"], encoding="utf-8")
     if "settings" in b and isinstance(b["settings"], dict):
         cs = db.company_settings(c)
+        stored = db.loads(c.get("settings"), {}) or {}
+        stored = stored if isinstance(stored, dict) else {}
+        for k in config.SECRET_COMPANY_SETTINGS:
+            # Phase 1: write back the stored marker, never the value company_settings resolved it to. A plain-text
+            # value an older writer left behind moves into the vault on the way.
+            v = stored.get(k, "")
+            if isinstance(v, str) and v and not v.startswith(vault.MARKER):
+                try:
+                    v = _secret_field(f"company.{c['id']}.{k}", v)
+                except vault.VaultError:
+                    pass   # it stays where it was; the next start's migration tries again
+            cs[k] = v
         for k, v in b["settings"].items():
-            if k not in config.DEFAULT_COMPANY_SETTINGS:
+            if k not in config.DEFAULT_COMPANY_SETTINGS or k in INTERNAL_COMPANY_SETTINGS:
                 continue
-            if isinstance(v, str) and v == "••••••••":
+            if k in config.SECRET_COMPANY_SETTINGS:   # Phase 1: into the vault (the mask leaves it unchanged)
+                try:
+                    kept = _secret_field(f"company.{c['id']}.{k}", v)
+                except vault.VaultError as e:
+                    raise HTTPError(500, f"The key could not be stored safely: {e}")
+                if kept is not None:
+                    cs[k] = kept
+                continue
+            if isinstance(v, str) and v == vault.MASK:
                 continue  # unchanged secret
-            if k in ("cycle_minutes", "daily_email_limit", "smtp_port", "imap_port"):
+            if k in ("cycle_minutes", "smtp_port", "imap_port"):
                 v = max(1, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
+            if k == "daily_email_limit":
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # Phase 2 budgets: 0 means agents send none
+            if k == "daily_token_budget":
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))   # 0 = no limit
+            if k in ("gpu_hours_per_day",):
+                try:
+                    v = max(0.25, float(v))
+                except (TypeError, ValueError):
+                    v = config.DEFAULT_COMPANY_SETTINGS[k]
+            if k in ("steps_per_task", "posts_per_week", "money_usd"):
+                v = max(0, _int(v, config.DEFAULT_COMPANY_SETTINGS[k]))
+            if k == "pinned_context":
+                v = [str(x)[:300] for x in v][:40] if isinstance(v, list) else []
             if k == "policies" and isinstance(v, dict):
                 v = {a: p for a, p in v.items() if a in config.POLICY_ACTIONS and p in ("approve", "auto", "off", "")
                      and a not in config.LOCKED_POLICIES}
                 v = {a: p for a, p in v.items() if p}
             cs[k] = v
         fields["settings"] = json.dumps(cs)
+        # Phase 0.5: a new mailbox, token, site address, postal address, standing orders or business type
+        # changes what the team can do, so the CEO plans with it at the next tick.
+        if planning.capability_hash(db.company_settings({"settings": fields["settings"]})) != caps_before:
+            fields["cycle_requested"] = 1
+    if "charter" in fields and (fields["charter"] or "") != (c.get("charter") or ""):
+        fields["cycle_requested"] = 1   # the owner rewrote the charter: plan against the new one
     if fields:
         db.update("companies", c["id"], **fields)
     bus.notify("company", company_id=c["id"])
@@ -225,6 +335,17 @@ def api_company_delete(h, m, body):
     if (body or {}).get("confirm") != c["name"]:
         raise HTTPError(400, "Type the company name to confirm.")
     db.update("companies", c["id"], status="archived")
+    # Phase 1: the company's connectors go with it (each removal deletes its vault secrets, its OAuth sign-in and
+    # closes any MCP client), then the company's own secrets (company.<id>.*) leave the vault.
+    from . import connectors   # imported here: connectors loads with tools, after this module's imports
+    for r in db.q("SELECT id FROM connectors WHERE company_id=?", (c["id"],)):
+        connectors.remove(r["id"])
+    try:
+        for name in vault.names():
+            if name.startswith(f"company.{c['id']}."):
+                vault.delete(name)
+    except vault.VaultError as e:   # the company is still deleted; the Doctor's vault row shows what is left
+        print(f"Vault: the secrets of company {c['id']} could not all be deleted: {e}")
     for t in ("agents", "tasks", "memory", "approvals", "events", "messages", "runs", "emails", "metrics"):
         db.run(f"DELETE FROM {t} WHERE company_id=?", (c["id"],))
     db.run("DELETE FROM companies WHERE id=?", (c["id"],))
@@ -239,7 +360,13 @@ def api_cycle(h, m, body):
     ceo = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
     if not ceo:
         raise HTTPError(400, "This company has no CEO agent.")
-    if not agents.start(ceo["id"], "cycle"):
+    if agents.is_running(ceo["id"]):
+        db.update("companies", c["id"], cycle_requested=1)   # the scheduler plans as soon as the CEO is free
+        return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
+    # The owner asked: the baseline is recorded and the cycle's header never says "Nothing has changed".
+    planning.cycle_started(c, requested=True)
+    if not agents.start(ceo["id"], "cycle", requested=True):
+        db.update("companies", c["id"], cycle_requested=1)
         return {"ok": False, "message": f"{ceo['name']} is busy; they'll plan as soon as they're free."}
     return {"ok": True, "message": f"{ceo['name']} is planning now."}
 
@@ -309,7 +436,7 @@ def api_agent_run(h, m, body):
     if not a:
         raise HTTPError(404, "Agent not found")
     if a["role"] == "ceo" and not (body or {}).get("task_id"):
-        ok = agents.start(a["id"], "cycle")
+        ok = agents.start(a["id"], "cycle", requested=True)   # the owner started it from the Team tab
     else:
         t = db.one("SELECT * FROM tasks WHERE company_id=? AND agent_id=? AND status='todo' ORDER BY priority, id LIMIT 1",
                    (a["company_id"], a["id"]))
@@ -325,7 +452,8 @@ def api_runs(h, m, body):
     qs = h.query
     agent_id = _int(qs.get("agent_id", [0])[0])
     sql = ("SELECT r.id, r.agent_id, r.task_id, r.kind, r.status, r.summary, r.tokens, r.steps, r.started_at, "
-           "r.finished_at, a.name AS agent_name FROM runs r LEFT JOIN agents a ON a.id=r.agent_id WHERE r.company_id=?")
+           "r.finished_at, r.max_prompt_tokens, a.name AS agent_name FROM runs r LEFT JOIN agents a "
+           "ON a.id=r.agent_id WHERE r.company_id=?")
     params: list = [c["id"]]
     if agent_id:
         sql += " AND r.agent_id=?"
@@ -346,13 +474,32 @@ def api_run(h, m, body):
 
 # ======================= tasks =======================
 
+CONTRACT_FIELDS = ("goal_id", "expected", "inputs", "depends_on", "due_days", "due_at", "budget_steps",
+                   "budget_tokens", "checks")   # Phase 2: the task contract the owner's form can set
+
+
+def _contract(company_id: int, b: dict, task: dict | None = None) -> dict:
+    """The contract fields of a task form, checked by the same rules as create_task (400 with the reason)."""
+    try:
+        return contracts.validate(company_id, {k: b[k] for k in CONTRACT_FIELDS if k in b}, task)
+    except contracts.ContractError as e:
+        raise HTTPError(400, str(e))
+
+
+def _task_out(t: dict, statuses: dict | None = None) -> dict:
+    """A task row as the dashboard reads it: depends_on as a list and blocked_by (Phase 2)."""
+    return {**t, **contracts.api_fields(t, statuses)}
+
+
 @route("GET", r"/api/companies/(\d+)/tasks")
 def api_tasks(h, m, body):
     c = _company_or_404(m.group(1))
-    base = "SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id WHERE t.company_id=? "
+    base = ("SELECT t.*, a.name AS agent_name, g.title AS goal_title FROM tasks t LEFT JOIN agents a ON "
+            "a.id=t.agent_id LEFT JOIN goals g ON g.id=t.goal_id WHERE t.company_id=? ")
     open_rows = db.q(base + "AND t.status NOT IN ('done','cancelled') ORDER BY t.priority, t.id", (c["id"],))
     closed = db.q(base + "AND t.status IN ('done','cancelled') ORDER BY t.updated_at DESC LIMIT 40", (c["id"],))
-    return {"tasks": open_rows + closed}
+    statuses = contracts.dependency_status(open_rows)
+    return {"tasks": [_task_out(t, statuses) for t in open_rows] + [_task_out(t, {}) for t in closed]}
 
 
 @route("POST", r"/api/companies/(\d+)/tasks")
@@ -365,14 +512,18 @@ def api_task_create(h, m, body):
     agent = db.get_agent(_int(b.get("agent_id"))) if b.get("agent_id") else None
     if not agent or agent["company_id"] != c["id"]:
         agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (c["id"],))
+    contract = _contract(c["id"], b)
     ts = db.now()
-    tid = db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
-                 " deliverable, acceptance, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (c["id"], title[:200], b.get("description", ""), agent["role"], agent["id"], "todo",
-                  max(1, min(_int(b.get("priority"), 1), 3)), "owner", (b.get("deliverable") or "").strip()[:200],
-                  (b.get("acceptance") or "").strip()[:2000], ts, ts))
+    kind = truth.classify_task(title, b.get("description", ""), b.get("deliverable") or "", b.get("kind") or "")
+    cols = {"company_id": c["id"], "title": title[:200], "description": b.get("description", ""),
+            "role": agent["role"], "agent_id": agent["id"], "status": "todo",
+            "priority": max(1, min(_int(b.get("priority"), 1), 3)), "created_by": "owner",
+            "deliverable": (b.get("deliverable") or "").strip()[:200],
+            "acceptance": (b.get("acceptance") or "").strip()[:2000], "kind": kind, "created_at": ts,
+            "updated_at": ts, **contract}
+    tid = db.run(f"INSERT INTO tasks({', '.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(cols.values()))
     bus.emit(c["id"], "task", f"created task #{tid} for {agent['name']}: {title}", None, {"task_id": tid, "by": "owner"})
-    return {"task": db.get_task(tid)}
+    return {"task": _task_out(db.get_task(tid))}
 
 
 @route("PATCH", r"/api/tasks/(\d+)")
@@ -381,7 +532,7 @@ def api_task_patch(h, m, body):
     if not t:
         raise HTTPError(404, "Task not found")
     b = body or {}
-    fields = {"updated_at": db.now()}
+    fields = {"updated_at": db.now(), **_contract(t["company_id"], b, t)}
     if b.get("status") in ("todo", "done", "blocked", "waiting", "cancelled"):
         fields["status"] = b["status"]
     for k in ("title", "description", "deliverable", "acceptance"):
@@ -397,7 +548,7 @@ def api_task_patch(h, m, body):
         fields["result"] = ((t["result"] or "") + f"\n[Owner] {b['note'].strip()}").strip()
     db.update("tasks", t["id"], **fields)
     bus.notify("tasks", company_id=t["company_id"])
-    return {"task": db.get_task(t["id"])}
+    return {"task": _task_out(db.get_task(t["id"]))}
 
 
 # ======================= chat, memory, metrics, email, events =======================
@@ -455,7 +606,9 @@ def api_memory_delete(h, m, body):
 @route("GET", r"/api/companies/(\d+)/metrics")
 def api_metrics(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"metrics": db.q("SELECT * FROM metrics WHERE company_id=? ORDER BY id DESC LIMIT 500", (c["id"],))}
+    return {"metrics": db.q("SELECT id, company_id, agent_id, name, value, note, created_at, "
+                            "COALESCE(NULLIF(source, ''), 'manual') AS source FROM metrics WHERE company_id=? "
+                            "ORDER BY id DESC LIMIT 500", (c["id"],))}
 
 
 @route("GET", r"/api/companies/(\d+)/emails")
@@ -495,6 +648,8 @@ def api_events(h, m, body):
     if cid:
         sql += " AND company_id=?"
         params.append(cid)
+    else:   # Phase 3: the all-companies feed leaves out a running bench's companies
+        sql += f" AND (company_id IS NULL OR {NOT_BENCH})"
     agent = _int(qs.get("agent_id", [0])[0])
     if agent:
         sql += " AND agent_id=?"
@@ -521,7 +676,8 @@ def api_approvals(h, m, body):
     status = h.query.get("status", ["pending"])[0]
     cid = _int(h.query.get("company_id", [0])[0])
     sql = ("SELECT p.*, a.name AS agent_name, a.role AS agent_role, c.name AS company_name FROM approvals p "
-           "LEFT JOIN agents a ON a.id=p.agent_id LEFT JOIN companies c ON c.id=p.company_id WHERE ")
+           "LEFT JOIN agents a ON a.id=p.agent_id LEFT JOIN companies c ON c.id=p.company_id "
+           "WHERE COALESCE(c.status, '')!='bench' AND ")   # Phase 3: a running bench's requests never reach the Inbox
     params: list = []
     if status == "pending":
         sql += "p.status='pending'"
@@ -534,6 +690,8 @@ def api_approvals(h, m, body):
     rows = db.q(sql, params)
     for r in rows:
         r["payload"] = db.loads(r["payload"], {})
+        # Phase 1: the risk tag on every card (a connector call carries its own)
+        r["tag"] = r["payload"].get("tag") if r["action"] == "connector_call" else actions.TAG_OF_ACTION.get(r["action"], "")
     return {"approvals": rows, "labels": actions.ACTION_LABELS}
 
 
@@ -566,7 +724,9 @@ def api_approval_retry(h, m, body):
 @route("GET", r"/api/companies/(\d+)/files")
 def api_files(h, m, body):
     c = _company_or_404(m.group(1))
-    return {"files": workspace.tree(c, ".", depth=6, limit=800)}
+    # Phase 2: leases are the files an agent is editing right now ("editing: Forge" in the Files tab). The owner's
+    # own edits (PUT below) ignore them: the owner is the board.
+    return {"files": workspace.tree(c, ".", depth=6, limit=800), "leases": workspace.leases(c)}
 
 
 @route("GET", r"/api/companies/(\d+)/file")
@@ -664,6 +824,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise HTTPError(404, "Not found")
             if method not in ("GET", "HEAD"):
                 raise HTTPError(405, "Method not allowed")
+            if path == "/oauth/callback" and method == "GET":   # Phase 1: the OAuth sign-in comes back here
+                from . import oauth
+                code, html = oauth.callback_page({k: v[0] for k, v in self.query.items()})
+                return self._send(code, html.encode("utf-8"), "text/html; charset=utf-8")
             if path.startswith("/preview/") or path.startswith("/files/"):
                 return self._company_file(path)
             return self._static(path)
@@ -731,7 +895,10 @@ class Handler(BaseHTTPRequestHandler):
         except workspace.PathError:
             raise HTTPError(400, "Bad path")
         if p.is_dir():
-            p = p / "index.html"
+            try:   # checked like the path itself: an index.html that is a link out of the folder is not served
+                p = workspace.safe_path(c, sub.rstrip("/") + "/index.html")
+            except workspace.PathError:
+                raise HTTPError(400, "Bad path")
         if not p.is_file():
             raise HTTPError(404, "Not found")
         # Agent-written pages are sandboxed so they can't call the dashboard API.

@@ -457,10 +457,12 @@ def is_model_connection_error(text: str | None) -> bool:
     return bool(_MODEL_DOWN_RE.search(low))
 
 
-def tick() -> None:
-    """Cheap SQL-only pass run by the scheduler every tick. Never raises."""
+def tick(only: dict | None = None) -> None:
+    """Cheap SQL-only pass run by the scheduler every tick. Never raises. only (Phase 3): the per-company checks for
+    that one company and nothing else; Holdco Bench passes its company, which the scheduler's tick never sees, and
+    its thread (with the bench's mocks and settings) must not act on the owner's companies."""
     try:
-        companies = db.q("SELECT * FROM companies WHERE status='active' ORDER BY id")
+        companies = [only] if only else db.q("SELECT * FROM companies WHERE status='active' ORDER BY id")
         if not companies:
             return
         settings = db.get_settings()
@@ -470,6 +472,8 @@ def tick() -> None:
             _check_repeated_errors(c)
             _check_bouncing(c, pending_tasks)
             _check_stalled(c, settings)
+        if only:
+            return   # connectors and search are the whole portfolio's: the scheduler's own tick checks them
         by_id = {c["id"]: c for c in companies}
         _check_connectors(by_id)
         _check_search(by_id, settings)
@@ -571,10 +575,15 @@ def _check_connectors(companies: dict[int, dict]) -> None:
             continue   # the streak is read by _check_search, which asks per company
         if _bad_streak[key] < CONNECTOR_BAD_STREAK or _last_connector_alert.get(key) == today:
             continue
-        # Doctor keys are "connector:<name>:<company id>" (global ones have no id); accept "conn:<id>:<name>" too.
+        # Rows carry their company (None for a global service, whose owner alert comes from the connector itself).
+        # Older keys put the company id in the key: "connector:<name>:<company id>" or "conn:<id>:<name>". Phase 1
+        # keys are "connector:<instance id>", where the number is NOT a company id, so the row's field wins.
         parts = key.split(":")
-        digits = [x for x in parts[1:] if x.isdigit()]
-        cid = int(digits[0]) if digits else r.get("company_id")
+        if "company_id" in r:
+            cid = r.get("company_id")
+        else:
+            digits = [x for x in parts[1:] if x.isdigit()]
+            cid = int(digits[0]) if digits else None
         c = companies.get(cid) if cid is not None else None
         if not c:
             continue

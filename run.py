@@ -30,6 +30,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=config.PORT)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
+    config.PORT, config.HOST = args.port, args.host   # Phase 1: OAuth redirects and browser_check use the real port
 
     if args.host not in ("127.0.0.1", "localhost") and not config.PASSWORD:
         sys.exit("Set HOLDCO_PASSWORD before exposing Holdco beyond this computer.")

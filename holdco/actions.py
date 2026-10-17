@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,10 +27,17 @@ ACTION_LABELS = {
     "run_code": "Run code",
     "spend_money": "Purchase",
     "question": "Question",
+    "connector_call": "Connected service call",
+    "decision": "Decision",
 }
 
 
 def _summary(action: str, p: dict) -> str:
+    if action == "decision":
+        return (p.get("question") or "")[:140]
+    if action == "connector_call":
+        args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
+        return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
     if action == "send_email":
         return f"Email to {p.get('to')}: {p.get('subject')}"
     if action == "social_post":
@@ -48,14 +56,34 @@ def _summary(action: str, p: dict) -> str:
     return action
 
 
-def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict) -> str:
-    """Called by agent tools for any outbound action."""
-    if action == "question":
+# Phase 1: the risk tag of each built-in outbound action, shown on the Inbox card.
+TAG_OF_ACTION = {"send_email": "contact", "social_post": "publish", "deploy_site": "publish", "http_post": "publish",
+                 "run_code": "write", "spend_money": "spend", "question": "read", "decision": "read"}
+
+
+def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict,
+         policy_action: str | None = None, tainted: list[str] | None = None) -> str:
+    # Phase 2: a decision is queued like a question (always asks, deduplicated), never run by a policy.
+    """Called by agent tools for any outbound action. policy_action (Phase 1) names the policy to apply when it
+    differs from the action, as for connector_call, whose policy comes from the tool's risk tag."""
+    if action in ("question", "decision"):
         policy = "approve"
     else:
-        policy = db.effective_policy(company, action)
+        policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    approver = "policy:auto"   # who let an action run without the owner, for the audit log
+    if action not in ("question", "decision"):
+        # Phase 3: a session that read outside content asks, and the trust ladder sits in front of the policy.
+        from . import taint, trust   # imported here: both import modules that import this one
+        sources = taint.current_sources() if tainted is None else list(tainted)
+        policy, why = trust.gate_policy(company, policy_action or action, payload, policy, sources)
+        if why and policy == "approve":
+            payload = {**payload, "_why_asked": why}
+            if why.startswith(trust.TAINTED):
+                payload["_taint"] = sources   # the Inbox card names where the outside content came from
+        elif why.startswith("trust:") and policy == "auto":
+            approver = why
     killed = False
     if policy == "auto" and db.get_settings().get("kill_switch"):
         policy, killed = "approve", True   # the kill switch freezes outbound actions: queue instead of running
@@ -64,26 +92,36 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
             result = execute(company, action, payload)
         except Exception as e:  # report failures back to the agent
             bus.emit(company["id"], "error", f"{ACTION_LABELS.get(action, action)} failed: {e}", agent["id"])
-            audit(company["id"], action, agent["name"], "policy:auto", payload, f"FAILED: {e}")
+            audit(company["id"], action, agent["name"], approver, payload, f"FAILED: {e}")
             return f"FAILED: {e}"
         bus.emit(company["id"], "action", f"{ACTION_LABELS.get(action, action)}: {_summary(action, payload)}",
                  agent["id"], {"action": action})
-        audit(company["id"], action, agent["name"], "policy:auto", payload, result)
+        audit(company["id"], action, agent["name"], approver, payload, result)
+        if action == "send_email":
+            from . import trust   # imported here: see above
+            trust.note_sent(company["id"], payload)   # the next email to this person is not a first message
         return result
 
-    # approve: queue it (deduplicated)
+    # approve: queue it (deduplicated; why it asks is not part of what it is)
     blob = json.dumps(payload, sort_keys=True)
+    same = json.dumps(_without_reasons(payload), sort_keys=True)
     for row in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND action=? AND status='pending'",
                     (company["id"], action)):
-        if json.dumps(db.loads(row["payload"], {}), sort_keys=True) == blob:
+        old = db.loads(row["payload"], {}) or {}
+        if action == "decision" and _same_question(old.get("question"), payload.get("question")):
+            # A decision carries its own deadline, so the same question asked again rarely has an identical payload.
+            return (f"Already waiting for the owner as decision #{row['id']}. Don't resubmit; continue with other "
+                    f"work, or finish with status 'waiting'.")
+        if json.dumps(_without_reasons(old), sort_keys=True) == same:
             return f"Already waiting for the owner as request #{row['id']}. Don't resubmit; continue with other work."
     summary = _summary(action, payload)
     aid = db.run("INSERT INTO approvals(company_id, agent_id, task_id, action, summary, payload, status, created_at)"
                  " VALUES(?,?,?,?,?,?,?,?)",
                  (company["id"], agent["id"], task_id, action, summary, blob, "pending", db.now()))
-    verb = "asked the owner" if action == "question" else "requested approval"
+    verb = {"question": "asked the owner", "decision": "asked the owner to decide"}.get(action, "requested approval")
     bus.emit(company["id"], "approval", f"{verb}: {summary}", agent["id"], {"approval_id": aid, "action": action})
     bus.notify("approvals")
+    _records_changed(company["id"])
     from . import notify  # imported here: notify and watchdog import tools, which imports this module
     try:
         notify.approval_requested(db.one("SELECT * FROM approvals WHERE id=?", (aid,)))
@@ -94,6 +132,14 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
     if action == "question":
         return (f"Question #{aid} sent to the owner. Their answer will appear in your notes. If you can't continue "
                 f"without it, finish with status 'waiting'.")
+    if action == "decision":
+        if not payload.get("reversible", True):
+            return (f"Decision #{aid} sent to the owner. It cannot be undone, so it waits for the owner's answer. "
+                    f"Continue with work that does not depend on it, or finish with status 'waiting'.")
+        deadline = str(payload.get("deadline_at") or "").replace("T", " ")[:16]
+        return (f"Decision #{aid} sent to the owner. If it is reversible and unanswered by {deadline} UTC, "
+                f"'{payload.get('recommended', '')}' will be taken. Continue with work that does not depend on it, "
+                f"or finish with status 'waiting'.")
     if killed:
         # The agent should know this was not the normal policy: nothing outbound runs until the owner resumes.
         return (f"Kill switch is on: queued for the owner as request #{aid}. Don't resubmit it. Continue with "
@@ -103,29 +149,52 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
 
 
 def decide(approval_id: int, decision: str, payload: dict | None = None, feedback: str = "",
-           answer: str = "") -> dict:
-    """The owner approves or rejects a request (or answers a question)."""
+           answer: str = "", decided_by: str = "owner") -> dict:
+    """The owner approves or rejects a request (or answers a question or a decision). decided_by (Phase 2):
+    owner, telegram or deadline."""
     row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
     if not row:
         raise ValueError("Request not found")
     if row["status"] != "pending":
         raise ValueError(f"Request #{approval_id} is already {row['status']}")
-    if decision == "approve" and row["action"] != "question" and db.get_settings().get("kill_switch"):
+    if decision == "approve" and row["action"] not in ("question", "decision") and db.get_settings().get("kill_switch"):
         raise ValueError("The kill switch is on. Turn it off to run approvals.")
     company = db.get_company(row["company_id"])
     p = db.loads(row["payload"], {})
     if payload:
-        p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")})
+        # network: the run_code card's "Allow network" box (Phase 3; a request queued before it existed lacks it);
+        # sandboxed: the card said "runs in a sandbox", so the run must not fall back to this PC (run_code)
+        p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")
+                  or (k in ("network", "sandboxed") and row["action"] == "run_code")})
     ts = db.now()
     label = ACTION_LABELS.get(row["action"], row["action"])
 
-    if row["action"] == "question":
+    update = ""   # Phase 2: the line a decision adds to its waiting task, when it differs from the memory note
+    if row["action"] == "decision" and decision == "reject" and not answer.strip():
+        # Dismissed without choosing: nothing was decided, so the brain records nothing.
+        status, result = "rejected", ""
+        note = f"Owner dismissed decision #{approval_id} (\"{p.get('question', '')[:200]}\") without choosing."
+        update = (f"Owner dismissed decision #{approval_id} without choosing an option. Decide within your own "
+                  f"authority, or ask again differently.")
+        if feedback.strip():
+            note += f" Owner's note: {feedback.strip()}"
+            update += f" Owner's note: {feedback.strip()}"
+    elif row["action"] == "decision":
+        status, result = "answered", answer.strip() or feedback.strip() or "(no answer)"
+        if decided_by == "deadline":
+            update = f"No answer by the deadline, so decision #{approval_id} took the recommended option: {result}"
+        else:
+            update = f"Owner decided #{approval_id}: {result}"
+        if feedback.strip() and feedback.strip() != result:
+            update += f". Owner's note: {feedback.strip()}"
+        note = f"{update} (decision: \"{p.get('question', '')[:200]}\")"
+    elif row["action"] == "question":
         status, result = "answered", answer or feedback or "(no answer)"
         note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
     elif decision == "approve":
         db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
         try:
-            result = execute(company, row["action"], p)
+            result = execute(company, row["action"], p, approval_id=approval_id)
             status = "done"
         except Exception as e:
             result, status = str(e), "failed"
@@ -135,20 +204,43 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     else:
         status, result = "rejected", ""
         note = f"Owner REJECTED request #{approval_id} ({label}: {_summary(row['action'], p)})."
-    if feedback and row["action"] != "question":
+    if feedback and row["action"] not in ("question", "decision"):
         note += f" Owner feedback: {feedback}"
 
-    db.update("approvals", approval_id, status=status, result=result, payload=json.dumps(p), decided_at=ts,
-              feedback=feedback, summary=_summary(row["action"], p) if row["action"] != "question" else row["summary"])
+    fields = {"status": status, "result": result, "payload": json.dumps(p), "decided_at": ts, "feedback": feedback,
+              "decided_by": decided_by,
+              "summary": _summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"]}
+    if row["action"] in ("question", "decision"):
+        # Phase 2: the owner (dashboard or phone) and the scheduler's deadline can answer the same row at the same
+        # moment. Only the first answer counts, so the brain records it and its origin acts on it once.
+        with db._lock:
+            db.run(f"UPDATE approvals SET {', '.join(f'{k}=?' for k in fields)} WHERE id=? AND status='pending'",
+                   [*fields.values(), approval_id])
+            claimed = db.scalar("SELECT changes()")
+        if not claimed:
+            now = (db.one("SELECT status FROM approvals WHERE id=?", (approval_id,)) or {}).get("status", "decided")
+            raise ValueError(f"Request #{approval_id} is already {now}")
+    else:
+        db.update("approvals", approval_id, **fields)
+    if row["action"] == "decision":
+        from . import decisions   # imported here: decisions imports tools, which imports this module
+        try:
+            fresh = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+            if status == "answered":
+                decisions.on_decided(fresh, result, decided_by)
+            else:
+                decisions.on_dismissed(fresh)
+        except Exception as e:   # the brain record is a view; the owner's answer must stand
+            print(f"decision record failed: {e}")
     db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
            (company["id"], row["agent_id"], "decision", note, 0, ts))
     if row["task_id"]:
         t = db.get_task(row["task_id"])
         if t and t["status"] in ("waiting", "blocked"):
-            db.update("tasks", t["id"], status="todo", updated_at=ts,
-                      description=(t["description"] or "") + f"\n\n[Update] {note}")
+            db.update("tasks", t["id"], status="todo", updated_at=ts, followup_at=ts,   # Phase 3: dispatched first
+                      description=(t["description"] or "") + f"\n\n[Update] {update or note}")
     agent = db.get_agent(row["agent_id"]) if row["agent_id"] else None
-    if status == "rejected" and feedback.strip() and agent and agent["enabled"]:
+    if status == "rejected" and feedback.strip() and agent and agent["enabled"] and row["action"] != "decision":
         # Rejected with feedback: the agent gets a task to revise and resubmit.
         details = json.dumps(p, ensure_ascii=False, indent=1)[:3000]
         db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
@@ -164,6 +256,15 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
             watchdog.resolve(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result)
         except NotImplementedError:
             pass
+    if row["action"] not in ("question", "decision") and status in ("done", "failed", "rejected"):
+        from . import trust   # Phase 3: clean approvals build the streak; edits reset it; rejections demote
+        try:
+            trust.after_decision(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), decision,
+                                 edited=bool(payload) and p != db.loads(row["payload"], {}))
+        except Exception as e:   # the ladder is advice; the owner's decision stands
+            print(f"trust update failed: {e}")
+    _reopen_waiting(company["id"], approval_id, ts)
+    _records_changed(company["id"])
     db.update("companies", company["id"], cycle_requested=1)
     kind = "decision" if status != "failed" else "error"
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
@@ -171,18 +272,81 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
 
 
+def _without_reasons(p) -> dict:
+    """Phase 3: a payload without why the owner is asked (_why_asked, _taint), for deduplication."""
+    return {k: v for k, v in (p or {}).items() if k not in ("_why_asked", "_taint")} if isinstance(p, dict) else {}
+
+
+def _same_question(a, b) -> bool:
+    """Phase 2: decisions are deduplicated on the question text (case and spacing ignored)."""
+    def norm(s):
+        return " ".join(str(s or "").lower().split())
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+_WAITING_ON_RE = re.compile(r"Waiting on the owner: #(\d+)")
+
+
+def _reopen_waiting(company_id: int, approval_id: int, ts: str) -> None:
+    """Phase 0.5: after any owner decision, tasks of the company that wait with no pending approval of their own
+    go back to the queue. A task whose question was refused as a duplicate waits on someone else's question and
+    was never reopened before. One whose last handoff names a question that is still pending ("Waiting on the
+    owner: #N", written by finish) keeps waiting for that one."""
+    try:
+        pending = {r["id"]: r["task_id"] for r in
+                   db.q("SELECT id, task_id FROM approvals WHERE company_id=? AND status IN ('pending','running')",
+                        (company_id,))}
+        own = {tid for tid in pending.values() if tid}
+        reopened = 0
+        for t in db.q("SELECT id, result FROM tasks WHERE company_id=? AND status='waiting'", (company_id,)):
+            if t["id"] in own:
+                continue
+            named = _WAITING_ON_RE.findall(t["result"] or "")
+            if named and int(named[-1]) in pending:
+                continue
+            note = f"[Holdco] The owner answered #{approval_id}; continue."
+            db.update("tasks", t["id"], status="todo", updated_at=ts, followup_at=ts,   # Phase 3: dispatched first
+                      result=((t["result"] or "") + "\n" + note).strip()[-6000:])
+            reopened += 1
+        if reopened:
+            bus.notify("tasks", company_id=company_id)
+    except Exception as e:   # reopening is a convenience; it must never undo the owner's decision
+        print(f"reopening waiting tasks failed: {e}")
+
+
+def _records_changed(company_id: int) -> None:
+    """Phase 0.5: records/ is rewritten from the database after every outbound action or decision."""
+    try:
+        from . import truth   # imported here: truth imports tools, which imports this module
+        c = db.get_company(company_id)
+        if c:
+            truth.records_changed(c)
+    except Exception as e:   # records are a view; a failure must never undo or block the action
+        print(f"records refresh failed: {e}")
+
+
 def audit(company_id: int, action: str, proposed_by: str, approved_by: str, payload: dict, result: str,
           approval_id: int | None = None) -> int:
-    """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent."""
-    return db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
-                  "approval_id) VALUES(?,?,?,?,?,?,?,?)",
-                  (db.now(), company_id, action, proposed_by or "", approved_by, json.dumps(payload, sort_keys=True,
-                   default=str)[:20000], str(result or "")[:4000], approval_id))
+    """Append-only record of every outbound action that actually ran: who proposed it, who allowed it, what was sent.
+    records/ is refreshed after the row is written, so it includes this action."""
+    from . import vault   # imported here: vault imports db; a secret in a result never reaches the audit log
+    aid = db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result, "
+                 "approval_id) VALUES(?,?,?,?,?,?,?,?)",
+                 (db.now(), company_id, action, proposed_by or "", approved_by,
+                  vault.redact(json.dumps(payload, sort_keys=True, default=str))[:20000],
+                  vault.redact(str(result or ""))[:4000], approval_id))
+    _records_changed(company_id)
+    return aid
 
 
 # ---------------- executors ----------------
 
-def execute(company: dict, action: str, p: dict) -> str:
+def execute(company: dict, action: str, p: dict, approval_id: int | None = None) -> str:
+    """Run one outbound action. approval_id is the request being run, when it is one (decide passes it)."""
+    if action == "connector_call":
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        # The request's company goes along, so the connector it names is checked to still be this company's.
+        return connectors.execute(p, company=company, approval_id=approval_id)
     if action == "send_email":
         in_reply = ""
         if p.get("reply_to_email_id"):
@@ -198,7 +362,9 @@ def execute(company: dict, action: str, p: dict) -> str:
     if action == "http_post":
         return _http(p)
     if action == "run_code":
-        return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)))
+        return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)),
+                        network=str(p.get("network", "")).strip().lower() in ("true", "1", "yes", "on"),
+                        sandboxed=str(p.get("sandboxed", "")).strip().lower() in ("true", "1", "yes", "on"))
     if action == "spend_money":
         return "Approved. The owner will complete this purchase themselves and record it."
     raise ValueError(f"Unknown action {action}")
@@ -217,15 +383,42 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float
 def _social(company: dict, p: dict) -> str:
     cs = db.company_settings(company)
     content = p.get("content", "")
+    # Phase 1: a healthy Buffer connection with a channel for this platform queues the post there. A Buffer failure
+    # after that point is a real failure (the approval shows it and can be retried), not a silent fallback.
+    try:
+        from . import connectors   # imported here: connectors imports tools, which imports this module
+        buffer = connectors.instance("buffer", company)
+    except Exception:
+        buffer = None
+    note = ""
+    if buffer and buffer.get("enabled", 1) and buffer.get("status") == "ok":
+        from . import conn_buffer
+        platform = p.get("platform", "") or "social"
+        if not conn_buffer.default_channels(buffer):
+            note = " Buffer was not used: its card has no default channels, so Holdco does not know where to post."
+        else:
+            # Channel by channel; the ones that went out are kept in the request (decide stores the payload), so a
+            # retry after a partial failure skips them.
+            posted = [str(x) for x in (p.get("buffer_posted") or [])]
+            try:
+                via = conn_buffer.post_for_platform(buffer, company, platform, content, p.get("link", ""),
+                                                    posted=posted)
+            finally:
+                if posted:
+                    p["buffer_posted"] = posted
+            if via is not None:
+                return via
+            note = f" Buffer was not used: none of its default channels is a {platform} channel."
     if cs.get("webhook_url"):
         status, text = _post_json(cs["webhook_url"], {"type": "social_post", "company": company["name"],
                                                       "platform": p.get("platform", ""), "content": content,
                                                       "link": p.get("link", "")})
         if status >= 400:
             raise RuntimeError(f"Webhook returned HTTP {status}: {text[:300]}")
-        return f"Sent to the posting webhook (HTTP {status})."
+        return f"Sent to the posting webhook (HTTP {status}).{note}"
     intent = "https://twitter.com/intent/tweet?" + urllib.parse.urlencode({"text": content[:280]})
-    return f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+    return (f"Approved. No posting webhook is set up, so the owner posts it by hand. One-click X link: {intent}"
+            f"{note}")
 
 
 def _http(p: dict) -> str:
@@ -255,7 +448,8 @@ def _deploy_netlify(company: dict) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for f in site_dir.rglob("*"):
-            if f.is_file():
+            # Phase 3: a link (code in the sandbox can make one, pointing anywhere on this PC) is never followed
+            if f.is_file() and not f.is_symlink():
                 z.write(f, f.relative_to(site_dir).as_posix())
     auth = {"Authorization": f"Bearer {token}", "User-Agent": web.UA}
     site_id = cs.get("netlify_site_id")
@@ -267,7 +461,8 @@ def _deploy_netlify(company: dict) -> str:
         site_id = site["id"]
         cs["netlify_site_id"] = site_id
         cs["site_url"] = site.get("ssl_url") or site.get("url", "")
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        # Only these keys: cs holds the resolved Netlify token, which must never go back into the table.
+        db.update_company_settings(company["id"], netlify_site_id=site_id, site_url=cs["site_url"])
     req = urllib.request.Request(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", data=buf.getvalue(),
                                  method="POST", headers={**auth, "Content-Type": "application/zip"})
     try:
@@ -277,12 +472,21 @@ def _deploy_netlify(company: dict) -> str:
         raise RuntimeError(f"Netlify deploy failed: HTTP {e.code} {e.read(300).decode('utf-8', 'replace')}") from None
     url = info.get("ssl_url") or info.get("url") or cs.get("site_url", "")
     if url:
-        cs["site_url"] = url
-        db.update("companies", company["id"], settings=json.dumps(cs))
+        db.update_company_settings(company["id"], site_url=url)
     return f"Website deployed: {url}"
 
 
-def run_code(company: dict, language: str, code: str, timeout: int = 60) -> str:
+def run_code(company: dict, language: str, code: str, timeout: int = 60, network: bool = False,
+             sandboxed: bool = False) -> str:
+    """sandboxed: the owner approved it as a run in the container (the Inbox card said so); it then never falls back
+    to this PC when the container runtime has gone away since."""
+    from . import sandbox   # Phase 3: inside a container when Docker or Podman is available
+    boxed = sandbox.run(company, language, code, timeout, network=network)
+    if boxed is not None:
+        return boxed
+    if sandboxed:
+        raise RuntimeError("You approved this to run in the code sandbox, but Docker or Podman is not available now, "
+                           "so nothing ran. Start it and retry this request, or ask for the run again.")
     ws = workspace.root(company)
     runs = ws / ".runs"
     runs.mkdir(parents=True, exist_ok=True)
@@ -301,12 +505,12 @@ def run_code(company: dict, language: str, code: str, timeout: int = 60) -> str:
         proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, timeout=timeout, env=env,
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s."
+        return f"{sandbox.NONE}\nTimed out after {timeout}s."
     except FileNotFoundError as e:
-        return f"Couldn't start the interpreter: {e}"
+        return f"{sandbox.NONE}\nCouldn't start the interpreter: {e}"
     out = proc.stdout.decode("utf-8", "replace")
     err = proc.stderr.decode("utf-8", "replace")
-    res = f"Exit code {proc.returncode}\n"
+    res = f"{sandbox.NONE}\nExit code {proc.returncode}\n"   # no container: the result says where it ran
     if out:
         res += f"--- stdout ---\n{out[-6000:]}\n"
     if err:

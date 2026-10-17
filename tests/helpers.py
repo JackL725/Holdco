@@ -80,8 +80,9 @@ class Client:
 class HoldcoProcess:
     """Runs `python run.py` against a temporary data folder."""
 
-    def __init__(self, data_dir: str | None = None):
+    def __init__(self, data_dir: str | None = None, env: dict | None = None):
         self.data_dir = data_dir or tempfile.mkdtemp(prefix="holdco-test-")
+        self.env = dict(env or {})   # extra environment for the app (kept across stop and start)
         self.port = free_port()
         self.proc: subprocess.Popen | None = None
         self.client = Client(f"http://127.0.0.1:{self.port}")
@@ -89,7 +90,10 @@ class HoldcoProcess:
 
     def start(self):
         env = {**os.environ, "HOLDCO_DATA": self.data_dir, "HOLDCO_PORT": str(self.port),
-               "HOLDCO_TICK_SECONDS": "1", "HOLDCO_ROUTINE_CHECK_SECONDS": "1", "PYTHONUNBUFFERED": "1"}
+               "HOLDCO_TICK_SECONDS": "1", "HOLDCO_ROUTINE_CHECK_SECONDS": "1", "PYTHONUNBUFFERED": "1",
+               # Phase 2: routines with an at_hour follow a fixed local noon, so the suite gives the same result at
+               # any time of day (the morning plan is due, the evening brief is not; a test can pass its own time).
+               "HOLDCO_TEST_LOCAL_NOW": "12:00", **self.env}
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "a", encoding="utf-8")
         self.proc = subprocess.Popen([sys.executable, str(ROOT / "run.py"), "--no-browser", "--port", str(self.port)],

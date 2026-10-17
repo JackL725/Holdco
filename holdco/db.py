@@ -65,6 +65,74 @@ CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY, created_at TEXT, company_id INTEGER, action TEXT, proposed_by TEXT DEFAULT '',
     approved_by TEXT DEFAULT '', payload TEXT DEFAULT '{}', result TEXT DEFAULT '', approval_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS index_state (
+    company_id INTEGER, source TEXT, ref TEXT, stamp TEXT, PRIMARY KEY (company_id, source, ref)
+);
+CREATE TABLE IF NOT EXISTS search_vectors (rowid INTEGER PRIMARY KEY, model TEXT, vector TEXT);
+CREATE TABLE IF NOT EXISTS fetched (
+    id INTEGER PRIMARY KEY, company_id INTEGER, url TEXT, sha TEXT, task_id INTEGER, run_id INTEGER, fetched_at TEXT
+);
+CREATE TABLE IF NOT EXISTS facts (
+    id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, task_id INTEGER, claim TEXT, url TEXT,
+    quote TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS strategy (
+    company_id INTEGER PRIMARY KEY, one_liner TEXT DEFAULT '', icp TEXT DEFAULT '', problem TEXT DEFAULT '',
+    offer TEXT DEFAULT '', price TEXT DEFAULT '', positioning TEXT DEFAULT '', voice TEXT DEFAULT '', updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY, company_id INTEGER, title TEXT, metric TEXT DEFAULT '', target REAL, current REAL,
+    deadline TEXT DEFAULT '', owner_role TEXT DEFAULT '', status TEXT DEFAULT 'active', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY, company_id INTEGER, name TEXT DEFAULT '', email TEXT DEFAULT '', company TEXT DEFAULT '',
+    role TEXT DEFAULT '', stage TEXT DEFAULT 'lead', source TEXT DEFAULT '', consent TEXT DEFAULT '',
+    unsubscribed INTEGER DEFAULT 0, last_touch TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY, company_id INTEGER, what TEXT, why TEXT DEFAULT '', expected TEXT DEFAULT '',
+    review_at TEXT DEFAULT '', outcome TEXT DEFAULT '', decided_by TEXT DEFAULT '', reversible INTEGER DEFAULT 1,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY, company_id INTEGER, goal_id INTEGER, hypothesis TEXT, metric TEXT DEFAULT '',
+    start TEXT DEFAULT '', stop TEXT DEFAULT '', result TEXT DEFAULT '', verdict TEXT DEFAULT 'pending', created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY, company_id INTEGER, text TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS brain_changes (
+    id INTEGER PRIMARY KEY, company_id INTEGER, agent_id INTEGER, section TEXT, payload TEXT DEFAULT '{}',
+    reason TEXT DEFAULT '', status TEXT DEFAULT 'pending', decided_at TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS leases (
+    company_id INTEGER, path TEXT, task_id INTEGER, agent_id INTEGER, run_id INTEGER, expires_at TEXT,
+    PRIMARY KEY (company_id, path)
+);
+CREATE TABLE IF NOT EXISTS briefs (
+    id INTEGER PRIMARY KEY, company_id INTEGER, kind TEXT, body TEXT, data TEXT DEFAULT '{}', created_at TEXT
+);
+-- Phase 3: Holdco Bench scores, the trust ladder and the global do-not-email list
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id INTEGER PRIMARY KEY, model TEXT, started_at TEXT, finished_at TEXT, settings TEXT DEFAULT '{}',
+    scenarios INTEGER DEFAULT 0, passed INTEGER DEFAULT 0, pass_rate REAL, tool_validity REAL,
+    tokens_per_second REAL, steps_avg REAL, results TEXT DEFAULT '[]', notes TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS trust (
+    company_id INTEGER, action TEXT, level INTEGER DEFAULT 0, streak INTEGER DEFAULT 0, cap_per_day INTEGER DEFAULT 0,
+    updated_at TEXT, PRIMARY KEY (company_id, action)
+);
+CREATE TABLE IF NOT EXISTS suppression (
+    email TEXT PRIMARY KEY, reason TEXT DEFAULT '', company_id INTEGER, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_goals_company ON goals(company_id, status);
+CREATE INDEX IF NOT EXISTS ix_contacts_company ON contacts(company_id, stage);
+CREATE INDEX IF NOT EXISTS ix_briefs_company ON briefs(company_id, kind, id);
+CREATE TABLE IF NOT EXISTS connectors (
+    id INTEGER PRIMARY KEY, company_id INTEGER, key TEXT, enabled INTEGER DEFAULT 1, config TEXT DEFAULT '{}',
+    status TEXT DEFAULT '', detail TEXT DEFAULT '', last_check TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_connectors_key ON connectors(key, company_id);
+CREATE INDEX IF NOT EXISTS ix_fetched_company ON fetched(company_id, url);
+CREATE INDEX IF NOT EXISTS ix_facts_company ON facts(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_events_company ON events(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_audit_company ON audit(company_id, id);
 CREATE INDEX IF NOT EXISTS ix_tasks_company ON tasks(company_id, status);
@@ -81,6 +149,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
   INSERT INTO memory_fts(memory_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+    title, heading, body,
+    company_id UNINDEXED, source UNINDEXED, ref UNINDEXED, line UNINDEXED, updated_at UNINDEXED,
+    tokenize = 'porter unicode61'
+);
 CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
   INSERT INTO memory_fts(memory_fts, rowid, content) VALUES('delete', old.id, old.content);
   INSERT INTO memory_fts(rowid, content) VALUES (new.id, new.content);
@@ -113,7 +186,25 @@ MIGRATIONS = {
     "agents": {"preset": "TEXT DEFAULT ''", "reasoning": "TEXT DEFAULT ''", "routines_on": "INTEGER DEFAULT 1"},
     "tasks": {"deliverable": "TEXT DEFAULT ''", "acceptance": "TEXT DEFAULT ''", "routine": "TEXT DEFAULT ''",
               # Phase 0: working notes that survive retries, and how often a task changed hands (watchdog)
-              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0"},
+              "notes": "TEXT DEFAULT ''", "reassigned": "INTEGER DEFAULT 0",
+              # Phase 0.5: outreach | deploy | post | purchase | ask | research | build | write
+              "kind": "TEXT DEFAULT ''",
+              # Phase 2: the task contract
+              "goal_id": "INTEGER", "expected": "TEXT DEFAULT ''", "inputs": "TEXT DEFAULT ''",
+              "depends_on": "TEXT DEFAULT '[]'", "due_at": "TEXT DEFAULT ''", "budget_steps": "INTEGER DEFAULT 0",
+              "budget_tokens": "INTEGER DEFAULT 0", "checks": "TEXT DEFAULT ''", "tokens_used": "INTEGER DEFAULT 0",
+              # Phase 3: the verification gate's results (JSON list) and when an owner's answer reopened the task
+              "verification": "TEXT DEFAULT ''", "followup_at": "TEXT DEFAULT ''"},
+    # Phase 2: who decided a decision (owner, telegram or deadline)
+    "approvals": {"decided_by": "TEXT DEFAULT ''"},
+    # Phase 0.5: the change stamp and backoff that stop idle re-planning
+    "companies": {"last_cycle_stamp": "TEXT DEFAULT ''", "cycle_backoff": "INTEGER DEFAULT 0"},
+    # Phase 1: where a number came from (a connector key, or 'manual' when an agent typed it)
+    "metrics": {"source": "TEXT DEFAULT 'manual'"},
+    # Phase 1: the Message-ID an inbound email answers, so replies to outreach can be counted
+    "emails": {"in_reply_to": "TEXT DEFAULT ''"},
+    # Phase 3: the largest prompt a run sent, for the context-use display
+    "runs": {"max_prompt_tokens": "INTEGER DEFAULT 0"},
 }
 
 
@@ -142,6 +233,11 @@ def init() -> None:
         except sqlite3.OperationalError:
             HAS_FTS = False
         _conn.commit()
+    try:   # Phase 1: plain-text secrets move into the vault (a no-op once done)
+        from . import vault
+        vault.migrate()
+    except Exception as e:   # a vault problem must not stop Holdco from starting; the Doctor reports it
+        print(f"Vault migration failed: {e}")
 
 
 def q(sql: str, params: tuple | list = ()) -> list[dict]:
@@ -204,6 +300,31 @@ def get_settings() -> dict:
     for k in config.LOCKED_POLICIES:
         pol[k] = "approve"
     s["policies"] = pol
+    return _resolve_secrets(s, config.SECRET_SETTINGS)
+
+
+_secret_warned: set[str] = set()   # vault names whose read failure was already printed
+
+
+def _resolve_secrets(s: dict, keys=None) -> dict:
+    """Phase 1: a secret is stored as "vault:<name>"; readers get the value from the vault ("" when missing).
+    Only the secret keys are resolved (keys: config.SECRET_SETTINGS or config.SECRET_COMPANY_SETTINGS; both when
+    None): any other setting that happens to read "vault:..." (a directive an agent or the owner typed) stays text,
+    so it can never pull a secret out of the vault. The result holds real secrets: never write it back to a table
+    (update_company_settings does that safely)."""
+    allowed = set(keys) if keys is not None else set(config.SECRET_SETTINGS) | set(config.SECRET_COMPANY_SETTINGS)
+    names = [k for k, v in s.items() if k in allowed and isinstance(v, str) and v.startswith("vault:")]
+    if names:
+        from . import vault   # imported here: vault imports db
+        for k in names:
+            name = s[k][len("vault:"):]
+            try:
+                s[k] = vault.get(name) or ""
+            except Exception as e:   # a foreign-machine secret: treat as unset, the Doctor's vault row says why
+                if name not in _secret_warned:   # once per secret: settings are read many times a minute
+                    _secret_warned.add(name)
+                    print(f"Vault: {k}: {e}")
+                s[k] = ""
     return s
 
 
@@ -262,12 +383,44 @@ def set_settings(values: dict) -> dict:
 # ---------- companies ----------
 
 def company_settings(company: dict) -> dict:
+    """A company's settings over the defaults, with vault markers resolved to the secrets themselves. For reading
+    only: writing this back would put the secrets in the table in plain text (use update_company_settings)."""
     s = dict(config.DEFAULT_COMPANY_SETTINGS)
     try:
         s.update(json.loads(company.get("settings") or "{}"))
     except ValueError:
         pass
-    return s
+    return _resolve_secrets(s, config.SECRET_COMPANY_SETTINGS)
+
+
+def update_company_settings(company_id: int, **changes) -> dict:
+    """Merge changes into a company's stored settings JSON and write it back. The stored JSON is loaded as it is
+    (vault markers stay markers, defaults are not added), so no resolved secret is ever written. A secret key among
+    the changes (config.SECRET_COMPANY_SETTINGS) goes to the vault and only its marker is stored; an empty value
+    deletes it. Returns the stored settings."""
+    marker = "vault:"
+    if any(k in config.SECRET_COMPANY_SETTINGS for k in changes):
+        from . import vault   # imported here: vault imports db. Before the lock: vault.migrate locks vault, then db
+        for k in config.SECRET_COMPANY_SETTINGS:
+            v = changes.get(k)
+            if not isinstance(v, str) or v.startswith(marker):
+                continue
+            name = f"company.{company_id}.{k}"
+            if v:
+                vault.put(name, v)
+                changes[k] = marker + name
+            else:
+                vault.delete(name)
+    with _lock:   # read, merge and write in one go, so a change made meanwhile is not lost
+        row = one("SELECT settings FROM companies WHERE id=?", (company_id,))
+        if not row:
+            return {}
+        stored = loads(row.get("settings"), {}) or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored.update(changes)
+        run("UPDATE companies SET settings=? WHERE id=?", (json.dumps(stored), company_id))
+        return stored
 
 
 def effective_policy(company: dict, action: str) -> str:

@@ -205,7 +205,10 @@ class TestPresets(unittest.TestCase):
             self.assertIn(p["category"], presets.CATEGORIES)
             self.assertIn(p["reasoning"], ("low", "medium", "high"))
             self.assertIn(p["creativity"], llm.CREATIVITY_TEMPS)
-            self.assertLessEqual(len(p["tools"]), 15, f"{key} has too many tools for a small model")
+            # Phase 2: planning needs the brain tools (brain_lookup, propose_brain_change, add_lesson; the CEO's
+            # set_strategy, set_goal and the rest), so the cap rose from 15 to 18 for executors and 24 for the CEO.
+            cap = 24 if key == "ceo" else 18
+            self.assertLessEqual(len(p["tools"]), cap, f"{key} has too many tools for a small model")
             unknown = [t for t in p["tools"] if t not in tools.REGISTRY]
             self.assertFalse(unknown, f"{key} uses unknown tools {unknown}")
             self.assertIn("finish", p["tools"])
@@ -213,7 +216,8 @@ class TestPresets(unittest.TestCase):
             self.assertLess(len(presets.render(key)), 4500, f"{key} role prompt is too long")
             for r in p["routines"]:
                 self.assertGreater(r["every_hours"], 0)
-                self.assertIn(r["requires"], ("", "imap", "smtp"))
+                self.assertIn(r["requires"], ("", "imap", "smtp", "no_analyst"))
+                self.assertIn(r["at_hour"], (None, *range(24)))
             self.assertTrue(all(u.startswith("https://") for u in p["sources"]))
 
     def test_templates(self):
@@ -287,7 +291,11 @@ class TestTools(unittest.TestCase):
         ctx = ctx_for(self.c, "engineering", db.get_task(tid))
         self.assertIn("Not finished yet", tools.execute(ctx, "finish", {"summary": "done"}))
         self.assertFalse(ctx.finished)
-        tools.execute(ctx, "write_file", {"path": "site/page.html", "content": "<html><body>" + "x" * 100 + "</body></html>"})
+        # a page the verification gate's static check passes (Phase 3): viewport and title, no audit blocker
+        tools.execute(ctx, "write_file", {"path": "site/page.html", "content": (
+            '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width, initial-scale=1"><title>Page</title></head><body><h1>Page</h1><p>'
+            + "x" * 100 + "</p></body></html>")})
         tools.execute(ctx, "finish", {"summary": "built it", "evidence": "audit ok"})
         self.assertTrue(ctx.finished)
         self.assertEqual(ctx.finish_status, "done")
@@ -347,7 +355,10 @@ class TestTools(unittest.TestCase):
         t = db.one("SELECT * FROM tasks WHERE company_id=? AND title LIKE 'Revise:%' ORDER BY id DESC", (self.c["id"],))
         self.assertIsNotNone(t)
         self.assertIn("Too pushy", t["description"])
-        # an email with no SMTP set fails and can be retried
+        # an email with no SMTP set fails and can be retried (commercial email needs a postal address first)
+        s = db.company_settings(self.c)
+        s["postal_address"] = "1 Main Street, Springfield, IL 62701"
+        db.update("companies", self.c["id"], settings=json.dumps(s))
         sales = ctx_for(self.c, "sales")
         tools.execute(sales, "send_email", {"to": "a@b.co", "subject": "Hi", "body": "Hello"})
         aid = db.scalar("SELECT MAX(id) FROM approvals WHERE company_id=?", (self.c["id"],))
@@ -435,6 +446,30 @@ class TestLoopGuard(unittest.TestCase):
         bad = ("write_file", {"path": "../outside.md", "content": "x"})
         results = self.run_script([self.REVIEW, bad, self.REVIEW])
         self.assertIn(self.NUDGE, [r for n, r in results if n == "review_text"][1])
+
+
+
+class TestTreeSurvivesVanishingFiles(unittest.TestCase):
+    """Windows CI: a records/ temp file vanished between listing the folder and resolving its path, and the
+    ValueError from relative_to crashed an agent run. A file that disappears mid-walk is skipped."""
+
+    def test_vanishing_file_is_skipped(self):
+        from unittest import mock
+        c = make_company("VanishCo", members=("ceo",))
+        root = workspace.root(c)
+        (root / "docs" / "keep.md").write_text("x", encoding="utf-8")
+        (root / "docs" / ".gone.tmp").write_text("x", encoding="utf-8")
+        real_rel = workspace.rel
+
+        def flaky_rel(company, p):
+            if p.name == ".gone.tmp":
+                raise ValueError("is not in the subpath")
+            return real_rel(company, p)
+
+        with mock.patch.object(workspace, "rel", flaky_rel):
+            paths = [i["path"] for i in workspace.tree(c, ".", 3, 100)]
+        self.assertIn("docs/keep.md", paths)
+        self.assertNotIn("docs/.gone.tmp", paths)
 
 
 if __name__ == "__main__":

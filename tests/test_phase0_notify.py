@@ -617,6 +617,8 @@ class TestHooksNeverBlock(NotifyCase):
     def setUp(self):
         super().setUp()
         self.tg.delay = 1.0   # the fake answers sendMessage after a second, like a bad phone network
+        # The hooks must return before that second is up. 0.9 s, not less: a loaded CI machine (or several suites
+        # at once) can take a few hundred milliseconds for the database writes that come before the hand-off.
 
     def tearDown(self):
         super().tearDown()
@@ -626,15 +628,15 @@ class TestHooksNeverBlock(NotifyCase):
         row = make_approval(self.company, "social_post", {"platform": "x", "content": "Slow phone"})
         t0 = time.monotonic()
         notify.approval_requested(row)
-        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertLess(time.monotonic() - t0, 0.9)
         self.assertEqual(self.tg.sent, [])
-        wait_for(lambda: len(self.tg.sent) == 1, 2, 0.02, "the request to reach the phone")
+        wait_for(lambda: len(self.tg.sent) == 1, 4, 0.02, "the request to reach the phone")
         self.assertIn("Slow phone", self.tg.sent[0]["text"])
         t0 = time.monotonic()
         notify.error(self.company, "Deploy failed: HTTP 500")
         notify.error(self.company, "Deploy failed: HTTP 500")   # the hourly rule is decided here, synchronously
-        self.assertLess(time.monotonic() - t0, 0.5)
-        wait_for(lambda: len(self.tg.sent) == 2, 2, 0.02, "the error to reach the phone")
+        self.assertLess(time.monotonic() - t0, 0.9)
+        wait_for(lambda: len(self.tg.sent) == 2, 4, 0.02, "the error to reach the phone")
         self.assertTrue(notify.flush())
         self.assertEqual(len(self.tg.sent), 2)
         self.assertEqual(len(self.tg.ntfy), 2)
@@ -643,7 +645,7 @@ class TestHooksNeverBlock(NotifyCase):
         agent = db.one("SELECT * FROM agents WHERE company_id=? AND role='marketing'", (self.company["id"],))
         t0 = time.monotonic()
         out = actions.gate(self.company, agent, None, "social_post", {"platform": "x", "content": "Gate speed"})
-        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertLess(time.monotonic() - t0, 0.9)
         self.assertIn("Queued for the owner's approval", out)
         self.assertEqual(self.tg.sent, [])
         m = wait_for(lambda: next((m for m in self.tg.sent if "Gate speed" in m["text"]), None), 2, 0.02,

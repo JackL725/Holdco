@@ -475,8 +475,10 @@ class TestWebSearchTool(ChainCase):
         self.assertEqual(self.errors(self.company), [])
 
     def test_alias_and_renamed_args_still_reach_the_chain(self):
+        # gpt-oss calls its built-in browser search "browser.search" with q/topn. ("search" alone is Holdco's own
+        # search over company knowledge since Phase 0.5; see tests/test_context.py for the old meaning.)
         st = self.stubs(ddg_html=Stub(rows("ddg")))
-        out = tools.execute(self.ctx(), "search", {"q": "pricing", "topn": 1})
+        out = tools.execute(self.ctx(), "browser.search", {"q": "pricing", "topn": 1})
         self.assertIn("ddg result 1", out)
         self.assertEqual(st["ddg_html"].calls, 1)
 

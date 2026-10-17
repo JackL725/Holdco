@@ -49,6 +49,12 @@ DEFAULT_SETTINGS: dict = {
     "kill_switch": False,             # stops every agent and freezes outbound actions until turned off
     "max_task_attempts": 2,           # failed attempts before a task is blocked and escalated to you
     "backup_keep": 14,                # nightly backups to keep
+    # Ground truth and context (Phase 0.5)
+    "review_model": "",               # stronger model for the critic pass and QA reviews; blank = CEO/agent model
+    "embedding_model": "",            # optional Ollama embedding model (e.g. nomic-embed-text) for meaning search
+    "pinned_context": [],             # files under data/context/ included in every prompt ("always include")
+    # Verify (Phase 3)
+    "small_model": "",                # optional small model for triage, summaries and classification; blank = default
 }
 
 # What happens when an agent tries an outbound action.
@@ -62,6 +68,11 @@ POLICY_ACTIONS = {
     "http_post": "Send data to an outside service",
     "run_code": "Run code on this PC",
     "spend_money": "Spend money",
+    # Phase 1: tools of connected services, by their risk tag
+    "connector_write": "Change data in a connected service",
+    "connector_publish": "Publish through a connected service",
+    "connector_contact": "Message people through a connected service",
+    "irreversible": "Irreversible actions: domains, deletions, refunds",
 }
 DEFAULT_POLICIES = {
     "send_email": "approve",
@@ -70,8 +81,19 @@ DEFAULT_POLICIES = {
     "http_post": "approve",
     "run_code": "approve",
     "spend_money": "approve",
+    "connector_write": "approve",
+    "connector_publish": "approve",
+    "connector_contact": "approve",
+    "irreversible": "approve",
 }
-LOCKED_POLICIES = {"spend_money"}  # money never moves without you
+LOCKED_POLICIES = {"spend_money", "irreversible"}  # money never moves, and nothing irreversible happens, without you
+
+# Phase 1: every tool carries one of these. read runs freely; the others map onto approval policies.
+RISK_TAGS = ("read", "write", "publish", "contact", "spend", "irreversible")
+
+# Phase 1: settings that are secrets live in the vault; the settings table keeps a "vault:<name>" marker.
+SECRET_SETTINGS = ("llm_api_key", "brave_api_key", "telegram_bot_token")
+SECRET_COMPANY_SETTINGS = ("smtp_password", "imap_password", "netlify_token")
 
 DEFAULT_COMPANY_SETTINGS: dict = {
     "cycle_minutes": 60,      # how often the CEO re-plans
@@ -86,6 +108,19 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "netlify_token": "", "netlify_site_id": "", "site_url": "",
     # Social posts / outbound automation (optional): a webhook (Zapier, Make, n8n, Discord...).
     "webhook_url": "",
+    "email_provider": "auto",    # Phase 1: auto | smtp | resend (auto = Resend when a healthy instance exists)
+    # Ground truth and context (Phase 0.5)
+    "postal_address": "",        # sender's postal address; commercial email must carry one (CAN-SPAM)
+    "archetype": "",             # business type override for the playbook; blank = detected from the idea
+    "daily_token_budget": 3000000,   # background tokens per day; 0 = no limit
+    "pinned_context": [],        # files under this company's context/ included in every prompt
+    "founding_stage": "",        # research | charter | critic | plan while founding (staged founding)
+    # Phase 2 budgets
+    "quiet_hours": "23:00-07:00",     # Phase 3: low-value research runs in this local window
+    "gpu_hours_per_day": 6,      # model time per day; over it the company gets no dispatch or cycles until tomorrow
+    "steps_per_task": 0,         # tool calls per task attempt; 0 = the global max_steps_per_run
+    "posts_per_week": 10,        # social posts approved or pending in the last 7 days
+    "money_usd": 0,              # display only: purchases always ask the owner
 }
 
 

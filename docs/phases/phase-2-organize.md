@@ -7,11 +7,45 @@ this phase the CEO plans top down (goal, bets, tasks), every open task names the
 review is built from connector data instead of agents' own summaries. This document is the implementation spec:
 an engineer builds from it, and the design rationale lives in [operating-model.md](../operating-model.md).
 
-Status: Planned. Branch `claude/phase-2-organize`, PR based on Phase 1. Depends on Phase 0
-([phase-0-stabilize.md](phase-0-stabilize.md): `routing.py`, `watchdog.py`, `notify.py`, `approvals` rows of
-action `question`, `tasks.notes`) and Phase 1 ([phase-1-connect.md](phase-1-connect.md): `metrics.source`,
-`connectors.py`, the vault). See also [architecture.md](../architecture.md), [owner-experience.md](../owner-experience.md)
-and [testing.md](../testing.md).
+Status: built. Branch `claude/phase-2-organize`, based on the code of Phases 0, 0.5 and 1 (pull request
+JackL725/Holdco#4 brings 0.5 and 1 into `main`). Gate on the owner's GPU (gpt-oss:20b, a sandbox with a fake Stripe in
+test mode): after the weekly review no open agent task lacked a goal, and the weekly memo's numbers came from Stripe
+rows, with the hand-typed waitlist number listed under self-reported only. Depends on Phase 0
+([phase-0-stabilize.md](phase-0-stabilize.md)), Phase 0.5
+([phase-0.5-ground-truth-and-context.md](phase-0.5-ground-truth-and-context.md)) and Phase 1
+([phase-1-connect.md](phase-1-connect.md)). See also [architecture.md](../architecture.md),
+[owner-experience.md](../owner-experience.md) and [testing.md](../testing.md).
+
+What Phase 0.5 and Phase 1 change in this design, decided at the start of the build:
+- Founding is staged (research, charter, critic, plan). The charter stage calls `set_strategy` and `set_goal` after
+  `update_charter`; the plan stage gives every first task a `goal_id` and `expected`.
+- The company block in the system prompt comes from `brain.company_section`: the digest once the brain has content,
+  otherwise Phase 0.5's charter core. The facts block (`truth.facts_section`) stays above it.
+- The planning prompt keeps Phase 0.5's header (nothing changed, waiting on the owner) first, then this phase's goals,
+  experiments, proposals and decisions due (`contracts.cycle_sections`), then the existing sections.
+- `ask_decision` reuses Phase 0.5's one-question-per-topic rules and the claims gate; decisions count toward the cap
+  of pending agent questions.
+- `gpu_hours_per_day` sits beside Phase 0.5's `daily_token_budget`; either stops dispatch and cycles for the day.
+- Role belts get `search`, `grep`, `edit_file`, `company_status` and `find_tool` at run time (Phases 0.5 and 1) on top of
+  the preset lists that `test_integrity` counts.
+- `write_brief` refuses a brief that states a number missing from its data block (once, listing the numbers), the same
+  anti-fabrication rule as Phase 0.5's claims gate.
+- End-to-end tests are numbered from `test_30`. Code lives in `brain.py`, `contracts.py` (task contracts, dependency
+  graph, budgets), `rhythms.py` and `decisions.py`; leases in `workspace.py`.
+
+Changes made after the first real-model run (gpt-oss:20b on the owner's GPU, `tests/test_phase2_realmodel.py`):
+- `create_task` does not offer `budget_steps` or `budget_tokens` to agents: the model set 3 steps and 200 tokens on
+  every task it created, which would have starved them. Budgets stay on the owner's task form and in the API.
+- A tool call whose arguments are wrapped in a second call object (`{"name": "functions.create_task", "arguments":
+  {...}}`), or named with the `functions.` prefix, is unwrapped; founding's plan stage had ended with no tasks.
+- `finish` on an evening brief, weekly review or monthly check that stored no brief is refused once with the
+  `write_brief` call to make, then accepted as `partial`; `update_task` cannot close the task the agent is running.
+- `assign_to` accepts an agent's name as well as its role, and agents cannot create tasks that duplicate a rhythm
+  ("Write daily brief").
+- From the second run: a brief may state the window in a metric's name ("30 days" for `stripe.revenue_usd_30d`); a
+  brief task's deliverable is recorded as the brief ("the weekly memo (brief #3, on the Overview)") instead of the
+  file path the model names, which the next planning cycle reported as missing; `update_task` queues a task the
+  model sets to `in_progress` as `todo`, since only a starting run may mark it in progress.
 
 ## Scope
 
@@ -439,7 +473,8 @@ the end; when a task's `tokens_used` already exceeds `budget_tokens` at the star
 to `blocked` with the note "Token budget exhausted" and the watchdog pattern `task_failed_twice` options apply.
 
 UI. Company Settings tab gets a "Budgets" section with the five fields. `PATCH /api/companies/<id>` accepts them
-(integers, minimum 1 for hours and steps, 0 allowed for posts and emails).
+(GPU hours as a number of at least 0.25 so a short trial is possible; steps, posts, emails and money as whole
+numbers of at least 0, where 0 steps means the app default).
 
 Code touch points: `config.DEFAULT_COMPANY_SETTINGS`, `server.api_company_patch` (integer coercion list),
 `scheduler.Scheduler.tick` and `_maybe_cycle`, `agents.run`, `tools.social_post`, `static/app.js` `TabSettings`
@@ -447,7 +482,8 @@ and `TabOverview`.
 
 ## Files
 
-New: `holdco/brain.py`, `holdco/rhythms.py`, `tests/test_phase2.py`.
+New: `holdco/brain.py`, `holdco/contracts.py`, `holdco/rhythms.py`, `holdco/decisions.py`, `tests/test_phase2_brain.py`,
+`tests/test_phase2_contracts.py`, `tests/test_phase2_rhythms.py`.
 
 Changed: `holdco/db.py` (SCHEMA: `strategy`, `goals`, `contacts`, `decisions`, `experiments`, `lessons`,
 `brain_changes`, `leases`, `briefs`; MIGRATIONS: tasks `goal_id`, `expected`, `inputs`, `depends_on`, `due_at`,
@@ -466,7 +502,8 @@ cycle script with `goal_id`, "Evening brief" and "Weekly review" scripts that ca
 
 ## Tests
 
-Unit (`tests/test_phase2.py`, using `make_company` and `ctx_for` from `test_unit.py`):
+Unit (`tests/test_phase2_brain.py`, `tests/test_phase2_contracts.py` and `tests/test_phase2_rhythms.py`, one per
+area, using `make_company` and `ctx_for` from `test_unit.py`):
 
 | Test | Proves |
 |---|---|
@@ -484,14 +521,15 @@ Unit (`tests/test_phase2.py`, using `make_company` and `ctx_for` from `test_unit
 | `test_decision_deadline` | A reversible decision past its deadline is resolved with the recommended option, `decided_by = "deadline"`, the waiting task reopened, one notification sent, and a `decisions` row with `decided_by = "deadline"` and `reversible = 1` written; an owner answer writes one with `decided_by = "owner"`; an irreversible one stays pending |
 | `test_budgets` | `social_post` refuses at `posts_per_week`; `agents.run` uses `min(steps_per_task, budget_steps)`; a company over `gpu_hours_per_day` gets no dispatch but still gets routine tasks |
 
-End to end (`tests/test_e2e.py`, new tests numbered after Phase 1's `test_24`):
-`test_25_founding_writes_brain` (founding with the fake model writes a strategy row and two goals, and every
-founding task has a `goal_id`); `test_26_rhythms_and_briefs` (forcing the routines, by setting
+End to end (`tests/test_e2e.py`, new tests numbered after Phase 1's `test_29`):
+`test_30_founding_writes_brain` (founding with the fake model writes a strategy row and two goals, and every
+founding task has a `goal_id`); `test_31_rhythms_and_briefs` (forcing the routines, by setting
 `companies.created_at` back and the fake clock past `at_hour`, creates "Evening brief" and "Weekly review"
 tasks; after they run, `GET /api/briefs/latest?company_id=` returns a daily and a weekly brief whose
 `data.metrics` entries carry `source: "stripe"`, rows injected through the Phase 1 fake Stripe metrics poll);
-`test_27_decision_in_inbox` (the Inbox endpoint lists a `decision` row created by the fake CEO's `ask_decision`,
-and the dashboard Brain tab assets load).
+`test_32_decision_in_inbox` (the Inbox endpoint lists a `decision` row created by the fake CEO's `ask_decision`,
+and the dashboard Brain tab assets load); `test_33_dependency_and_lease` (a task that depends on an
+open task is not dispatched until that task is done, and the task list shows `blocked_by`).
 
 Fakes: `tests/fake_ollama.py` gains the scripts above. No new fake services; the Phase 0 fake Telegram and the
 Phase 1 fake Stripe are reused.
