@@ -560,5 +560,37 @@ class TestSchedulerReview(Base):
         self.assertEqual(db.scalar("SELECT pinned FROM memory WHERE id=?", (mid,)), 1)
 
 
+class TestFollowUpsToTheReview(Base):
+    """Three items the review listed without fixing, fixed after it."""
+
+    def test_a_question_that_uses_the_word_stop_is_not_an_unsubscribe(self):
+        from holdco import truth
+        for subject, body in (("Re: your plan", "How do I stop the renewal?"), ("Visit", "I want to stop by your shop"),
+                              ("Re: trial", "Can you stop the trial?\nthanks")):
+            self.assertFalse(truth.is_stop_request(subject, body), body)
+        for subject, body in (("STOP", ""), ("Re: hi", "stop"), ("Re: hi", "Stop. Thanks"), ("Re", "unsubscribe"),
+                              ("Re", "Please stop emailing me."), ("Remove me", ""), ("Re", "Do not contact me again")):
+            self.assertTrue(truth.is_stop_request(subject, body), subject + " " + body)
+        c = make_company("StopWordCo")
+        inbound(c, "Pat <pat@shop.example.org>", "Re: your plan", "How do I stop the renewal?")
+        self.assertFalse(truth.suppressed("pat@shop.example.org"))
+        self.assertFalse(verify.is_suppressed("pat@shop.example.org"))
+
+    def test_zero_for_an_optional_ranged_number_means_none(self):
+        c = make_company("ZeroCo")
+        out = tools.execute(ctx_for(c, "ceo"), "create_task", {"title": "Write the FAQ", "assign_to": "marketing",
+                                                                "due_days": 0, "priority": 2})
+        self.assertTrue(out.startswith("Created task #"), out)
+        tid = int(out.split("#")[1].split(" ")[0])
+        self.assertEqual(db.get_task(tid)["due_at"] or "", "")
+        out = tools.execute(ctx_for(c, "ceo"), "create_task", {"title": "Write the blog post", "assign_to": "marketing",
+                                                                "due_days": 91})
+        self.assertIn("due_days must be an integer 1-90", out)
+
+    def test_payment_link_with_a_query_string_is_the_same_link(self):
+        urls = verify._payment_urls("Link: https://buy.stripe.com/test_abc123?prefilled_email=a%40b.c#top.", None)
+        self.assertEqual(urls, ["https://buy.stripe.com/test_abc123"])
+
+
 if __name__ == "__main__":
     unittest.main()

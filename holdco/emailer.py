@@ -319,7 +319,7 @@ def _route_inbound(company: dict, email_id: int, sender: str, subject: str) -> N
     row = db.one("SELECT body FROM emails WHERE id=?", (email_id,)) or {}
     body = str(row.get("body") or "")
     address = email.utils.parseaddr(sender or "")[1].strip().lower()
-    stop = bool(address and (truth.STOP_WORDS.search(subject or "") or truth.STOP_WORDS.search(_first_line(body))))
+    stop = bool(address and truth.is_stop_request(subject or "", truth._own_words(body)))
     if stop:
         try:
             verify.suppress(address, f"inbound email #{email_id}: {(subject or _first_line(body))[:120]}", cid)

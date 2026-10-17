@@ -2114,6 +2114,19 @@ _PLACEHOLDER_LOCALS = {"you", "your", "name", "user", "someone", "test", "email"
 _PLACEHOLDER_DOMAINS = re.compile(r"(?:^|\.)(?:example\.(?:com|org|net)|domain\.com|yourdomain\.\w+|mydomain\.\w+|"
                                   r"yourcompany\.\w+|company\.com|website\.com)$")
 STOP_WORDS = re.compile(r"\b(?:stop|unsubscribe|remove\s+me)\b", re.I)
+# A request to stop email, as opposed to a sentence that uses the word ("How do I stop the renewal?"): unsubscribe
+# or "remove me" anywhere, "stop emailing/contacting/sending..." anywhere, or a line that is only "stop" (with
+# "please" or "thanks" around it), which is what people type in reply to "Reply 'stop'...".
+_STOP_REQUEST = re.compile(
+    r"\bunsubscribe\b|\bremove\s+me\b|\bopt\s*(?:me\s+)?out\b|"
+    r"\bstop\s+(?:e-?mailing|contacting|messaging|sending|writing)\b|\b(?:don'?t|do\s+not)\s+(?:e-?mail|contact)\s+me\b|"
+    r"^\W*(?:please\W+)?stop(?:\W+please)?(?:\W+thanks?(?:\s+you)?)?\W*$", re.I | re.M)
+
+
+def is_stop_request(subject: str, own_words: str) -> bool:
+    """Does an inbound email ask not to be emailed again? Looks at the subject and at the lines the sender wrote
+    (_own_words: quoted text, where our own opt-out line comes back, is already cut)."""
+    return bool(_STOP_REQUEST.search(subject or "") or _STOP_REQUEST.search(own_words or ""))
 OPT_OUT = "Reply 'stop' and we won't email you again."
 _OPT_OUT_RE = re.compile(r"\b(?:stop|unsubscribe|opt[ -]?out)\b|won'?t\s+(?:e-?mail|follow\s+up|contact|reach\s+out)|"
                          r"reply\s+.{0,12}\bno\b", re.I)
@@ -2145,8 +2158,7 @@ def suppressed(address: str) -> bool:
         return True
     for e in db.q("SELECT from_addr, subject, body FROM emails WHERE direction='in' AND lower(from_addr) LIKE ?",
                   (f"%{a}%",)):
-        if _addr(e["from_addr"]) == a and (STOP_WORDS.search(e["subject"] or "")
-                                           or STOP_WORDS.search(_own_words(e["body"] or ""))):
+        if _addr(e["from_addr"]) == a and is_stop_request(e["subject"] or "", _own_words(e["body"] or "")):
             return True
     return False
 

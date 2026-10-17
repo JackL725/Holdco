@@ -487,6 +487,7 @@ def _payment_urls(text: str, inst: dict | None) -> list[str]:
     out: list[str] = []
     for u in rx.findall(text or ""):
         u = u.rstrip(".,;:!?*_'\"”’")
+        u = u.split("#")[0].split("?")[0]   # ?prefilled_email=... and the like are not part of the link
         if u not in out:
             out.append(u)
     return out

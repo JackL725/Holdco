@@ -587,7 +587,7 @@ class TestDecisions(Base):
         self.assertIn("give 2 to 5 options", ask(options="$29"))
         self.assertIn("give 2 to 5 options", ask(options="a\nb\nc\nd\ne\nf"))
         self.assertIn("recommended must be one of the options", ask(recommended="$39"))
-        self.assertIn("deadline_hours must be", ask(deadline_hours=0))
+        self.assertIn("deadline_hours must be", ask(deadline_hours=-5))   # 0 means "not given" (Phase 3): 48 h
         self.assertIn("deadline_hours must be", ask(deadline_hours=400))
         self.assertIn("the owner reads questions on a phone", ask(question="Proceed?"))
         out = ask(options="- $29\n- $49", recommended="$29", deadline_hours=24, context="Two competitors charge $39.")

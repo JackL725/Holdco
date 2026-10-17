@@ -268,6 +268,8 @@ def _coerce(k: str, prop: dict, v) -> tuple[bool, object, str]:
         if empty:
             return False, None, ""
         n = _as_number(v)
+        if n == 0 and (prop.get("minimum") or 0) > 0:
+            return False, None, ""   # gpt-oss fills optional numbers with 0 ("due_days": 0): it means "none"
         if n is None or not n.is_integer() or not _in_range(prop, n):
             return False, None, f"{k} must be an integer{_range_text(prop)}; you sent {_shown(v)}"
         v = int(n)
