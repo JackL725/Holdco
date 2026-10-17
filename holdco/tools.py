@@ -58,6 +58,8 @@ class Ctx:
     verify_warned: bool = False
     verify_waiting_on: int | None = None   # the run_code request the gate's last check queued or waits on
     verify_failed: list = field(default_factory=list)   # the gate's failed results from its last check
+    calls_made: int = 0          # tool calls this session ran, finish left out (finish's idle-cycle check)
+    idle_warned: bool = False    # finish() said once that a planning cycle had used no tool
 
 
 @dataclass
@@ -153,6 +155,8 @@ def resolve(ctx: Ctx, name: str, args: dict) -> tuple[str, dict]:
 
 
 def execute(ctx: Ctx, name: str, args: dict) -> str:
+    if name != "finish":
+        ctx.calls_made += 1
     if name in ctx.loaded_by_name:   # Phase 1: a connector tool find_tool loaded into this session
         spec = ctx.loaded_by_name[name]
         try:
@@ -970,6 +974,9 @@ WAITING_REFUSAL = ("Not finished yet: nothing is waiting on the owner for this t
                    "have and finish with status 'partial' when another attempt can carry on, or 'blocked' and say "
                    "what blocks you.")
 WAITING_ON_LABEL = "Waiting on the owner: "
+IDLE_CYCLE_REFUSAL = ("Not finished yet: this planning session has not used a tool, so nothing in your summary has "
+                      "happened. Plan with your tools (create_task, start_experiment, update_task, ask_decision or "
+                      "ask_owner), then call finish. If there is truly nothing to do, say so and call finish again.")
 
 
 def _waiting_for(ctx: Ctx) -> int | None:
@@ -1005,6 +1012,11 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         # The brief is the deliverable, not the file path the model names for it (the real-model run named
         # briefs/daily-<date>.md, which never exists, and the next planning cycle flagged it MISSING).
         target = f"the {rhythms.BRIEF_LABEL[brief['kind']]} (brief #{brief['id']}, on the Overview)"
+    if ctx.kind == "cycle" and status == "done" and not ctx.calls_made and not ctx.idle_warned:
+        # Phase 3 bench gate: a real planning cycle's first and only call was finish, its summary describing tasks
+        # created, experiments started and a question asked, none of which happened. Once, like the other checks.
+        ctx.idle_warned = True
+        return IDLE_CYCLE_REFUSAL
     if ctx.kind == "founding" and status == "waiting":
         # A founding stage never waits: the next stage starts (or founding completes) either way, and a question
         # the stage asked stays in the owner's Inbox. Kept as 'waiting', the plan stage that asked for a domain (as

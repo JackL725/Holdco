@@ -89,7 +89,7 @@ Scenario schema (`scenarios.py`; a `Scenario` dataclass, instances in `SCENARIOS
 | `mocks` | dict | `search` (scripted results or `blocked`), `fetch` ({url: text or status}), `stripe`, `telegram`, `mcp` (tool list and scripted results), `playwright` (`absent` or scripted `browser_check` output), `write_file_fail_once` |
 | `assertions` | list | See the assertion table |
 | `lazy_fails` | bool | Must fail when the fake model runs in lazy mode |
-| `timeout_s` | int | Wall-clock limit for the scenario (default 300) |
+| `timeout_s` | int | Wall-clock limit for the scenario (default by kind of run: 300 s for a task or chat, 600 s for a cycle, 900 s for a founding) |
 
 Assertions (`runner.check(assertion, ctx_state) -> (passed, detail)`):
 

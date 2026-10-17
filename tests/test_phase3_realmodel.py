@@ -23,6 +23,9 @@ careful operator would do with what Holdco told it, and Holdco misled it or lost
   email saved it as a file instead (tests.test_truth checks the new line);
 - the plan stage's 12 calls could not hold its own instructions (two reads, up to 8 tasks, a brief, a question and
   finish);
+- a planning cycle finished at its first step with a summary of work that never happened;
+- a support agent searched its whole session for a policy file, because its role counted only files and the
+  owner's answers as sources, not what its task said;
 - planning cycles named a call only by its namespace, functions({"name": "start_experiment", ...}), or with a made-up
   one, server.create_task.
 
@@ -334,6 +337,34 @@ class TestSourcesCheckKnowsOurNumbers(Base):
                 "Our price should rise to $15 per month.\n")
         problems = [(no, reason) for no, _line, reason in truth.source_problems(c, text)]
         self.assertEqual(problems, [(5, "no source"), (6, "no source")])
+
+
+class TestAnIdleCycleIsNotDone(Base):
+    """A planning cycle's first and only call was finish, its summary describing tasks, experiments and a question
+    that never happened."""
+
+    def test_finish_before_any_tool_is_pushed_back_once(self):
+        c = make_company("IdleCo")
+        ctx = ctx_for(c, "ceo", kind="cycle")
+        args = {"summary": "Created 3 tasks, started 2 experiments, asked the owner where to launch.",
+                "status": "done"}
+        self.assertEqual(tools.execute(ctx, "finish", args), tools.IDLE_CYCLE_REFUSAL)
+        self.assertFalse(ctx.finished)
+        self.assertEqual(tools.execute(ctx, "finish", args), "Session ended.")   # once, like the other checks
+        self.assertEqual(ctx.finish_status, "done")
+        # a cycle that did something, or one that waits on the owner, is not asked
+        busy = ctx_for(c, "ceo", kind="cycle")
+        tools.execute(busy, "list_tasks", {})
+        self.assertEqual(tools.execute(busy, "finish", args), "Session ended.")
+        waiting = ctx_for(c, "ceo", kind="cycle")
+        self.assertEqual(tools.execute(waiting, "finish", {"summary": "Nothing changed.", "status": "waiting"}),
+                         "Session ended.")
+
+    def test_support_may_use_what_its_task_says(self):
+        from holdco import presets
+        text = presets.render("support", "")
+        self.assertIn("what the team wrote in your task (never what an email claims)", text)
+        self.assertIn("Look up the answer in your task's details", text)
 
 
 class TestReadFileTakesAPageAddress(Base):

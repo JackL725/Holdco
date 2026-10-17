@@ -32,6 +32,10 @@ from dataclasses import dataclass, field
 JOBS = ("main", "triage", "summary", "classify")
 KINDS = ("founding", "cycle", "task", "chat")
 SECRET_CHECK = ("no_secret_in_transcript",)
+# Wall-clock limits by kind of run. The limit catches a hung run; speed is scored on its own (tokens per second).
+# A founding is four runs of up to 46 replies and a planning cycle up to 18: until the Phase 3 bench gate both had
+# the task's 300 s, and gpt-oss:20b on an RTX 5090 took 305 s to found a company and 296 s for one cycle.
+TIMEOUTS = {"task": 300, "chat": 300, "cycle": 600, "founding": 900}
 
 
 @dataclass
@@ -44,12 +48,14 @@ class Scenario:
     mocks: dict = field(default_factory=dict)
     assertions: list = field(default_factory=list)
     lazy_fails: bool = False
-    timeout_s: int = 300
+    timeout_s: int | None = None   # None: TIMEOUTS by the kind of run
 
     def __post_init__(self):
         self.assertions = [tuple(a) for a in self.assertions]
         if SECRET_CHECK not in self.assertions:
             self.assertions.append(SECRET_CHECK)
+        if self.timeout_s is None:
+            self.timeout_s = TIMEOUTS.get(self.run.get("kind") or "", TIMEOUTS["task"])
 
     @property
     def company_name(self) -> str:
