@@ -15,7 +15,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 
-from . import bus, db, web
+from . import bus, db, llm, web
 
 
 class EmailError(Exception):
@@ -285,15 +285,71 @@ def _in_reply_to(msg) -> str:
     return value[:998]
 
 
+TRIAGE_LABELS = ("support", "sales", "spam", "other")
+TRIAGE_SYSTEM = ("You sort the inbound email of a small company. Labels: support (a customer or user needs help or "
+                 "asks about something they use or bought), sales (someone may buy: asks about prices or plans, or "
+                 "answers our outreach), spam (unsolicited ads, phishing, scams, bulk mail nobody asked for), other "
+                 '(anything else). Reply with JSON only: {"label": "support"}, {"label": "sales"}, {"label": "spam"} '
+                 'or {"label": "other"}.')
+
+
+def triage_email(sender: str, subject: str, body: str, settings: dict | None = None) -> str:
+    """The small model's label for an inbound email: support, sales, spam or other (Phase 3 'triage' job). Raises
+    LLMError when the model cannot be asked or answers something else."""
+    out = llm.run_job("triage", f"From: {sender[:200]}\nSubject: {subject[:300]}\n\n{(body or '')[:3000]}",
+                      TRIAGE_SYSTEM, settings, json_output=True)
+    data = llm.extract_json(out)
+    label = str((data.get("label") if isinstance(data, dict) else "") or out or "").strip().strip('."\'`').lower()
+    if label not in TRIAGE_LABELS:
+        raise llm.LLMError(f"unclear triage label: {(out or '')[:80]!r}")
+    return label
+
+
+def _first_line(body: str) -> str:
+    """The first line the sender wrote (quoted lines skipped)."""
+    return next((ln.strip() for ln in (body or "").splitlines() if ln.strip() and not ln.strip().startswith(">")), "")
+
+
 def _route_inbound(company: dict, email_id: int, sender: str, subject: str) -> None:
-    agent = (db.one("SELECT * FROM agents WHERE company_id=? AND role='support' AND enabled=1", (company["id"],))
-             or db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (company["id"],)))
+    """A new inbound email becomes a reply task for support (else the CEO). Phase 3: a stop or unsubscribe goes on
+    the global do-not-email list; with a small model set, spam is filed as handled with no task and sales mail goes
+    to the sales agent when the company has one. Without a small model, or when it fails, routing is as before."""
+    from . import truth, verify   # imported here: truth imports this module
+    cid = company["id"]
+    row = db.one("SELECT body FROM emails WHERE id=?", (email_id,)) or {}
+    body = str(row.get("body") or "")
+    address = email.utils.parseaddr(sender or "")[1].strip().lower()
+    stop = bool(address and (truth.STOP_WORDS.search(subject or "") or truth.STOP_WORDS.search(_first_line(body))))
+    if stop:
+        try:
+            verify.suppress(address, f"inbound email #{email_id}: {(subject or _first_line(body))[:120]}", cid)
+        except Exception as e:   # the reply task below still tells the team
+            print(f"[emailer] could not add {address} to the do-not-email list: {e}")
+    label = ""
+    if llm.small_model():
+        try:
+            label = triage_email(sender, subject, body)
+        except Exception as e:   # LLMError (timeout, unclear label) or anything else: plain routing
+            print(f"[emailer] triage of email #{email_id} skipped: {e}")
+    if label == "spam":
+        db.run("UPDATE emails SET status='handled' WHERE id=? AND company_id=?", (email_id, cid))
+        bus.emit(cid, "email", f"Filed email #{email_id} from {sender[:60]} as spam (no task)",
+                 data={"email_id": email_id, "triage": "spam"})
+        return
+    agent = (label == "sales" and db.one("SELECT * FROM agents WHERE company_id=? AND role='sales' AND enabled=1",
+                                         (cid,))) or None
+    agent = (agent or db.one("SELECT * FROM agents WHERE company_id=? AND role='support' AND enabled=1", (cid,))
+             or db.one("SELECT * FROM agents WHERE company_id=? AND role='ceo'", (cid,)))
     if not agent:
         return
     ts = db.now()
+    note = f" Sorted as {label}." if label else ""
+    if stop:
+        note += (" They asked not to be emailed again: do not reply; if they are a contact, mark them unsubscribed "
+                 "with update_contact.")
     db.run("INSERT INTO tasks(company_id, title, description, role, agent_id, status, priority, created_by,"
            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-           (company["id"], f"Reply to email #{email_id} from {sender[:60]}",
+           (cid, f"Reply to email #{email_id} from {sender[:60]}",
             f"New inbound email #{email_id}. Subject: {subject}\nRead it with check_inbox, reply with send_email "
-            f"(reply_to_email_id={email_id}) if a reply is needed, then mark_email_handled.",
+            f"(reply_to_email_id={email_id}) if a reply is needed, then mark_email_handled.{note}",
             agent["role"], agent["id"], "todo", 1, "inbox", ts, ts))

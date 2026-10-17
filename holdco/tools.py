@@ -1,6 +1,7 @@
 """Tools the agents can call."""
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -11,6 +12,9 @@ from . import actions, bus, checks, db, presets, roles, web, workspace
 MAX_RESULT = 7000
 OPEN_STATUSES = ("todo", "in_progress", "blocked", "waiting")
 TASK_STATUSES = ("todo", "in_progress", "done", "blocked", "waiting", "cancelled")
+FINISH_STATUSES = ("done", "partial", "blocked", "waiting")
+COMPANY_STAGES = ("idea", "building", "launched", "revenue")
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 
 
 class ToolError(Exception):
@@ -94,12 +98,19 @@ def risk_of(name: str) -> str:
     return t.risk if t else BUILTIN_RISK.get(name, "write")
 
 
-def S(desc: str, **extra) -> dict:
-    return {"type": "string", "description": desc, **extra}
+def S(desc: str, enum: list | tuple | None = None, **extra) -> dict:
+    """A string argument; enum lists the only values it accepts (clean_args checks them, Phase 3)."""
+    return {"type": "string", "description": desc, **({"enum": list(enum)} if enum else {}), **extra}
 
 
-def I(desc: str) -> dict:
-    return {"type": "integer", "description": desc}
+def I(desc: str, lo: int | None = None, hi: int | None = None) -> dict:
+    """An integer argument; lo and hi are the range clean_args checks (Phase 3)."""
+    out: dict = {"type": "integer", "description": desc}
+    if lo is not None:
+        out["minimum"] = lo
+    if hi is not None:
+        out["maximum"] = hi
+    return out
 
 
 def specs(names: list[str]) -> list[dict]:
@@ -120,7 +131,8 @@ ARG_RENAMES = {"fetch_url": {"id": "url", "link": "url"}, "web_search": {"q": "q
                "run_code": {"script": "code", "cmd": "code"},
                "read_file": {"file": "path", "filename": "path", "file_path": "path"},
                "write_file": {"file": "path", "filename": "path", "file_path": "path", "text": "content", "body": "content"},
-               "create_task": {"role": "assign_to", "assignee": "assign_to", "details": "description"},
+               "create_task": {"role": "assign_to", "assignee": "assign_to", "assigned_to": "assign_to",
+                               "details": "description"},
                "finish": {"result": "summary", "message": "summary"}}
 
 
@@ -145,6 +157,8 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
             with taint.current(ctx):
                 out = str(connectors.call(ctx, name, clean_args(spec, args)))
             out = taint.after_tool(ctx, name, args, out)   # Phase 3: external reads taint the session
+        except ArgError as e:   # Phase 3: the repair message is the result; the model fixes the call next step
+            out = f"ERROR: bad arguments for {name}: {e}"
         except (ToolError, ValueError) as e:
             out = f"ERROR: {e}"
         except Exception as e:   # a connected service must never crash the run
@@ -153,8 +167,7 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
     name, args = resolve(ctx, name, args)
     t = REGISTRY.get(name)
     if not t or (ctx.allowed and name not in ctx.allowed):
-        import difflib
-        close = difflib.get_close_matches(name, sorted(ctx.allowed), n=3, cutoff=0.5)
+        close =difflib.get_close_matches(name, sorted(ctx.allowed), n=3, cutoff=0.5)
         hint = f" Did you mean {' or '.join(close)}?" if close else ""
         return (f"ERROR: there's no tool called '{name}' available to you.{hint} Your tools are: "
                 f"{', '.join(sorted(ctx.allowed))}.")
@@ -162,6 +175,8 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
         with taint.current(ctx):   # Phase 3: actions.gate sees what this session read
             out = t.fn(ctx, **_clean_args(t, args))
         out = taint.after_tool(ctx, name, args, out)
+    except ArgError as e:
+        out = f"ERROR: bad arguments for {name}: {e}"
     except TypeError as e:
         out = f"ERROR: bad arguments for {name}: {e}. Expected: {json.dumps(t.parameters['properties'])}"
     except (ToolError, workspace.PathError, web.WebError, ValueError) as e:
@@ -178,33 +193,157 @@ def _clean_args(t: Tool, args: dict) -> dict:
     return clean_args({"parameters": t.parameters}, args)
 
 
+class ArgError(ToolError):
+    """Arguments that do not fit the tool's schema, one repair line per problem (Phase 3, design section 2).
+    tools.execute returns them as "ERROR: bad arguments for <tool>: <lines>"."""
+
+
+_NUMBER_RE = re.compile(r"[#$]?\s*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[+-]?\.\d+)")
+_TRUE, _FALSE = ("true", "yes", "y", "on", "1"), ("false", "no", "n", "off", "0", "none")
+
+
+def _as_number(v) -> float | None:
+    """v as a number when it plainly is one: 3, 2.5, "3", " 2.5", "#12", "$19", "1,200". None otherwise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v == v and abs(v) != float("inf") else None
+    m = _NUMBER_RE.fullmatch(v.strip()) if isinstance(v, str) else None
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+def _shown(v) -> str:
+    """A sent value as a repair message quotes it: strings in quotes, the rest as JSON, both kept short."""
+    text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
+    text = text if len(text) <= 60 else text[:57] + "..."
+    return f"'{text}'" if isinstance(v, str) else text
+
+
+def _num_text(x) -> str:
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+def _range_text(prop: dict) -> str:
+    lo, hi = prop.get("minimum"), prop.get("maximum")
+    if lo is not None and hi is not None:
+        return f" {_num_text(lo)}-{_num_text(hi)}"
+    if lo is not None:
+        return f" of at least {_num_text(lo)}"
+    return f" of at most {_num_text(hi)}" if hi is not None else ""
+
+
+def _in_range(prop: dict, n: float) -> bool:
+    lo, hi = prop.get("minimum"), prop.get("maximum")
+    return (lo is None or n >= lo) and (hi is None or n <= hi)
+
+
+def _enum_value(v, enum: list):
+    """The allowed value v means, or None. Case, spaces and hyphens do not matter ("In progress" is in_progress),
+    and one clear spelling variant is accepted ("canceled" is cancelled); anything else is refused."""
+    if v in enum:
+        return v
+    if not isinstance(v, str) or not all(isinstance(e, str) for e in enum):
+        return None
+    key = re.sub(r"[\s-]+", "_", v.strip().lower())
+    norm = {re.sub(r"[\s-]+", "_", e.strip().lower()): e for e in enum}
+    if key in norm:
+        return norm[key]
+    close =difflib.get_close_matches(key, list(norm), n=2, cutoff=0.9)
+    return norm[close[0]] if len(close) == 1 else None
+
+
+def _coerce(k: str, prop: dict, v) -> tuple[bool, object, str]:
+    """One argument against its property: (given, value, problem). A null (gpt-oss sends goal_id: null), and an
+    empty value for anything but free text, means the argument was left out. Values that plainly mean the declared
+    type are converted ("3" is 3, "true" is true); anything else is a problem, worded as the model reads it back
+    (design section 2's table)."""
+    typ = prop.get("type")
+    types = typ if isinstance(typ, list) else [typ]
+    if v is None:
+        return ("null" in types), None, ""
+    empty = isinstance(v, str) and not v.strip()
+    if "integer" in types:
+        if empty:
+            return False, None, ""
+        n = _as_number(v)
+        if n is None or not n.is_integer() or not _in_range(prop, n):
+            return False, None, f"{k} must be an integer{_range_text(prop)}; you sent {_shown(v)}"
+        v = int(n)
+    elif "number" in types:
+        if empty:
+            return False, None, ""
+        n = _as_number(v)
+        if n is None or not _in_range(prop, n):
+            return False, None, f"{k} must be a number{_range_text(prop)}; you sent {_shown(v)}"
+        v = v if isinstance(v, (int, float)) and not isinstance(v, bool) else n
+    elif "boolean" in types:
+        word = v.strip().lower() if isinstance(v, str) else None
+        if isinstance(v, bool):
+            pass
+        elif empty:
+            return False, None, ""
+        elif word in _TRUE or word in _FALSE or (isinstance(v, int) and v in (0, 1)):
+            v = word in _TRUE if word is not None else bool(v)
+        else:
+            return False, None, f"{k} must be true or false; you sent {_shown(v)}"
+    elif "string" in types and not isinstance(v, str):
+        v = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+    enum = prop.get("enum")
+    if enum:
+        if isinstance(v, str) and not v.strip():
+            return False, None, ""
+        value = _enum_value(v, list(enum))
+        if value is None:
+            return False, None, f"{k} must be one of {', '.join(str(e) for e in enum)}; you sent {_shown(v)}"
+        v = value
+    return True, v, ""
+
+
+def _near_miss(key: str, lacking: list[str]) -> str | None:
+    """The declared argument an unknown key was meant to be ("titel", "Title" or "assign-to"), among those the call
+    lacks; None for every other unknown key, which is dropped without a word (models add harmless extras)."""
+    flat =re.sub(r"[\s_-]+", "", str(key).lower())
+    for p in lacking:
+        if re.sub(r"[\s_-]+", "", p.lower()) == flat:
+            return p
+    close = difflib.get_close_matches(str(key).lower(), lacking, n=1, cutoff=0.8)
+    return close[0] if close else None
+
+
 def clean_args(spec: dict, args: dict) -> dict:
-    """Coerce arguments to the types a spec declares and check the required ones (a Tool or a connector spec)."""
+    """Check and convert arguments against the schema a spec declares (a Tool or a connector spec). Values that
+    plainly mean the declared type are converted; every value that does not fit raises ArgError with one repair
+    line per problem (design section 2), so the model can fix the call on its next step. Unknown keys are dropped,
+    unless one is a near miss of a declared argument the call lacks."""
     params = spec.get("parameters") or {}
     props = params.get("properties") or {}
-    clean = {}
-    for k, v in (args or {}).items():
+    required = list(params.get("required") or [])
+    args = args or {}
+    clean, problems, bad = {}, [], set()
+    for k, v in args.items():
         if k not in props:
             continue
-        typ = props[k].get("type")
-        if typ == "integer" and not isinstance(v, int):
-            try:
-                v = int(float(v))
-            except (TypeError, ValueError):
-                continue
-        elif typ == "number" and not isinstance(v, (int, float)):
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                continue
-        elif typ == "boolean" and not isinstance(v, bool):
-            v = str(v).lower() in ("1", "true", "yes")
-        elif typ == "string" and not isinstance(v, str):
-            v = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-        clean[k] = v
-    missing = [r for r in params.get("required") or [] if r not in clean]
+        given, value, problem = _coerce(k, props[k] if isinstance(props[k], dict) else {}, v)
+        if problem:
+            problems.append(problem)
+            bad.add(k)
+        elif given:
+            clean[k] = value
+    lacking = [p for p in props if p not in args]
+    near: dict[str, str] = {}
+    for k in args:
+        if k not in props:
+            meant = _near_miss(k, [p for p in lacking if p not in near.values()])
+            if meant:
+                near[k] = meant
+    if near:
+        expected = ", ".join([r for r in required if r in props] + [p for p in props if p not in required])
+        problems += [f"unknown argument '{k}'; expected {expected}" for k in near]
+    missing = [r for r in required if r not in clean and r not in bad and r not in near.values()]
     if missing:
-        raise ToolError(f"missing required argument(s): {', '.join(missing)}")
+        problems.append(f"missing required argument(s): {', '.join(missing)}")
+    if problems:
+        raise ArgError("\n".join(problems))
     return clean
 
 
@@ -357,13 +496,13 @@ def _role_named(team: dict[str, dict], assign_to: str) -> str:
        "assign_to": S("Role or name of the teammate (see the Team list)"),
        "deliverable": S("Where the result will be: a file path like site/index.html, or an action like 'email queued'"),
        "acceptance": S("3-5 checkable acceptance criteria, one per line"),
-       "priority": I("1 = urgent, 2 = normal, 3 = later"),
+       "priority": I("1 = urgent, 2 = normal, 3 = later", 1, 3),
        "kind": S("Optional: outreach, deploy, post, purchase, ask, research, build or write"),
        "goal_id": I("The active goal this task serves, e.g. 1"),
        "expected": S("What this task should move and by how much"),
        "inputs": S("Files and facts to read first"),
        "depends_on": S("Task ids that must be done first, e.g. 12, 14"),
-       "due_days": I("Due in this many days (1-90)"),
+       "due_days": I("Due in this many days (1-90)", 1, 90),
        "checks": S("Tool checks to run when it is done, one per line, e.g. browser_check site/index.html")},
       ("title", "assign_to"))
 def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", deliverable: str = "",
@@ -411,7 +550,7 @@ def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", del
         "budget_steps": budget_steps, "budget_tokens": budget_tokens, "checks": checks})
     ts = db.now()
     cols = {"company_id": ctx.company["id"], "title": title.strip()[:200], "description": description, "role": role,
-            "agent_id": team[role]["id"], "status": "todo", "priority": max(1, min(int(priority or 2), 3)),
+            "agent_id": team[role]["id"], "status": "todo", "priority": int(priority or 2),   # 1-3: the schema
             "created_by": ctx.agent["name"], "deliverable": deliverable.strip()[:200],
             "acceptance": acceptance.strip()[:2000], "kind": kind, "created_at": ts, "updated_at": ts, **contract}
     tid = db.run(f"INSERT INTO tasks({', '.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(cols.values()))
@@ -431,9 +570,11 @@ def create_task(ctx: Ctx, title: str, assign_to: str, description: str = "", del
 
 
 @tool("update_task", "Change a task's status or add a note (e.g. cancel a stale task, unblock one, record progress).",
-      {"task_id": I("Task number"), "status": S("todo, in_progress, done, blocked, waiting or cancelled"),
+      {"task_id": I("Task number"),
+       "status": S("todo, in_progress, done, blocked, waiting or cancelled", enum=TASK_STATUSES),
        "note": S("A short note to add"), "assign_to": S("Reassign to another role"),
-       "goal_id": I("Attach the task to this active goal"), "due_days": I("Due in this many days from now (1-90)")},
+       "goal_id": I("Attach the task to this active goal"),
+       "due_days": I("Due in this many days from now (1-90)", 1, 90)},
       ("task_id",))
 def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign_to: str = "", goal_id: int = 0,
                 due_days: int = 0) -> str:
@@ -446,10 +587,7 @@ def update_task(ctx: Ctx, task_id: int, status: str = "", note: str = "", assign
         return (f"ERROR: task #{task_id} is the task you are working on now. End it with finish (status done, "
                 f"partial, blocked or waiting), not update_task.")
     queued = ""
-    if status:
-        status = status.strip().lower()
-        if status not in TASK_STATUSES:
-            raise ToolError(f"Status must be one of {', '.join(TASK_STATUSES)}")
+    if status:   # one of TASK_STATUSES: the schema's enum (clean_args)
         if status == "in_progress" and t["status"] != "in_progress":
             # Holdco marks a task in progress when an agent starts it; set by hand, no run would ever pick it up.
             status = "todo"
@@ -495,12 +633,20 @@ def list_tasks(ctx: Ctx, status: str = "open") -> str:
 
 # ======================= memory & metrics =======================
 
+MEMORY_KINDS = ("fact", "decision", "lesson", "contact", "note")
+
+
 @tool("remember", "Save a fact, decision or lesson to the company's shared memory.",
       {"content": S("What to remember (one clear statement)"),
-       "kind": S("fact, decision, lesson, contact or note"),
+       "kind": S("fact, decision, lesson, contact or note", enum=MEMORY_KINDS),
        "pin": {"type": "boolean", "description": "Pin it so every agent always sees it (use sparingly)"}},
       ("content",))
 def remember(ctx: Ctx, content: str, kind: str = "note", pin: bool = False) -> str:
+    # Phase 3: with an embedding model and a small model, a note that says what an existing one says is not saved
+    # twice (the nearest note above 0.92 similarity, confirmed by the small model).
+    same = embeddings.duplicate_memory(ctx.company, content, kind)
+    if same:
+        return f"Already in memory (#{same})."
     mid = db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
                  (ctx.company["id"], ctx.agent["id"], (kind or "note")[:20], content[:2000], int(bool(pin)), db.now()))
     _log(ctx, "memory", f"noted: {content[:140]}")
@@ -631,7 +777,8 @@ def deploy_site(ctx: Ctx) -> str:
 
 
 @tool("http_request", "Call an outside web API. GET runs directly; POST/PUT/PATCH/DELETE may need approval.",
-      {"url": S("Full URL"), "method": S("GET, POST, PUT, PATCH or DELETE"), "body": S("JSON body as a string"),
+      {"url": S("Full URL"), "method": S("GET, POST, PUT, PATCH or DELETE", enum=HTTP_METHODS),
+       "body": S("JSON body as a string"),
        "headers": S("JSON object of extra headers, as a string")}, ("url",))
 def http_request(ctx: Ctx, url: str, method: str = "GET", body: str = "", headers: str = "") -> str:
     method = (method or "GET").upper()
@@ -676,7 +823,7 @@ def request_purchase(ctx: Ctx, item: str, amount_usd: float, reason: str, vendor
 @tool("update_charter", "Write or replace the company charter (Markdown). Optionally rename the company and set its one-liner and stage.",
       {"charter": S("The full charter in Markdown"), "company_name": S("New company name (optional)"),
        "one_liner": S("One sentence: what we do and for whom"),
-       "stage": S("idea, building, launched or revenue")}, ("charter",))
+       "stage": S("idea, building, launched or revenue", enum=COMPANY_STAGES)}, ("charter",))
 def update_charter(ctx: Ctx, charter: str, company_name: str = "", one_liner: str = "", stage: str = "") -> str:
     missing = planning.validate_charter(charter)
     if missing:
@@ -751,7 +898,8 @@ def check_contrast(ctx: Ctx, foreground: str = "", background: str = "", pairs: 
 
 @tool("review_text", "Check copy: reading grade, length, hype, unsourced numbers, and rules for the kind of text.",
       {"text": S("The text to check (or use path)"), "path": S("A file in the company folder to check instead"),
-       "kind": S("landing, cold_email, email, support_reply, social, social_x, article or general")}, ())
+       "kind": S("landing, cold_email, email, support_reply, social, social_x, article or general",
+                 enum=tuple(checks.GRADE_TARGET))}, ())
 def review_text(ctx: Ctx, text: str = "", path: str = "", kind: str = "general") -> str:
     is_html = False
     if path and not text:
@@ -833,7 +981,8 @@ def _waiting_for(ctx: Ctx) -> int | None:
 
 @tool("finish", "End your work session with a handoff for the team.",
       {"summary": S("What you did, in up to 5 short bullets"),
-       "status": S("done, partial (some progress, more needed), blocked (can't proceed) or waiting (on the owner)"),
+       "status": S("done, partial (some progress, more needed), blocked (can't proceed) or waiting (on the owner)",
+                   enum=FINISH_STATUSES),
        "deliverable": S("Path of the main output"),
        "evidence": S("How you checked it: tool results, URLs"),
        "open_issues": S("Anything unfinished or uncertain"),
@@ -929,5 +1078,6 @@ from . import context, planning, truth  # noqa: E402,F401  (Phase 0.5: search, g
 from . import connectors, browser  # noqa: E402,F401  (Phase 1: find_tool, connector routing, browser_check)
 from . import brain, contracts, decisions, rhythms  # noqa: E402,F401  (Phase 2: brain, contracts, rhythms, decisions)
 from . import taint, verify  # noqa: E402,F401  (Phase 3: taint tracking, the verification gate)
+from . import embeddings  # noqa: E402  (Phase 3: the duplicate check in remember)
 for _name, _t in REGISTRY.items():   # tools registered before BUILTIN_RISK existed in a module keep their tag
     _t.risk = _t.risk if _t.risk != "write" else BUILTIN_RISK.get(_name, "write")

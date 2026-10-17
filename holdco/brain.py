@@ -875,7 +875,8 @@ def add_lesson(ctx: Ctx, text: str) -> str:
 @tool("add_contact", "Save a person to the company's contact list (CRM). If the email is already saved, that "
       "contact is updated instead.",
       {"name": S("Full name"), "email": S("Email address"), "company": S("Their company"),
-       "role": S("Their job title"), "stage": S("lead, contacted, replied, customer or lost (default lead)"),
+       "role": S("Their job title"),
+       "stage": S("lead, contacted, replied, customer or lost (default lead)", enum=CONTACT_STAGES),
        "source": S("Where they came from: a URL, a form, a reply"),
        "consent": S("yes if they agreed to be contacted, otherwise no"), "notes": S("Anything useful")}, ())
 def add_contact(ctx: Ctx, name: str = "", email: str = "", company: str = "", role: str = "", stage: str = "",
@@ -898,7 +899,8 @@ def add_contact(ctx: Ctx, name: str = "", email: str = "", company: str = "", ro
 
 
 @tool("update_contact", "Update a saved contact: stage, last touch, consent, unsubscribed or notes.",
-      {"contact_id": I("Contact number"), "stage": S("lead, contacted, replied, customer or lost"),
+      {"contact_id": I("Contact number"),
+       "stage": S("lead, contacted, replied, customer or lost", enum=CONTACT_STAGES),
        "last_touch": S("Date of the last contact, YYYY-MM-DD or 'today'"), "consent": S("yes or no"),
        "unsubscribed": {"type": "boolean", "description": "true when they opted out (final)"},
        "notes": S("A note to add")}, ("contact_id",))
@@ -1005,7 +1007,8 @@ def set_goal(ctx: Ctx, title: str, metric: str, target: float, deadline: str, ow
 
 
 @tool("drop_goal", "Close an active goal as done or dropped. Its tasks keep their goal_id.",
-      {"goal_id": I("Goal number"), "status": S("done or dropped"), "note": S("Why, in one line")},
+      {"goal_id": I("Goal number"), "status": S("done or dropped", enum=("done", "dropped")),
+       "note": S("Why, in one line")},
       ("goal_id", "status"))
 def drop_goal(ctx: Ctx, goal_id: int, status: str, note: str = "") -> str:
     cid = ctx.company["id"]
@@ -1094,7 +1097,7 @@ def start_experiment(ctx: Ctx, goal_id: int, hypothesis: str, metric: str = "", 
 
 @tool("conclude_experiment", "Judge an experiment: what happened, and the verdict won, lost or inconclusive.",
       {"experiment_id": I("Experiment number"), "result": S("What happened, with the numbers and their source"),
-       "verdict": S("won, lost or inconclusive")}, ("experiment_id", "result", "verdict"))
+       "verdict": S("won, lost or inconclusive", enum=VERDICTS[1:])}, ("experiment_id", "result", "verdict"))
 def conclude_experiment(ctx: Ctx, experiment_id: int, result: str, verdict: str) -> str:
     cid = ctx.company["id"]
     e = db.one("SELECT * FROM experiments WHERE id=? AND company_id=?", (experiment_id, cid))

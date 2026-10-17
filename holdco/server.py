@@ -83,11 +83,37 @@ def api_state(h, m, body):
     }
 
 
+CONTEXT_RUNS = 50      # Phase 3: Settings' context use covers this many of the latest finished runs
+CONTEXT_WARN = 0.85    # ... and warns when their p95 prompt is above this share of num_ctx
+
+
+def _percentile(values: list[int], pct: int) -> int:
+    """Nearest-rank percentile of sorted values (0 for none)."""
+    if not values:
+        return 0
+    rank = -(-pct * len(values) // 100)   # ceil(pct% of n), in whole numbers
+    return values[max(1, rank) - 1]
+
+
+def context_use(settings: dict | None = None) -> dict:
+    """How full the model's context got (design section 9): p50 and p95 of runs.max_prompt_tokens over the latest
+    finished runs that reported one, the context size, and warn when p95 is above 85% of it."""
+    s = settings or db.get_settings()
+    num_ctx = int(s.get("num_ctx") or 32768)
+    values = sorted(int(r["max_prompt_tokens"]) for r in db.q(
+        "SELECT max_prompt_tokens FROM runs WHERE COALESCE(finished_at, '') != '' AND max_prompt_tokens > 0 "
+        "ORDER BY id DESC LIMIT ?", (CONTEXT_RUNS,)))
+    p95 = _percentile(values, 95)
+    return {"n": len(values), "p50": _percentile(values, 50), "p95": p95, "num_ctx": num_ctx,
+            "warn": bool(values) and p95 > CONTEXT_WARN * num_ctx}
+
+
 @route("GET", "/api/settings")
 def api_settings(h, m, body):
-    s = _masked(db.get_settings(), config.SECRET_SETTINGS)
+    raw = db.get_settings()
+    s = _masked(raw, config.SECRET_SETTINGS)
     return {"settings": s, "policy_actions": config.POLICY_ACTIONS, "locked": sorted(config.LOCKED_POLICIES),
-            "data_dir": str(config.DATA_DIR)}
+            "data_dir": str(config.DATA_DIR), "context_use": context_use(raw)}
 
 
 @route("PUT", "/api/settings")
@@ -419,7 +445,8 @@ def api_runs(h, m, body):
     qs = h.query
     agent_id = _int(qs.get("agent_id", [0])[0])
     sql = ("SELECT r.id, r.agent_id, r.task_id, r.kind, r.status, r.summary, r.tokens, r.steps, r.started_at, "
-           "r.finished_at, a.name AS agent_name FROM runs r LEFT JOIN agents a ON a.id=r.agent_id WHERE r.company_id=?")
+           "r.finished_at, r.max_prompt_tokens, a.name AS agent_name FROM runs r LEFT JOIN agents a "
+           "ON a.id=r.agent_id WHERE r.company_id=?")
     params: list = [c["id"]]
     if agent_id:
         sql += " AND r.agent_id=?"
