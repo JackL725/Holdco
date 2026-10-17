@@ -302,8 +302,12 @@ def _bare_name(name: str, tool_names: set[str]) -> str:
     """gpt-oss sometimes names a tool with its harmony namespace, "functions.create_task"; drop the prefix when the
     rest is a tool of this session."""
     name = (name or "").strip()
-    if name not in tool_names and name.startswith("functions.") and name[len("functions."):] in tool_names:
-        return name[len("functions."):]
+    if name not in tool_names and "." in name:
+        # Phase 3 bench gate: also "server.create_task" (a prompt-based call in a real run). Only these made-up
+        # namespaces: "browser.search" is gpt-oss's built-in search, which tools.ALIASES maps to web_search.
+        space, _, rest = name.partition(".")
+        if space in NAMESPACES + ("server", "default_api", "api", "assistant") and rest in tool_names:
+            return rest
     return name
 
 
@@ -319,13 +323,27 @@ def unwrap_call(name: str, args: dict, tool_names: set[str]) -> tuple[str, dict]
         inner = _parse_args(inner)
         if inner_name == name and inner:
             return name, inner
+        # A name that is no tool of this session, the call inside: functions({"name": "start_experiment",
+        # "arguments": {...}}) opened both real-model planning cycles of the Phase 3 bench gate, and a prompt-based
+        # run sent container.exec({"tool": "list_tasks", "args": {}}) three times.
+        if name not in tool_names and inner_name in tool_names and inner_name != name:
+            return inner_name, inner
     return name, args
 
 
-def _text_tool_call(text: str, tool_names: set[str]) -> ToolCall | None:
+NAMESPACES = ("functions", "function", "tools", "tool", "call")
+
+
+def _text_tool_call(text: str, tool_names: set[str], tools: list[dict] | None = None) -> ToolCall | None:
     obj = extract_json(text)
     if not isinstance(obj, dict):
         return None
+    return _object_call(obj, tool_names, tools)
+
+
+def _object_call(obj: dict, tool_names: set[str], tools: list[dict] | None = None) -> ToolCall | None:
+    """One tool call written as a JSON object: {"tool": name, "args": {...}} (or name/arguments, function/parameters),
+    {"<tool name>": {...}}, or only a tool's arguments (_bare_args_call)."""
     name = obj.get("tool") or obj.get("name") or obj.get("function")
     args = obj.get("args", obj.get("arguments", obj.get("parameters", {})))
     if isinstance(args, str):
@@ -334,7 +352,85 @@ def _text_tool_call(text: str, tool_names: set[str]) -> ToolCall | None:
         name = _bare_name(name, tool_names)
     if isinstance(name, str) and name in tool_names and isinstance(args, dict):
         return ToolCall(name=name, arguments=args)
-    return None
+    if len(obj) == 1:
+        # {"create_task": {"title": ...}}: the shape a real cycle wrote its five planned tasks in, as text.
+        key, value = next(iter(obj.items()))
+        key = _bare_name(str(key), tool_names)
+        if key in tool_names and isinstance(value, dict):
+            return ToolCall(name=key, arguments=value)
+    return _bare_args_call(obj, tools or [])
+
+
+def _json_objects(text: str) -> list:
+    """Every top-level JSON object in text, in order (a reply can hold several calls one after another)."""
+    out, i, text = [], 0, text or ""
+    while True:
+        start = text.find("{", i)
+        if start == -1:
+            return out
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            return out
+        try:
+            out.append(json.loads(text[start:end + 1]))
+            i = end + 1
+        except ValueError:
+            i = start + 1
+
+
+def text_tool_calls(text: str, tool_names: set[str], tools: list[dict] | None = None) -> list[ToolCall]:
+    """The tool calls a reply wrote as text instead of making them, at most four (agents.run runs four per step).
+    Each JSON object in the text that reads as a call counts; a call with no arguments to a tool that requires
+    some is left out (a real run followed its call with an empty copy of it). Falls back to the first JSON value,
+    fenced or not (extract_json), as before."""
+    calls = []
+    specs = {t.get("name"): t for t in tools or []}
+    for obj in _json_objects(text):
+        if not isinstance(obj, dict):
+            continue
+        tc = _object_call(obj, tool_names, tools)
+        required = ((specs.get(tc.name) or {}).get("parameters") or {}).get("required") if tc else None
+        if tc and (tc.arguments or not required):
+            calls.append(tc)
+    if not calls:
+        tc = _text_tool_call(text, tool_names, tools)
+        calls = [tc] if tc else []
+    return calls[:4]
+
+
+def _bare_args_call(obj: dict, tools: list[dict]) -> ToolCall | None:
+    """A reply whose text is only a tool's arguments, with no tool named: gpt-oss sometimes writes its call into the
+    message text instead of making it ({"summary": "...", "status": "partial", "deliverable": "..."} at the end of a
+    real founding stage, which then ran out of steps). It counts as that tool's call when exactly one tool on the
+    belt declares every key and the object holds all of that tool's required arguments; anything else stays text."""
+    keys = {k for k in obj if isinstance(k, str)}
+    if not keys or len(keys) != len(obj):
+        return None
+    fits = []
+    for t in tools:
+        params = t.get("parameters") or {}
+        props, required = set(params.get("properties") or {}), set(params.get("required") or [])
+        if t.get("name") and keys <= props and required <= keys:
+            fits.append(t["name"])
+    return ToolCall(name=fits[0], arguments=dict(obj)) if len(fits) == 1 else None
 
 
 def _parse_args(raw) -> dict:
@@ -526,9 +622,9 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
         calls = [ToolCall(*unwrap_call(c.name, c.arguments, names), id=c.id) for c in calls]
     if tools and not calls:
         # In json mode finish is always allowed (tool_call_schema), even for a run whose belt lacks it (chat).
-        tc = _text_tool_call(content, (names | {"finish"}) if json_mode else names)
-        if tc:
-            calls = [tc]
+        found = text_tool_calls(content, (names | {"finish"}) if json_mode else names, tools)
+        if found:
+            calls = [ToolCall(c.name, c.arguments, id=f"call_{i}") for i, c in enumerate(found)]
             content = ""
     # Unknown tool names are kept so the agent gets a helpful error instead of silence.
     calls = calls if tools else []

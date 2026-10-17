@@ -773,10 +773,14 @@ class TestFindTool(Base):
                                                 "with a price"])
         self.assertEqual([t["name"] for t in ctx.loaded_tools].count("testapi__publish_widget"), 1)
         self.assertEqual(len(ctx.loaded_tools), len({t["name"] for t in ctx.loaded_tools}))
-        # No match names what is connected.
+        # No match names what is connected, and what it offers (Phase 3 bench gate), so the next search can hit it.
         out = connectors.find_tool(ctx, "zebra stripes")
-        self.assertEqual(out, "No connected tool matches 'zebra stripes'. Connected services: testapi (test mode), "
-                              "testmcp.")
+        first, offer = out.splitlines()
+        self.assertEqual(first, "No connected tool matches 'zebra stripes'. Connected services: testapi (test mode), "
+                                "testmcp.")
+        self.assertTrue(offer.startswith("What they offer: "), offer)
+        self.assertIn("testapi__list_widgets (List the widgets in the shop)", offer)
+        self.assertTrue(offer.endswith(". Search again with words from these."), offer)
         lonely = make_company("LonelyCo")
         call("POST", "/api/connectors", {"id": self.mcp_id, "enabled": False})
         self.assertEqual(connectors.find_tool(ctx_for(lonely, "marketing"), "widget"),

@@ -962,7 +962,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(row["pass_rate"], 1.0)
         self.assertEqual(sorted(r["name"] for r in row["results"]), sorted(only))   # in the scenarios' own order
         self.assertTrue(all(r["passed"] for r in row["results"]), row["results"])
-        self.assertEqual(self.api.get(f"/api/bench/results/{run_id}")["results"], row["results"])
+        # One run's page has every scenario's trace; the list leaves the traces out and is otherwise the same.
+        one = self.api.get(f"/api/bench/results/{run_id}")["results"]
+        self.assertTrue(all(r["trace"] for r in one), one)
+        self.assertEqual([{k: v for k, v in r.items() if k != "trace"} for r in one], row["results"])
         self.api.get("/api/bench/results/999999", expect=404)
         # Nothing of the bench stays behind, and the owner's companies are untouched.
         self.assertEqual(self.sql("SELECT id FROM companies WHERE status='bench' OR name LIKE 'Bench: %'"), [])

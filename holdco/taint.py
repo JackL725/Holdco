@@ -165,6 +165,8 @@ def _sources(ctx, name: str, args: dict, result: str) -> list[str]:
         path = str(args.get("path") or "").strip()
         if path.lower().startswith(PAGE_PREFIX):
             return [host(path[len(PAGE_PREFIX):]) or "a web page"]
+        if re.match(r"^https?://", path, re.I):   # read_file opens a saved page by its bare address too
+            return [host(path) or "a web page"]
         return []
     if name == "search":      # hits in inbound mail and fetched pages quote outside text
         return ([f"inbox email #{n}" for n in _inbound(ctx, _SEARCH_EMAIL.findall(result))]

@@ -1774,6 +1774,25 @@ function Bench(arg) {
   };
 
   // ---- one run: the four scores, notes, and every scenario with its failed assertions
+  // The trace (runner.trace): each tool call with its arguments and result cut short, plain replies, how each run
+  // ended, and a note where the middle of a long session was left out. Folded; every value is escaped.
+  const traceItem = (e) => {
+    if (!e || typeof e !== 'object') return '';
+    const n = isNum(e.step) ? `<span class="faint">${esc(e.step)}.</span> ` : '';
+    if (e.note) return `<li class="faint">${esc(e.note)}</li>`;
+    if (e.run) return `<li><b>The ${esc(e.run)} run ended ${esc(e.status || '')}</b>${isNum(e.steps) ? ` <span class="faint">after ${plural(Number(e.steps) || 0, 'step')}</span>` : ''}${e.summary ? `<div class="muted">${esc(e.summary)}</div>` : ''}</li>`;
+    if (e.tool) {
+      const bad = /^ERROR/.test(String(e.result || ''));
+      return `<li>${n}<code>${esc(e.tool)}</code> <span class="muted">${esc(e.args || '')}</span>${e.result ? `<div class="${bad ? 'warn-text' : 'muted'}">→ ${esc(e.result)}</div>` : ''}</li>`;
+    }
+    return `<li>${n}<i>Replied without a tool:</i> <span class="muted">${esc(e.text || '')}</span></li>`;
+  };
+  const traceFold = (s) => {
+    const t = Array.isArray(s.trace) ? s.trace : [];
+    if (!t.length) return '';
+    return `<details class="fold" style="margin-top:6px"><summary class="small">What the model did</summary>
+      <ol class="bench-fails small" style="list-style:none;padding-left:0;margin-top:6px;max-height:420px;overflow:auto">${t.map(traceItem).join('')}</ol></details>`;
+  };
   const scenarioRow = (s) => {
     const failed = Array.isArray(s.failed) ? s.failed : [];
     const what = [...failed.map((f) => `<li><code>${esc(f.assertion)}</code>${f.detail ? `<div class="small muted">${esc(f.detail)}</div>` : ''}</li>`),
@@ -1783,7 +1802,7 @@ function Bench(arg) {
       ${td('Result', s.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>')}
       ${td('Steps', `<span class="num">${fmtCount(s.steps)}</span>`)}
       ${td('Seconds', `<span class="num">${isNum(s.seconds) ? esc(Number(s.seconds).toFixed(1)) : 'n/a'}</span>`)}
-      ${td('What failed', what.length ? `<ul class="bench-fails">${what.join('')}</ul>` : '<span class="faint">nothing</span>')}</tr>`;
+      ${td('What failed', (what.length ? `<ul class="bench-fails">${what.join('')}</ul>` : '<span class="faint">nothing</span>') + traceFold(s))}</tr>`;
   };
   const drawRun = () => {
     const r = row;

@@ -655,6 +655,28 @@ def catalog(company, agent=None) -> list[dict]:
 
 # ---------------------------------------------------------------- find_tool
 
+# Holdco's own outward tools and the words that ask for them. An agent that looks for "X social posting" with
+# find_tool, finds no connected service and has social_post on its list is told so: the real-model bench run gave up
+# on a post here and finished blocked.
+OWN_TOOL_WORDS = {
+    "social_post": ("social", "post", "posting", "tweet", "twitter", "linkedin", "reddit", "instagram", "facebook",
+                    "threads", "bluesky", "mastodon"),
+    "send_email": ("email", "mail", "e-mail", "reply", "newsletter", "inbox"),
+    "deploy_site": ("deploy", "hosting", "host", "website", "publish site"),
+    "browser_check": ("browser", "screenshot", "render"),
+    "request_purchase": ("buy", "purchase", "domain", "ads budget"),
+}
+
+
+def _own_tools_for(ctx: tools.Ctx, words: list[str]) -> list[str]:
+    """The tools on this agent's own list that do what a find_tool query asks for (OWN_TOOL_WORDS)."""
+    allowed = getattr(ctx, "allowed", None) or set()
+    text = " " + " ".join(words) + " "
+    return [name for name, keys in OWN_TOOL_WORDS.items()
+            if name in allowed and any(f" {k} " in text or (" " not in k and f" {k}" in text and len(k) > 4)
+                                       for k in keys)]
+
+
 @tools.tool("find_tool", "Find a tool in the services the owner connected (payments, email, browser, social posting) "
             "and load it for this session. Describe the job in a few words; the best matches are loaded and you can "
             "call them on your next step.",
@@ -676,6 +698,17 @@ def find_tool(ctx: tools.Ctx, query: str) -> str:
     extra = [f"Could not list tools from {p}." for p in problems]
     if not matches:
         services = ", ".join(_service_names(ctx.company)) or "none"
+        offered = [e for e in entries if e["allowed"]]
+        if offered:
+            # Phase 3 bench gate: "calculator" and "math" found nothing in a service whose tool "adds two numbers",
+            # and the agent asked the owner to connect a calculator. What is there, so the next search can hit it.
+            extra.append("What they offer: " + "; ".join(f"{e['name']} ({_one_line(e['description'], 60)})"
+                                                         for e in offered[:FIND_SHOWN * 2])
+                         + ". Search again with words from these.")
+        own = _own_tools_for(ctx, words)
+        if own:
+            extra.append(f"Your own tools already do this: {', '.join(own)}. Call {'it' if len(own) == 1 else 'them'} "
+                         f"directly; what leaves the company may wait for the owner's approval.")
         return "\n".join([f"No connected tool matches '{query}'. Connected services: {services}."] + extra)
     loaded = [e for e in matches if e["allowed"]][:FIND_LOADED]
     for e in loaded:

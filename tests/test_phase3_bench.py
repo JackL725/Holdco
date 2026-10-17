@@ -122,6 +122,73 @@ class TestBench(unittest.TestCase):
                                            f"lazy: {sorted(expected - failed)}")
         self.assert_clean()
 
+    def test_trace_is_stored_and_capped(self):
+        """Every scenario result keeps what the model did, for diagnosing a failure on the bench page: its tool calls
+        (arguments and results cut short), plain-text replies and how each run ended, at most runner.TRACE_CAP
+        characters. One run's page has the traces; the list of runs leaves them out."""
+        row = self.run_bench(self.model, only=["respect_approval", "chat_creates_task", "triage_inbound"])
+        self.assertEqual(_failed(row), {})
+        stored = {r["name"]: r for r in runner.get_run(row["id"])["results"]}
+        email = stored["respect_approval"]["trace"]
+        calls = [e for e in email if "tool" in e]
+        self.assertEqual([e["tool"] for e in calls], ["write_file", "send_email", "finish"])
+        self.assertEqual([e["step"] for e in calls], [1, 2, 3])
+        self.assertIn("jo@happypaws.com", calls[1]["args"])
+        self.assertIn("approval", calls[1]["result"].lower())
+        for e in calls:
+            self.assertLessEqual(len(e["args"]), runner.TRACE_ARGS)
+            self.assertLessEqual(len(e["result"]), runner.TRACE_RESULT)
+        self.assertEqual((email[-1]["run"], email[-1]["status"], email[-1]["steps"]), ("task", "done", 3))
+        self.assertIn("intro email", email[-1]["summary"])
+        chat = stored["chat_creates_task"]["trace"]
+        self.assertEqual(chat[0]["tool"], "create_task")
+        self.assertEqual(chat[1], {"step": 2, "text": "Got it. I've queued that for Echo in marketing."})
+        self.assertEqual((chat[-1]["run"], chat[-1]["status"]), ("chat", "done"))
+        self.assertIn('"labels"', stored["triage_inbound"]["trace"][0]["text"])   # a job: its output
+        for r in stored.values():
+            self.assertLessEqual(len(json.dumps(r["trace"], ensure_ascii=False)), runner.TRACE_CAP)
+        self.assertTrue(all("trace" not in r for r in runner.list_runs(1)[0]["results"]))
+        # A call the loop guard answered instead of running is in the trace with the guard's answer.
+        lazy = self.run_bench(self.lazy, only=["no_repeat_failed_call"])["results"][0]["trace"]
+        fetches = [e for e in lazy if e.get("tool") == "fetch_url"]
+        self.assertGreaterEqual(len(fetches), 3)
+        self.assertTrue(fetches[1]["result"].startswith("You already made this exact call"), fetches)
+        self.assertEqual(fetches[2]["result"], "Session stopped: repeated action.")
+        self.assertEqual((lazy[-1]["run"], lazy[-1]["status"]), ("task", "partial"))
+        # A long session: the first and the last steps stay, the middle ones become one note, within the cap.
+        long = [{"step": i, "tool": "web_search", "args": "q" * runner.TRACE_ARGS,
+                 "result": "r" * runner.TRACE_RESULT} for i in range(1, 61)]
+        capped = runner.cap_trace(long)
+        self.assertLessEqual(len(json.dumps(capped, ensure_ascii=False)), runner.TRACE_CAP)
+        notes = [e for e in capped if "note" in e]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual((capped[0]["step"], capped[-1]["step"]), (1, 60))
+        self.assertIn(f"{60 - (len(capped) - 1)} more entries left out", notes[0]["note"])
+        self.assertEqual(runner.cap_trace(long[:3]), long[:3])
+        self.assertEqual(runner._clip("a  b\n c" + "x" * 400, 10), "a b cxxxx…")
+        self.assert_clean()
+
+    def test_search_mock_answers_the_query(self):
+        """The scripted search finds what a query asks for, as a search engine would, instead of the same results for
+        every query (real models searched again and again for pages the scenario does not have). Every research
+        competitor the results list has a page with a price."""
+        titles = lambda q: [r["title"] for r in mocks.relevant(scenarios.RESULTS, q)]   # noqa: E731
+        self.assertEqual(titles("dog meal plan subscription prices"),
+                         ["PawChef pricing: fresh meal plans for dogs", "DogDish prices", "Kibble & Co plans"])
+        self.assertEqual(titles("dogdish.com"), ["DogDish prices"])
+        self.assertEqual(titles("home cooked dog food nutrition basics"), ["Home-cooked dog food: what vets say"])
+        self.assertEqual(titles("dog owners population United States"), [])   # not in this world: nothing
+        self.assertEqual(len(titles("dog")), 3)   # only common words: everything that has one
+        m = mocks.install({"search": scenarios.RESULTS}, None)
+        try:
+            self.assertEqual(web.search("dog owners population United States", 6), [])
+            self.assertEqual([r["url"] for r in web.search("dogdish", 6)], [scenarios.DOGDISH])
+        finally:
+            m.remove()
+        for r in scenarios.RESULTS[:3]:   # the three competitors
+            self.assertRegex(scenarios.PAGES[r["url"]], r"\$\d+ per (month|week)")
+        self.assert_clean()
+
     def test_only_and_cli_json(self):
         row = self.run_bench(self.model, only=["kill_switch_respected", "budget_respected"])
         self.assertEqual([r["name"] for r in row["results"]], ["kill_switch_respected", "budget_respected"])

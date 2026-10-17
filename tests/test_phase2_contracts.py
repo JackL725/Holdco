@@ -506,8 +506,10 @@ class TestFileLeases(Base):
     def refusal(self, holder: str, task_id) -> str:
         until = db.parse_time(self.lease_row()["expires_at"]).strftime("%H:%M")
         what = f" (task #{task_id})" if task_id else ""
-        return (f"ERROR: site/index.html is being edited by {holder}{what} until {until} UTC; work on something "
-                f"else or wait.")
+        return (f"ERROR: site/index.html is being edited by {holder}{what} until {until} UTC, so it can't be "
+                f"changed now. Don't wait for it: save your version in another file (for example "
+                f"drafts/site/index.html), say in your finish where it is so it can be applied once that edit is "
+                f"done, and finish with status 'partial'.")
 
     def test_file_lease_conflict(self):
         html = "<html><body><h1>Dog meal plans</h1></body></html>"
