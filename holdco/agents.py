@@ -12,6 +12,7 @@ import traceback
 from . import (brain, bus, config, connectors, contracts, db, decisions, doctor, llm, planning, playbooks,  # noqa: F401
                presets, rhythms, roles, tools, truth, vault, verify, watchdog, workspace)
 from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
+from .verify import summary_line as _gate_line   # _task_lines has a parameter named verify
 
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
@@ -229,7 +230,7 @@ def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: 
             chk = deliverable_status(company, t.get("deliverable", ""))
             if chk:
                 line += f" {chk}"
-            gate = verify.summary_line(t)   # Phase 3: what the verification gate found, from tool results
+            gate = _gate_line(t)   # Phase 3: what the verification gate found, from tool results
             if gate:
                 line += f" {gate}"
             if t["result"]:

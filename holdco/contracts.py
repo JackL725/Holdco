@@ -16,7 +16,7 @@ from . import bus, db
 
 CLOSED = ("done", "cancelled")                 # a dependency in one of these no longer holds anything up
 OPEN = ("todo", "in_progress", "blocked", "waiting")
-CHECK_TOOLS = ("browser_check", "audit_page", "review_text", "check_contrast", "fetch_url")
+CHECK_TOOLS = ("browser_check", "audit_page", "review_text", "check_contrast", "fetch_url", "run_tests")   # Phase 3
 DUE_DAYS = (1, 90)
 BUDGET_STEPS = (3, 60)
 PROPOSAL_LINE_CAP = 500   # characters of one brain proposal in the planning prompt (brain_lookup shows as much)
