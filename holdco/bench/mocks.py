@@ -1505,7 +1505,7 @@ def _record(m: Mocks) -> None:
         if not m.mine() or depth:   # llm.chat calls itself on a fallback: count the outer reply only
             return orig_chat(messages, tools, model, settings, *args, **kwargs)
         m._depth.n = depth + 1
-        t0 = time.monotonic()
+        t0 = time.perf_counter()   # high resolution: Windows' monotonic clock ticks in ~16 ms
         try:
             reply = orig_chat(messages, tools, model, settings, *args, **kwargs)
         finally:
@@ -1518,7 +1518,7 @@ def _record(m: Mocks) -> None:
         if agent:
             m.agent_replies += 1
         m.replies.append({"kind": m.kind if agent else "job", "step": m.agent_replies if agent else 0,
-                          "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
+                          "seconds": time.perf_counter() - t0, "tokens": int(reply.tokens or 0),
                           "eval_count": int(reply.eval_count or 0), "eval_seconds": float(reply.eval_seconds or 0.0),
                           "calls": len(reply.tool_calls or []), "mode": reply.mode})
         # For the scenario's trace: what a reply said, for the replies a run's transcript does not keep (a chat's

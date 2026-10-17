@@ -342,7 +342,10 @@ class TestDoctorRules(DoctorBase):
         from holdco import context
         c = make_company("IndexRowCo")
         context.reindex(c)
-        r = doctor._check_index()
+        real = context.index_status()   # this company only: other tests' companies may be mid-index in the background
+        mine = {**real, "companies": [x for x in real["companies"] if x["id"] == c["id"]]}
+        with patch.object(context, "index_status", return_value=mine):
+            r = doctor._check_index()
         self.assertEqual((r["key"], r["label"], r["status"], r["fix"]), ("search_index", "Search index", "ok", None))
         self.assertIn("Full-text index:", r["detail"])
         self.assertIn("last indexed", r["detail"])
@@ -401,7 +404,7 @@ class TestDoctorRules(DoctorBase):
         try:
             r = doctor.api_index_rebuild(Stub(), None, {})
             self.assertTrue(r["ok"])
-            deadline = time.time() + 20
+            deadline = time.time() + 90   # every active company of the whole suite is reindexed; Windows runners are slow
             while time.time() < deadline and doctor._reindexing.is_set():
                 time.sleep(0.05)
             self.assertFalse(doctor._reindexing.is_set())

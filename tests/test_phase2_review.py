@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from html.parser import HTMLParser
@@ -320,9 +321,12 @@ class TestDecisionRace(Base):
         real = db.get_company
         fired = []
 
+        me = threading.current_thread()
+
         def deadline_first(cid):
-            # The scheduler's deadline answers while the owner's answer is on its way.
-            if not fired:
+            # The scheduler's deadline answers while the owner's answer is on its way. Only on this thread: a records
+            # refresh in the background also reads the company, and firing there made the race land either way.
+            if not fired and threading.current_thread() is me:
                 fired.append(True)
                 actions.decide(aid, "approve", answer="Keep $9", decided_by="deadline")
             return real(cid)
