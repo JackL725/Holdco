@@ -1499,11 +1499,12 @@ def _record(m: Mocks) -> None:
             m._depth.n = depth
         # llm.Reply carries what the server measured: eval_count tokens generated in eval_seconds (Ollama). The OpenAI
         # API reports no generation time (eval_seconds 0), so the runner falls back to tokens over this wall time.
-        # text is for the scenario's trace: a reply the run's transcript does not keep (a chat's final answer).
         m.replies.append({"kind": m.kind, "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
                           "eval_count": int(reply.eval_count or 0), "eval_seconds": float(reply.eval_seconds or 0.0),
-                          "calls": len(reply.tool_calls or []), "mode": reply.mode,
-                          "text": str(reply.content or "")[:2000]})
+                          "calls": len(reply.tool_calls or []), "mode": reply.mode})
+        # For the scenario's trace: what a reply said, for the replies a run's transcript does not keep (a chat's
+        # final answer).
+        m.replies[-1]["text"] = str(reply.content or "")[:2000]
         return reply
 
     def execute(ctx, name, args):
