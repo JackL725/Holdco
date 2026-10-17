@@ -392,16 +392,14 @@ python -m unittest discover -s tests -t . -v
 ```
 
 No GPU, model or network needed: `tests/fake_ollama.py` is a scripted stand-in for Ollama (and the
-OpenAI-compatible API), `tests/fake_telegram.py` for the Telegram Bot API and ntfy, and fakes for Stripe, Resend,
-Buffer, an MCP server (stdio and HTTP, both protocol generations) and an OAuth server, so the whole app runs end
-to end, including an agent creating a Stripe payment link and the revenue arriving by itself. The suite has about
-630 tests: unit suites for the quality checks, the model client, preset integrity,
-file and network safety, tools and approvals, and each Phase 0 module (Doctor, search chain, watchdog and working
-notes, Telegram and ntfy) and each Phase 0.5 module (facts and claims, context and search, planning and
-staged founding), a replay of the first real run's failures through the real agent loop; and a full run of the real server: founding from a template, the 24/7 scheduler,
-approvals, chat, QA review with the deliverable check, recurring duties, restart recovery, the prompt-based tool
-fallback, the OpenAI-compatible backend, pausing and deletion, the founding preflight, the kill switch, phone
-notifications and the audit log. GitHub Actions runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
+OpenAI-compatible API), and `holdco/bench/mocks.py` holds the stand-ins for Telegram, Stripe, an MCP server (stdio
+and HTTP, both protocol generations) and web search that the tests and the Bench share, next to fakes for Resend,
+Buffer and an OAuth server. The suite has about 860 tests: unit suites for each module of every phase, replays of
+what real models did in real runs (founding, briefs, the Bench gate), and a full run of the real server from
+founding to the autopilot, approvals, the kill switch, phone notifications, connected services, the brain and its
+rhythms, the verification gate, taint and the trust ladder. Holdco Bench runs in the suite twice: the scripted model
+must pass all 33 scenarios, and a deliberately lazy one must fail exactly the scenarios it should, which proves
+the checks can fail. GitHub Actions runs it on Windows and Linux for Python 3.10, 3.12 and 3.13 on every push.
 
 To click around the dashboard without a GPU, run `python tests/fake_ollama.py 11999`, start Holdco, and set the
 server address in Settings to `http://127.0.0.1:11999`.
