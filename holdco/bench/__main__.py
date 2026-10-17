@@ -28,6 +28,13 @@ def main(argv=None) -> int:
     ap.add_argument("--backend", choices=("ollama", "openai"), help="model server API (default: the setting)")
     a = ap.parse_args(argv)
 
+    if "HOLDCO_PORT" not in os.environ:
+        # No server runs in this process, so preview links (browser_check, the web-page gate) must not reach a
+        # Holdco that is running on this PC on the default port: give the bench a free port of its own.
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            os.environ["HOLDCO_PORT"] = str(s.getsockname()[1])
     temp = None
     if a.data:
         os.environ["HOLDCO_DATA"] = os.path.abspath(a.data)
