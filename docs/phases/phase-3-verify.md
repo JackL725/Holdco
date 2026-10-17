@@ -562,6 +562,10 @@ Scores (`python -m holdco.bench --model gpt-oss:20b`, the same data folder for e
 |---|---|---|---|---|
 | First run (Phase 3 as merged) | 17 of 33 (52%) | 92% | 198 | 10.3 |
 | After the fixes, three full runs | 26, 25, 29 of 33 | 96%, 97%, 98% | 198 to 199 | 9.9 to 10.5 |
+| Huihui-Qwen3.8-27B Q6_K_L, final code, not tuned | 24 of 33 (73%) | 100% | 48 | 7.7 |
+
+The Qwen row is one run on the same final code, for comparison only: at 48 tokens per second four scenarios hit
+their time limit (a 300 s task, a 900 s founding), which the limits allow for hung runs, not for a slower model.
 
 The final run (29 of 33) is on the final code; the two before it lacked the last fixes. What stays failing is the
 model: it plans the order but never sets `depends_on`, finishes complete work as `partial`, researches when it
