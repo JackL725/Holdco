@@ -671,21 +671,13 @@ def _a_brain_row(state, section, where=None):
     return bool(hits), f"{len(hits)} matching row(s) in {table}"
 
 
-# Dates and times inside the data's strings are when, not how much: their parts never back a number in a brief. The
-# lazy model's invented "37%" passed whenever a timestamp in the data held a 37 (a minute or a second).
-_WHEN = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?|"
-                   r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
-
-
 def _numbers(x, out: set) -> set:
-    """Every number in a brief's data: values, and the numbers written inside its strings and names (dates and
-    times left out)."""
+    """Every number in a brief's data: values, and the numbers written inside its strings and names."""
     if isinstance(x, bool) or x is None:
         return out
     if isinstance(x, (int, float)):
         out.add(abs(float(x)))
     elif isinstance(x, str):
-        x = _WHEN.sub(" ", x)
         out.update(abs(float(n.replace(",", ""))) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", x)
                    if n.replace(",", "").replace(".", "", 1).isdigit())
     elif isinstance(x, dict):
