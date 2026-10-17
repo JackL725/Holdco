@@ -189,6 +189,14 @@ class TestBench(unittest.TestCase):
             self.assertRegex(scenarios.PAGES[r["url"]], r"\$\d+ per (month|week)")
         self.assert_clean()
 
+    def test_numbers_from_data_ignore_dates_and_times(self):
+        """A timestamp in a brief's data never backs a number in its body: the lazy model's invented "37%" passed
+        whenever the data held a 37 as a minute or a second."""
+        data = {"metrics": [{"name": "waitlist_signups", "value": 57, "at": "2026-10-17T08:37:12Z"}],
+                "window": "since 2026-10-16 18:37", "deadline": "2026-12-01"}
+        self.assertEqual(runner._numbers(data, set()), {57.0})
+        self.assertEqual(runner._numbers({"name": "stripe.revenue_usd_30d"}, set()), {30.0})   # names still count
+
     def test_only_and_cli_json(self):
         row = self.run_bench(self.model, only=["kill_switch_respected", "budget_respected"])
         self.assertEqual([r["name"] for r in row["results"]], ["kill_switch_respected", "budget_respected"])
