@@ -15,8 +15,9 @@ Phase 1 (`mcp.py`, `connectors.py`, `vault.py`, `oauth.py`, risk tags), Phase 2 
 where the new modules sit and [testing.md](../testing.md) for the fakes.
 
 Decided at the start of the build, from what Phases 1 to 3 built:
-- Connector modules register through `connectors.MODULES`; the later tier lives in `conn_later.py`. Fakes follow
-  Phase 3's rule: new fake services go in `holdco/bench/mocks.py` and `tests/fake_*.py` re-export them.
+- Connector modules register through `connectors.MODULES`; the later tier lives in `conn_later.py`. The new fakes
+  are `tests/fake_*.py` servers as listed under Files (the Bench does not use these services, so they stay out of
+  `holdco/bench/mocks.py`).
 - `deploy_site` asks `conn_cloudflare.deploy_if_selected(company)` first and falls back to Netlify.
 - The scheduler's Phase 3 class order is kept: `portfolio.order(queue)` reorders classes 3 to 6 by deficit.
 - The monthly review's decisions use Phase 2's `decisions.create` with `origin={"kind": "portfolio"}`, answered
