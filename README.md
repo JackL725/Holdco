@@ -92,6 +92,27 @@ No cloud AI, no API bills, no pip installs.
   ones wait for you. What you chose goes into the brain and comes back for review two weeks later.
 - **Budgets.** GPU hours per day, tool calls per task, posts per week and emails per day, per company, in its
   Settings tab. The Overview shows how much of today's GPU budget is used.
+- **Holdco Bench: scores for your model.** *Settings → Test this model* runs 33 scenarios of Holdco's own work
+  against stand-in services (found a company, fix a page that fails QA, write a compliant cold email, resist a
+  prompt injection, recover from a tool error, plan top down...) and shows the pass rate, how many tool calls were
+  valid, tokens per second and steps per scenario. Test two models and the *Model scores* page puts them side by
+  side, so you pick by score. Also from the command line: `python -m holdco.bench --model gpt-oss:20b`.
+- **Work is checked before it counts as done.** A page must pass a browser check (or a labelled static check when
+  the Playwright browser isn't connected), code must pass its tests, a payment link must exist in Stripe, research
+  may cite only pages the agent actually read, and every email must pass the outreach rules. A task that fails is
+  sent back once and otherwise ends partial; the CEO's review sees the results, not just the agent's word.
+- **Outside content can't steer your agents.** After an agent reads a web page, search results or an inbound email,
+  that text is marked as information, not instructions, and the agent's emails, posts and other outward actions
+  wait for you, whatever your approval settings say; the Inbox card says why.
+- **A trust ladder instead of on/off.** Approve 15 of the same kind of request without edits and Holdco asks
+  whether agents may do it on their own, up to a daily cap. An edit resets the count; a rejection steps it back.
+  Spending money, irreversible actions, legal wording and a first email to a new person always ask.
+- **Code runs in a sandbox** when Docker Desktop or Podman is installed: no network, capped memory and processes,
+  only the company's folder visible. Without one, the Doctor page says so and code requests say they run on this PC.
+- **Smarter use of the GPU.** Tool calls in prompt-based mode are shaped by a schema so they always parse, and a
+  wrong argument gets an exact repair message. An optional small model sorts inbound email, summarises old tool
+  results and spots duplicate memories. The owner's follow-ups and tasks due soon go first; low-value research
+  waits for the quiet hours. Settings shows how full the context window gets.
 - **Also built in:** company email over SMTP/IMAP (inbound mail becomes support tasks), website publishing
   (Netlify), and a posting webhook for X/LinkedIn/Discord via Zapier, Make or n8n.
 
@@ -194,6 +215,10 @@ Let two agents work at the same time by telling Ollama to serve parallel request
 With `gpt-oss:20b` and the default 32k context, two parallel agents fit with room to spare. If you try a
 bigger model and see slowdowns, run `ollama ps`: anything not 100% on GPU is spilling into system RAM,
 so lower *Agents working at once* or the context window.
+
+To choose between models, press **Test this model** in Settings for each one and compare them on the *Model
+scores* page. Settings also shows *Context use*: when the 95th percentile gets near the window, raise the context
+size or trim pinned context.
 
 ## Keeping companies running
 
@@ -308,8 +333,12 @@ Scheduler ── every few seconds ──► CEO planning cycle ──► task b
 
 - Agents' web access is limited to the public internet; requests to this PC or your home network are blocked.
 - Agent-built web pages are served sandboxed so they can't control the dashboard.
-- **Run code** really runs Python or shell commands on your PC (inside the company's folder, with a time
-  limit, but not in a sandbox). Leave it on *Ask me first* unless you're comfortable with that.
+- **Run code** runs inside a Docker or Podman container when one is installed (no network unless you tick *Allow
+  network* on the request, 1 GB of memory, one CPU, the company folder only). Without one it really runs Python or
+  shell commands on your PC (inside the company's folder, with a time limit); the Doctor page and the request card
+  say so. Leave it on *Ask me first* unless you're comfortable with that.
+- **Taint and trust.** Outward actions after an agent read outside content always ask you, and the trust ladder
+  (company Settings → Trust) can only let routine requests through up to their daily cap; locked actions never.
 - **Audit log** (Inbox page): every outbound action that ran, with who proposed it, who allowed it (you, or a
   *Let agents do it* policy), the exact payload and the result, failures included. Nothing in Holdco edits it.
 - **Kill switch.** One press (sidebar, or `/stop` from your phone) stops every agent and freezes outbound actions.
@@ -390,11 +419,12 @@ request. Each phase document under `docs/phases/` says what was built and how to
 3. **Phase 1: Connect** (built): an MCP client for both protocol generations, OAuth, a
    credential vault, risk tags on every tool, connector cards with health checks and metric pipes, `find_tool`,
    the first connectors (Stripe, Resend, a Playwright browser, Buffer, Brave) and `browser_check`.
-4. **Phase 2: Organize** (built in this pull request): the company brain with measured goals, top-down planning,
+4. **Phase 2: Organize** (built): the company brain with measured goals, top-down planning,
    task contracts with dependencies and file leases, daily and weekly rhythms with briefs built from real numbers,
    a decisions queue with deadlines, and budgets for GPU time, steps and posts.
-5. **Phase 3: Verify** (planned): Holdco Bench to score models on Holdco's own work, a browser QA gate,
-   structured tool calls, a code sandbox, taint tracking and a trust ladder for approvals.
+5. **Phase 3: Verify** (built in this pull request): Holdco Bench to score models on Holdco's own work, the
+   verification gate, structured tool calls with repair messages, a code sandbox, taint tracking, a trust ladder
+   for approvals, a small model for routine jobs, dispatch priorities and the context-use display.
 6. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
 
 ## Project layout
@@ -422,6 +452,12 @@ holdco/
   contracts.py      task contracts, the dependency graph, budgets (GPU hours, steps, tokens, posts)
   rhythms.py        morning plan, evening brief, weekly review and monthly check data; briefs; portfolio brief
   decisions.py      the decisions queue: options, a recommendation, deadlines and auto-resolution
+  bench/            Holdco Bench: scenarios, the runner, the stand-in services and the command line
+  verify.py         the verification gate by kind of work, outreach rules, the do-not-email list
+  sandbox.py        run_code in a Docker or Podman container
+  taint.py          outside content: fencing and the "this session read outside content" rule
+  trust.py          the trust ladder: levels, streaks, daily caps and promotion questions
+  embeddings.py     meaning-based duplicate check for memory
   vault.py          the credential vault (DPAPI, keyring, encrypted file) and redaction
   mcp.py, oauth.py  MCP client (stdio and Streamable HTTP, both protocol generations) and OAuth with PKCE
   connectors.py     connector cards, health checks, metric pipes, find_tool, risk-gated calls
