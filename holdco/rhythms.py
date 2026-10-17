@@ -21,7 +21,7 @@ import re
 import threading
 from collections import Counter
 
-from . import brain, bus, contracts, db, notify, roles
+from . import brain, bus, contracts, db, llm, notify, roles
 from .routing import HTTPError, company_or_404, route, to_int
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401
 
@@ -590,7 +590,7 @@ def _data_for(ctx: Ctx, kind: str) -> tuple[dict, str]:
 
 @tool("write_brief", "Store this run's brief (daily, weekly or monthly). Use only numbers from the data block in your "
       "task; the brief is sent to the owner's phone and pinned on the dashboard.",
-      {"kind": S("daily, weekly or monthly"), "body": S("The brief in Markdown, under 350 words")},
+      {"kind": S("daily, weekly or monthly", enum=BRIEF_KINDS), "body": S("The brief in Markdown, under 350 words")},
       ("kind", "body"), risk="write")
 def write_brief(ctx: Ctx, kind: str, body: str) -> str:
     kind = (kind or "").strip().lower()
@@ -711,10 +711,30 @@ def _move(m: dict) -> float:
     return abs(m["delta_24h"]) / abs(before) if before else float("inf")
 
 
+NARRATIVE_SYSTEM = ("You write the opening paragraph of the owner's daily portfolio brief from the JSON you are given: "
+                    "two or three plain sentences on what moved, what shipped and what needs the owner. Use only facts "
+                    "and numbers that are in the JSON; never add a number. No heading, no list.")
+
+
+def portfolio_narrative(data: dict, settings: dict | None = None) -> str:
+    """The portfolio brief's narrative paragraph ('summary' job, Phase 3). Raises LLMError when the model cannot be
+    asked, and ValueError when the paragraph states a number the data does not hold (the brief is then sent
+    without it)."""
+    out = llm.strip_thinking(llm.run_job("summary", json.dumps(data, ensure_ascii=False, default=str)[:8000],
+                                         NARRATIVE_SYSTEM, settings))
+    text = " ".join(out.split())[:1200]
+    if not text:
+        raise llm.LLMError("the narrative came back empty")
+    unknown = unsupported_numbers(text, data)
+    if unknown:
+        raise ValueError(f"the narrative states numbers the data does not hold: {', '.join(unknown[:5])}")
+    return text
+
+
 def portfolio_brief(companies: list[dict] | None = None) -> int:
-    """Build the portfolio brief in code (no model): per company the goal lines, the top 3 metric moves, shipped,
-    stuck and decisions needed; then the decisions waiting for the owner. Stored with company_id NULL and sent to
-    the phone."""
+    """Build the portfolio brief in code: per company the goal lines, the top 3 metric moves, shipped, stuck and
+    decisions needed; then the decisions waiting for the owner. Stored with company_id NULL and sent to the phone.
+    Phase 3: with a small model set, its narrative paragraph (numbers from the data only) opens the brief."""
     companies = _active_companies() if companies is None else companies
     lines, entries, waiting = [], [], 0
     for c in companies:
@@ -734,8 +754,14 @@ def portfolio_brief(companies: list[dict] | None = None) -> int:
         lines.append(f"- Shipped {len(d['shipped'])}, stuck {stuck}, decisions needed {needed}")
         lines.append("")
     lines.append(f"Decisions waiting for you: {waiting}")
-    body = "\n".join(lines)
     data = {"companies": entries, "decisions_waiting": waiting}
+    narrative = ""
+    if llm.small_model():   # Phase 3: the small model writes the opening paragraph from the same data
+        try:
+            narrative = portfolio_narrative(data)
+        except Exception as e:   # LLMError, a number the data does not hold, or anything else: no paragraph
+            print(f"[rhythms] portfolio narrative skipped: {e}")
+    body = "\n".join(([narrative, ""] if narrative else []) + lines)
     bid = db.run("INSERT INTO briefs(company_id, kind, body, data, created_at) VALUES(?,?,?,?,?)",
                  (None, "daily", body, json.dumps(data, ensure_ascii=False, default=str), db.now()))
     bus.emit(None, "brief", f"portfolio brief for {len(companies)} compan{'y' if len(companies) == 1 else 'ies'}",

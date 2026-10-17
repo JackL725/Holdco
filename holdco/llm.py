@@ -11,6 +11,7 @@ import http.client
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from . import db
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _json_mode_models: set[str] = set()   # models that rejected native tool calling
 _no_think_models: set[str] = set()    # models (or Ollama versions) that rejected the think parameter
+_no_schema_servers: set[str] = set()  # servers that rejected the JSON shape of a prompt-based call (older Ollama)
 
 _bg_lock = threading.Lock()
 _bg_sem: threading.BoundedSemaphore | None = None
@@ -46,6 +48,13 @@ class Reply:
     tokens: int = 0
     mode: str = "native"
     thinking: str = ""
+    # Phase 3: how full the context was (Ollama prompt_eval_count, OpenAI usage.prompt_tokens), and what the model
+    # generated in how long (Ollama eval_count and eval_duration). The OpenAI API reports no generation time, so
+    # eval_seconds stays 0 there and wall_seconds, the whole request, stands in for it.
+    prompt_tokens: int = 0
+    eval_count: int = 0
+    eval_seconds: float = 0.0
+    wall_seconds: float = 0.0
 
 
 def background_slot() -> threading.BoundedSemaphore:
@@ -94,6 +103,10 @@ def _openai_base(base: str) -> str:
 
 def _headers(s: dict) -> dict:
     return {"Authorization": f"Bearer {s['llm_api_key']}"} if s.get("llm_api_key") else {}
+
+
+def _server(s: dict) -> str:
+    return f"{s.get('llm_backend', 'ollama')} {str(s.get('llm_base_url') or '').rstrip('/')}"
 
 
 def list_models(settings: dict | None = None) -> list[str]:
@@ -177,6 +190,15 @@ def _to_openai(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _arg_type(prop: dict) -> str:
+    """One argument's type in the "# How to act" list: its allowed values or its range when it has them."""
+    if prop.get("enum"):
+        return "|".join(str(v) for v in prop["enum"])
+    typ = str(prop.get("type", "string"))
+    lo, hi = prop.get("minimum"), prop.get("maximum")
+    return f"{typ} {lo}-{hi}" if lo is not None and hi is not None else typ
+
+
 def _json_mode_instructions(tools: list[dict]) -> str:
     lines = ["", "# How to act",
              "You act by calling tools. To call a tool, reply with exactly one JSON object and nothing else:",
@@ -185,9 +207,18 @@ def _json_mode_instructions(tools: list[dict]) -> str:
     for t in tools:
         props = t["parameters"].get("properties", {})
         req = set(t["parameters"].get("required", []))
-        args = ", ".join(f"{k}{'' if k in req else '?'}: {v.get('type', 'string')}" for k, v in props.items())
+        args = ", ".join(f"{k}{'' if k in req else '?'}: {_arg_type(v)}" for k, v in props.items())
         lines.append(f"- {t['name']}({args}): {t['description']}")
     return "\n".join(lines)
+
+
+def tool_call_schema(names) -> dict:
+    """The shape of one prompt-based tool call (Ollama structured outputs, design section 2), so the reply is always
+    {"tool": <an allowed name>, "args": {...}}. finish is always allowed, so a run can always end."""
+    return {"type": "object",
+            "properties": {"tool": {"type": "string", "enum": sorted(set(names) | {"finish"})},
+                           "args": {"type": "object"}},
+            "required": ["tool", "args"]}
 
 
 def _to_json_mode(messages: list[dict], tools: list[dict]) -> list[dict]:
@@ -322,13 +353,35 @@ def _parse_args(raw) -> dict:
 # ---------------- model routing (Phase 3) ----------------
 
 JOBS = ("main", "triage", "summary", "classify")
+JOB_TIMEOUT = 60   # seconds for one triage, summary or classify call; callers fall back to the old way on LLMError
+
+
+def small_model(settings: dict | None = None) -> str:
+    """The owner's small model for jobs that do not need the main model, or "" when none is set. Holdco's own job
+    callers (inbound triage, memory dedupe, old-result summaries, the portfolio narrative) only run with one, so
+    without it nothing changes; the Bench scores a job on the default model instead (pick_model)."""
+    s = settings or db.get_settings()
+    return str(s.get("small_model") or "").strip()
 
 
 def pick_model(job: str = "main", settings: dict | None = None, agent_model: str = "") -> str:
     """The model for a job: 'main' is the agent's or the default model; triage, summary and classify use the small
-    model when the owner set one. Scaffold: always the main model."""
+    model when the owner set one, else the default model."""
     s = settings or db.get_settings()
-    return agent_model or s.get("default_model", "")
+    if job != "main" and small_model(s):
+        return small_model(s)
+    return (agent_model if job == "main" else "") or s.get("default_model", "")
+
+
+def run_job(job: str, prompt: str, system: str = "", settings: dict | None = None, json_output: bool = False) -> str:
+    """One call for a small job (triage, summary, classify) on pick_model(job), with a 60-second limit and low
+    reasoning effort. Returns the answer text; raises LLMError, which every caller answers with the old behaviour."""
+    s = dict(settings or db.get_settings())
+    s["request_timeout"] = min(float(s.get("request_timeout") or JOB_TIMEOUT), JOB_TIMEOUT)
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+    reply = chat(messages, model=pick_model(job, s), settings=s, json_output=json_output, think="low",
+                 creativity="precise")
+    return reply.content
 
 
 # ---------------- sampling ----------------
@@ -378,10 +431,16 @@ def chat(messages: list[dict], tools: list[dict] | None = None, model: str | Non
         if think and "think" in msg:
             _no_think_models.add(model)
             return chat(messages, tools, model, settings, json_output, temperature, None, creativity)
+        if (use_json_mode and not json_output and "format" in msg and _server(s) not in _no_schema_servers
+                and not is_tool_parse_error(e)):
+            # An older Ollama takes only "json" in format, and some OpenAI-compatible servers reject json_object:
+            # ask again the way it worked before Phase 3 (the "# How to act" text still describes the shape).
+            _no_schema_servers.add(_server(s))
+            return chat(messages, tools, model, settings, json_output, temperature, think, creativity)
         if (tools and not use_json_mode and mode == "auto" and not is_tool_parse_error(e)
                 and ("support tools" in msg or "tool" in msg and "400" in msg)):
             _json_mode_models.add(model)
-            return _call(s, model, messages, tools, names, True, json_output, samp, think)
+            return chat(messages, tools, model, settings, json_output, temperature, think, creativity)
         raise
 
 
@@ -409,7 +468,10 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     timeout = float(s.get("request_timeout", 600))
     base = s["llm_base_url"].rstrip("/")
     msgs = _to_json_mode(messages, tools) if json_mode else None
+    # Phase 3: a prompt-based call is held to its JSON shape by the server, unless this server rejected that once.
+    shaped = json_mode and bool(tools) and not json_output and _server(s) not in _no_schema_servers
     thinking = ""
+    started = time.monotonic()
 
     if s["llm_backend"] == "ollama":
         body = {"model": model, "stream": False, "keep_alive": s.get("keep_alive", "30m"),
@@ -421,6 +483,8 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
             body["tools"] = [_tool_schema(t) for t in tools]
         if json_output:
             body["format"] = "json"
+        elif shaped:
+            body["format"] = tool_call_schema(names)
         data = _request(base + "/api/chat", body, _headers(s), timeout)
         msg = data.get("message") or {}
         content = msg.get("content") or ""
@@ -428,14 +492,16 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
         raw_calls = [(tc.get("function") or {}) for tc in (msg.get("tool_calls") or [])]
         calls = [ToolCall(name=f.get("name", ""), arguments=_parse_args(f.get("arguments")), id=f"call_{i}")
                  for i, f in enumerate(raw_calls) if f.get("name")]
-        tokens = int(data.get("prompt_eval_count") or 0) + int(data.get("eval_count") or 0)
+        prompt_tokens, eval_count = _count(data.get("prompt_eval_count")), _count(data.get("eval_count"))
+        eval_seconds = _count(data.get("eval_duration")) / 1e9   # Ollama reports nanoseconds
+        tokens = prompt_tokens + eval_count
     else:
         body = {"model": model, "messages": msgs if json_mode else _to_openai(messages),
                 **{k: v for k, v in samp.items() if k in ("temperature", "top_p")}}
         if tools and not json_mode:
             body["tools"] = [_tool_schema(t) for t in tools]
             body["tool_choice"] = "auto"
-        if json_output:
+        if json_output or shaped:
             body["response_format"] = {"type": "json_object"}
         data = _request(_openai_base(base) + "/chat/completions", body, _headers(s), timeout)
         choice = (data.get("choices") or [{}])[0]
@@ -449,7 +515,9 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
                 calls.append(ToolCall(name=f["name"], arguments=_parse_args(f.get("arguments")),
                                       id=tc.get("id") or f"call_{i}"))
         usage = data.get("usage") or {}
-        tokens = int(usage.get("total_tokens") or 0)
+        tokens = _count(usage.get("total_tokens"))
+        prompt_tokens, eval_count, eval_seconds = _count(usage.get("prompt_tokens")), \
+            _count(usage.get("completion_tokens")), 0.0
 
     content, inline_thoughts = split_thinking(content)
     if inline_thoughts:
@@ -457,14 +525,24 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     if tools:
         calls = [ToolCall(*unwrap_call(c.name, c.arguments, names), id=c.id) for c in calls]
     if tools and not calls:
-        tc = _text_tool_call(content, names)
+        # In json mode finish is always allowed (tool_call_schema), even for a run whose belt lacks it (chat).
+        tc = _text_tool_call(content, (names | {"finish"}) if json_mode else names)
         if tc:
             calls = [tc]
             content = ""
     # Unknown tool names are kept so the agent gets a helpful error instead of silence.
     calls = calls if tools else []
     return Reply(content=content, tool_calls=calls, tokens=tokens, mode="json" if json_mode else "native",
-                 thinking=thinking[:8000])
+                 thinking=thinking[:8000], prompt_tokens=prompt_tokens, eval_count=eval_count,
+                 eval_seconds=round(eval_seconds, 3), wall_seconds=round(time.monotonic() - started, 3))
+
+
+def _count(v) -> int:
+    """A token count or duration from the server's reply; anything unusable is 0."""
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def complete_json(prompt: str, system: str = "", model: str | None = None, temperature: float = 0.7):

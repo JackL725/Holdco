@@ -370,8 +370,9 @@ class TestGoals(Base):
                                                deadline=in_days(9)))
         self.assertIn("deadline must be a future date", run(f, "set_goal", title="Late", metric="m", target=1,
                                                             deadline="2020-01-01"))
-        self.assertIn("missing required argument(s): target", run(f, "set_goal", title="No number", metric="m",
-                                                                  target="lots", deadline=in_days(9)))
+        # Phase 3: a value that is not a number gets a repair message instead of being dropped
+        self.assertIn("target must be a number; you sent 'lots'", run(f, "set_goal", title="No number", metric="m",
+                                                                     target="lots", deadline=in_days(9)))
 
     def test_drop_goal_and_experiments(self):
         c = make_company("BetCo")
@@ -384,7 +385,7 @@ class TestGoals(Base):
         e = db.one("SELECT * FROM experiments WHERE id=?", (eid,))
         self.assertEqual((e["metric"], e["verdict"], e["start"]), ("forms.signups", "pending", in_days(0)))
         self.assertIn("is not an active goal", run(ceo, "start_experiment", goal_id=9999, hypothesis="x"))
-        self.assertIn("verdict must be won, lost or inconclusive",
+        self.assertIn("verdict must be one of won, lost, inconclusive; you sent 'meh'",
                       run(ceo, "conclude_experiment", experiment_id=eid, result="3%", verdict="meh"))
         self.assertIn("concluded: lost", run(ceo, "conclude_experiment", experiment_id=eid, result="3.1% [forms]",
                                              verdict="LOST"))

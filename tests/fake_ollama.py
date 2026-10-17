@@ -393,6 +393,8 @@ class FakeModelServer:
         # tests lower size_vram to simulate a model spilling into system RAM.
         self.ps: list[dict] = [{"name": "gpt-oss:20b", "model": "gpt-oss:20b",
                                 "size": 14_000_000_000, "size_vram": 14_000_000_000}]
+        self.prompt_tokens = 900          # what each chat reply reports as prompt_eval_count (context use)
+        self.schema_misses: list[str] = []   # scripted tools a JSON-schema request did not allow (should stay empty)
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -421,9 +423,12 @@ class FakeModelServer:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                # Phase 3: format (Ollama) and response_format (OpenAI) are recorded so tests can check the JSON
+                # schema of prompt-based tool calls.
                 outer.calls.append({"path": self.path, "model": body.get("model"), "think": body.get("think"),
                                     "options": body.get("options"), "temperature": body.get("temperature"),
-                                    "ntools": len(body.get("tools") or [])})
+                                    "ntools": len(body.get("tools") or []), "format": body.get("format"),
+                                    "response_format": body.get("response_format")})
                 if self.path == "/api/embed":   # Phase 0.5: meaning-based search
                     if body.get("model") == EMBED_FAIL_MODEL:
                         return self._json(500, {"error": "embedding model crashed"})
@@ -441,21 +446,31 @@ class FakeModelServer:
                         msg = {"role": "assistant", "content": None, "tool_calls": [
                             {"id": f"call_{len(msgs)}", "type": "function",
                              "function": {"name": r["function"]["name"], "arguments": json.dumps(r["function"]["arguments"])}}]}
-                    return self._json(200, {"choices": [{"message": msg}], "usage": {"total_tokens": 500}})
+                    return self._json(200, {"choices": [{"message": msg}], "usage": {
+                        "total_tokens": outer.prompt_tokens + 80, "prompt_tokens": outer.prompt_tokens,
+                        "completion_tokens": 80}})
                 if body.get("format") == "json" and not tools:
                     return self._json(200, {"message": {"role": "assistant", "content": json.dumps(IDEAS)},
                                             "prompt_eval_count": 50, "eval_count": 120})
                 if body["model"] == "notools:latest" and tools:
                     return self._json(400, {"error": "registry.ollama.ai/library/notools does not support tools"})
                 r = tc("ping", message="ok") if ping else script(msgs, tools)
+                schema = body.get("format") if isinstance(body.get("format"), dict) else None
                 if isinstance(r, str):
                     msg = {"role": "assistant", "content": r}
+                elif schema is not None:   # Phase 3: structured outputs, the reply is exactly the schema's object
+                    enum = ((schema.get("properties") or {}).get("tool") or {}).get("enum") or []
+                    if r["function"]["name"] not in enum:
+                        outer.schema_misses.append(r["function"]["name"])
+                    msg = {"role": "assistant", "content": json.dumps(
+                        {"tool": r["function"]["name"], "args": r["function"]["arguments"]})}
                 elif body["model"] == "notools:latest":   # prompt-based tool calling
                     msg = {"role": "assistant", "content": "Sure.\n```json\n" + json.dumps(
                         {"tool": r["function"]["name"], "args": r["function"]["arguments"]}) + "\n```"}
                 else:
                     msg = {"role": "assistant", "content": "", "thinking": "planning...", "tool_calls": [r]}
-                self._json(200, {"message": msg, "prompt_eval_count": 900, "eval_count": 80, "done": True})
+                self._json(200, {"message": msg, "prompt_eval_count": outer.prompt_tokens, "eval_count": 80,
+                                 "eval_duration": 2_000_000_000, "done": True})
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self.httpd.daemon_threads = True

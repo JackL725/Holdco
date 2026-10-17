@@ -115,7 +115,7 @@ def create(company: dict, agent: dict, task_id: int | None, question: str, optio
       "reversible decision takes the recommended option. For simple questions use ask_owner.",
       {"question": S("The decision, one paragraph"), "options": S("2 to 5 options, one per line"),
        "recommended": S("The option you recommend, exactly as written in options"),
-       "deadline_hours": I("Hours before the recommended option is taken (1 to 336, default 48)"),
+       "deadline_hours": I("Hours before the recommended option is taken (1 to 336, default 48)", MIN_HOURS, MAX_HOURS),
        "reversible": {"type": "boolean", "description": "False if it cannot be undone (then it waits for the owner)"},
        "context": S("Why now and what was tried (up to 1,500 characters)")},
       ("question", "options", "recommended"), risk="write")
