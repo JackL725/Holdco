@@ -231,6 +231,7 @@ DEFINITION = {
     },
     "health": health,
     "tools": tools,
+    "external": True,   # Phase 3: every page it shows belongs to someone else, so reading one taints the session
     "launch": launch,
     "mcp": {"command": _command, "args": _args, "env": {}, "classify": CLASSIFY, "allow": ALLOW,
             "blocked": list(BLOCKED)},

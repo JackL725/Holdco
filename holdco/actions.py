@@ -72,6 +72,7 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    approver = "policy:auto"   # who let an action run without the owner, for the audit log
     if action not in ("question", "decision"):
         # Phase 3: a session that read outside content asks, and the trust ladder sits in front of the policy.
         from . import taint, trust   # imported here: both import modules that import this one
@@ -79,6 +80,10 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy, why = trust.gate_policy(company, policy_action or action, payload, policy, sources)
         if why and policy == "approve":
             payload = {**payload, "_why_asked": why}
+            if why.startswith(trust.TAINTED):
+                payload["_taint"] = sources   # the Inbox card names where the outside content came from
+        elif why.startswith("trust:") and policy == "auto":
+            approver = why
     killed = False
     if policy == "auto" and db.get_settings().get("kill_switch"):
         policy, killed = "approve", True   # the kill switch freezes outbound actions: queue instead of running
@@ -87,15 +92,19 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
             result = execute(company, action, payload)
         except Exception as e:  # report failures back to the agent
             bus.emit(company["id"], "error", f"{ACTION_LABELS.get(action, action)} failed: {e}", agent["id"])
-            audit(company["id"], action, agent["name"], "policy:auto", payload, f"FAILED: {e}")
+            audit(company["id"], action, agent["name"], approver, payload, f"FAILED: {e}")
             return f"FAILED: {e}"
         bus.emit(company["id"], "action", f"{ACTION_LABELS.get(action, action)}: {_summary(action, payload)}",
                  agent["id"], {"action": action})
-        audit(company["id"], action, agent["name"], "policy:auto", payload, result)
+        audit(company["id"], action, agent["name"], approver, payload, result)
+        if action == "send_email":
+            from . import trust   # imported here: see above
+            trust.note_sent(company["id"], payload)   # the next email to this person is not a first message
         return result
 
-    # approve: queue it (deduplicated)
+    # approve: queue it (deduplicated; why it asks is not part of what it is)
     blob = json.dumps(payload, sort_keys=True)
+    same = json.dumps(_without_reasons(payload), sort_keys=True)
     for row in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND action=? AND status='pending'",
                     (company["id"], action)):
         old = db.loads(row["payload"], {}) or {}
@@ -103,7 +112,7 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
             # A decision carries its own deadline, so the same question asked again rarely has an identical payload.
             return (f"Already waiting for the owner as decision #{row['id']}. Don't resubmit; continue with other "
                     f"work, or finish with status 'waiting'.")
-        if json.dumps(old, sort_keys=True) == blob:
+        if json.dumps(_without_reasons(old), sort_keys=True) == same:
             return f"Already waiting for the owner as request #{row['id']}. Don't resubmit; continue with other work."
     summary = _summary(action, payload)
     aid = db.run("INSERT INTO approvals(company_id, agent_id, task_id, action, summary, payload, status, created_at)"
@@ -258,6 +267,11 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+def _without_reasons(p) -> dict:
+    """Phase 3: a payload without why the owner is asked (_why_asked, _taint), for deduplication."""
+    return {k: v for k, v in (p or {}).items() if k not in ("_why_asked", "_taint")} if isinstance(p, dict) else {}
 
 
 def _same_question(a, b) -> bool:
