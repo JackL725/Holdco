@@ -2,7 +2,8 @@
 agent session against mocks and assert on what happened, scoring any model on the owner's GPU.
 
 RUNNING is set while a bench runs: the scheduler then skips task dispatch and CEO cycles so timing is not distorted
-(chat still works). Bench companies have status 'bench' and are never dispatched or listed.
+(chat still works). Bench companies have status 'bench' and are never dispatched or listed; their requests, events
+and errors stay out of the Inbox, the feed, the counts and the owner's phone.
 
 The pieces: scenarios.py (the 33 scenarios), mocks.py (the scripted outside world, also the test suite's fakes),
 runner.py (run, check, score, record a bench_runs row) and __main__.py (python -m holdco.bench). The dashboard API

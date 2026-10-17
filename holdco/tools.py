@@ -56,6 +56,8 @@ class Ctx:
     tainted: bool = False
     taint_sources: list = field(default_factory=list)
     verify_warned: bool = False
+    verify_waiting_on: int | None = None   # the run_code request the gate's last check queued or waits on
+    verify_failed: list = field(default_factory=list)   # the gate's failed results from its last check
 
 
 @dataclass
@@ -704,23 +706,17 @@ def ask_owner(ctx: Ctx, question: str, options: str = "", recommended: str = "",
 
 # ======================= outbound =======================
 
-def _emails_today(cid: int) -> int:
-    sent = db.scalar("SELECT COUNT(*) FROM emails WHERE company_id=? AND direction='out' AND created_at >= ?",
-                     (cid, db.now()[:10]))
-    pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND action='send_email' AND status='pending'",
-                        (cid,))
-    return (sent or 0) + (pending or 0)
-
-
 @tool("send_email", "Send an email from the company mailbox (may need the owner's approval).",
       {"to": S("Recipient email address"), "subject": S("Subject line"), "body": S("Plain-text body, signed with the company name"),
        "reply_to_email_id": I("If replying to an inbound email, its number")}, ("to", "subject", "body"))
 def send_email(ctx: Ctx, to: str, subject: str, body: str, reply_to_email_id: int = 0) -> str:
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", to.strip()):
         raise ToolError("That doesn't look like a valid email address.")
-    limit = int(db.company_settings(ctx.company).get("daily_email_limit", 25))
-    if _emails_today(ctx.company["id"]) >= limit:
-        return f"Daily email limit ({limit}) reached. Try again tomorrow."
+    # Phase 3: the daily cap first (nothing else matters once it is reached), worded and counted exactly as
+    # outreach_check words and counts it, so the agent reads one rule whichever check meets it.
+    cap = verify.cap_problem(ctx.company)
+    if cap:
+        return "ERROR: email not sent: " + cap
     refusal, body = truth.outreach_guard(ctx, to.strip(), subject, body)
     if refusal:
         return refusal
@@ -800,13 +796,20 @@ def http_request(ctx: Ctx, url: str, method: str = "GET", body: str = "", header
                         {"method": method, "url": url, "body": parsed_body, "headers": hdrs})
 
 
+NETWORK_RE = re.compile(r"\bnetwork\s*=\s*true\b", re.I)   # Phase 3: a task that lets run_code use the network
+
+
 @tool("run_code", "Run a Python script or shell command inside the company folder (may need approval).",
       {"language": S("python or shell"), "code": S("The code to run"), "timeout": I("Seconds, max 600 (default 60)")},
       ("code",))
 def run_code(ctx: Ctx, code: str, language: str = "python", timeout: int = 60) -> str:
     lang = "python" if (language or "python").lower().startswith("py") else "shell"
+    # Phase 3: the sandbox runs without a network unless the task says network=true (the owner can also tick
+    # "Allow network" on the approval card).
+    task = ctx.task or {}
+    network = bool(NETWORK_RE.search(f"{task.get('title') or ''}\n{task.get('description') or ''}"))
     return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "run_code",
-                        {"language": lang, "code": code, "timeout": int(timeout or 60)})
+                        {"language": lang, "code": code, "timeout": int(timeout or 60), "network": network})
 
 
 @tool("request_purchase", "Ask the owner to buy something (domain, tool, ads budget...). Money is never spent without them.",
@@ -1032,12 +1035,20 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
     if status == "done" and ctx.task:
         # Phase 3: the verification gate, by kind of work and by the task's checks; once, like the deliverable check
         problem = verify.finish_problem(ctx, target, summary, evidence)
-        if problem and not ctx.verify_warned:
+        waiting = verify.waiting_request(ctx) if problem else None
+        if problem and waiting and verify.only_waiting(ctx):
+            # The tests wait for the owner to approve running them (no sandbox): nothing to fix here, so the task
+            # waits on that request, like Phase 0.5's waiting tasks, and reopens when the owner decides.
+            status, waiting_on = "waiting", waiting
+            open_issues = (open_issues + f"\nVerification waits on the owner: {problem}.").strip()
+        elif problem and not ctx.verify_warned:
             ctx.verify_warned = True
             return (f"Not finished yet: {problem}. Fix it and call finish again, or finish with status 'partial' and "
                     f"explain.")
-        if problem:
-            status = "partial"
+        elif problem:
+            # Still failing after the push-back: partial, or waiting when the tests also wait for the owner (the
+            # next attempt, after the owner's decision, sees what else fails).
+            status, waiting_on = ("waiting", waiting) if waiting else ("partial", waiting_on)
             open_issues = (open_issues + f"\nVerification failed: {problem}.").strip()
     if status == "done":
         problem = truth.finish_guard(ctx, status, target, summary, evidence)

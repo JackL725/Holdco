@@ -50,10 +50,27 @@ def emit(company_id: int | None, kind: str, message: str, agent_id: int | None =
     )
     ev = {"type": "event", "id": eid, "company_id": company_id, "agent_id": agent_id, "kind": kind,
           "message": message, "data": data or {}, "created_at": created}
+    if _bench_company(company_id):
+        return ev   # Phase 3: a Holdco Bench company's events are the bench's record, not the owner's feed or phone
     publish(ev)
     if kind == "error":
         _tell_phone(company_id, message)
     return ev
+
+
+def _bench_company(company_id: int | None) -> bool:
+    """Is this a Holdco Bench company (status 'bench')? Only looked up while a bench runs, so it costs nothing
+    otherwise."""
+    if not company_id:
+        return False
+    try:
+        from . import bench   # imported here: the package imports nothing of Holdco at its top
+        if not (bench.RUNNING or bench.STATUS.get("running")):
+            return False
+        row = db.one("SELECT status FROM companies WHERE id=?", (company_id,))
+        return bool(row and row["status"] == "bench")
+    except Exception:
+        return False
 
 
 def _tell_phone(company_id: int | None, message: str) -> None:

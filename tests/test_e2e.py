@@ -11,6 +11,7 @@ a decision in the inbox, and a task that waits for the one it depends on.
 from __future__ import annotations
 
 import calendar
+import json
 import secrets
 import sqlite3
 import sys
@@ -238,24 +239,31 @@ class EndToEnd(unittest.TestCase):
         type(self).cid2 = c["id"]
 
     def test_12_prompt_based_tool_fallback(self):
+        # Whatever fails below, the model goes back: the later tests need the native one.
+        self.addCleanup(lambda: self.api.put("/api/settings", {"default_model": "gpt-oss:20b"}))
         self.api.put("/api/settings", {"default_model": "notools:latest"})
         echo = self.agent(self.cid, "marketing")
         t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Draft launch post v2", "agent_id": echo["id"],
                                                               "priority": 1})["task"]
         wait_for(lambda: next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"] == "done", 60,
                  what="task via prompt-based tool calls")
-        self.api.put("/api/settings", {"default_model": "gpt-oss:20b"})
 
     def test_13_openai_compatible_backend(self):
+        # Whatever fails below, the backend goes back to Ollama: left on the OpenAI API, later tests would fail too.
+        self.addCleanup(lambda: self.api.put("/api/settings", {"llm_backend": "ollama",
+                                                               "default_model": "gpt-oss:20b"}))
         self.api.put("/api/settings", {"llm_backend": "openai", "default_model": "local-model"})
         self.assertTrue(self.api.post("/api/llm/test")["ok"])
         scout = self.agent(self.cid, "research")
         t = self.api.post(f"/api/companies/{self.cid}/tasks", {"title": "Scan pricing again", "agent_id": scout["id"],
                                                               "priority": 1})["task"]
+        # Phase 3: Scout fetches the page it cites (the research gate), and its handoff passes the gate
         wait_for(lambda: next(x for x in self.tasks(self.cid) if x["id"] == t["id"])["status"] == "done", 60,
                  what="task via OpenAI-compatible API")
         self.assertTrue(any(c["path"] == "/v1/chat/completions" for c in self.model.calls))
-        self.api.put("/api/settings", {"llm_backend": "ollama", "default_model": "gpt-oss:20b"})
+        done = next(x for x in self.tasks(self.cid) if x["id"] == t["id"])
+        self.assertIn({"kind": "research", "passed": True}, [{k: r[k] for k in ("kind", "passed")}
+                                                             for r in json.loads(done["verification"] or "[]")])
 
     def test_14_thinking_view(self):
         think = self.api.get(f"/api/events?company_id={self.cid}&kinds=think&limit=300")["events"]
@@ -923,6 +931,132 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.sql("SELECT COUNT(*) AS n FROM leases WHERE task_id=?", (then["id"],))[0]["n"], 0)
         files = self.api.get(f"/api/companies/{cid}/files")
         self.assertNotIn("marketing/launch.md", [x["path"] for x in files["leases"]])
+
+    # ---------------------------------------------------------------- phase 3: verify
+    def test_34_bench_api(self):
+        # A slower model keeps the bench busy long enough to see it running: a second start is refused (409) and
+        # its companies and their requests, which exist meanwhile, never reach the dashboard's list or the Inbox.
+        self.model.delay = 0.3
+        self.addCleanup(setattr, self.model, "delay", 0.05)
+        only = ["kill_switch_respected", "respect_approval", "chat_creates_task"]   # respect_approval queues an email
+        run_id = self.api.post("/api/bench/run", {"model": "gpt-oss:20b", "only": only})["run_id"]
+        busy = self.api.post("/api/bench/run", {"model": "gpt-oss:20b"}, expect=409)
+        self.assertIn("already running", busy["error"])
+        listed, existed = set(), set()
+
+        def finished():
+            state = self.api.get("/api/state")
+            listed.update(c["name"] for c in state["companies"])
+            listed.update(a["company_name"] or "" for a in self.pending())   # the Inbox
+            existed.update(r["name"] for r in self.sql("SELECT name FROM companies WHERE status='bench'"))
+            status = self.api.get("/api/bench/status")
+            return status if not status["running"] else None
+        status = wait_for(finished, 90, 0.1, what="the bench to finish")
+        self.assertEqual((status["run_id"], status["done"], status["total"], status["error"]), (run_id, 3, 3, ""))
+        self.assertTrue(existed, "the bench's companies were never seen in the database")
+        self.assertFalse({n for n in listed if n.startswith("Bench: ")}, listed)
+        row = self.api.get("/api/bench/results?limit=5")["runs"][0]
+        self.assertEqual((row["id"], row["model"], row["scenarios"], row["passed"]), (run_id, "gpt-oss:20b", 3, 3))
+        for key in ("pass_rate", "tool_validity", "tokens_per_second", "steps_avg"):
+            self.assertIsNotNone(row[key], key)
+        self.assertEqual(row["pass_rate"], 1.0)
+        self.assertEqual(sorted(r["name"] for r in row["results"]), sorted(only))   # in the scenarios' own order
+        self.assertTrue(all(r["passed"] for r in row["results"]), row["results"])
+        self.assertEqual(self.api.get(f"/api/bench/results/{run_id}")["results"], row["results"])
+        self.api.get("/api/bench/results/999999", expect=404)
+        # Nothing of the bench stays behind, and the owner's companies are untouched.
+        self.assertEqual(self.sql("SELECT id FROM companies WHERE status='bench' OR name LIKE 'Bench: %'"), [])
+        self.assertEqual(sorted(p.name for p in (Path(self.app.data_dir) / "companies").glob("bench-*")), [])
+        self.assertEqual(self.api.get(f"/api/companies/{self.kid}")["company"]["status"], "active")
+
+    def test_35_site_task_static_gate(self):
+        cid = self.kid
+        forge = self.agent(cid, "engineering")
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Build the pricing page", "agent_id": forge["id"],
+                                                          "priority": 1, "deliverable": "site/pricing.html"})["task"]
+        done = wait_for(lambda: next((x for x in self.tasks(cid) if x["id"] == t["id"] and x["status"] == "done"),
+                                     None), 60, what="the pricing page task")
+        # The first finish was pushed back by the gate (the form sent its entries nowhere); the fixed page passed.
+        finishes = [m["content"] for m in self.last_transcript(cid, forge["id"], t["id"])
+                    if m["role"] == "tool" and m["name"] == "finish"]
+        self.assertEqual(len(finishes), 2, finishes)
+        self.assertTrue(finishes[0].startswith("Not finished yet: web page: site/pricing.html: form 1 has no action "
+                                               "or data-netlify attribute (submissions go nowhere)"), finishes[0])
+        self.assertEqual(finishes[1], "Session ended.")
+        # Playwright is not set up in CI: the static check counted, and the result says so.
+        [r] = json.loads(done["verification"])
+        self.assertEqual((r["kind"], r["passed"], r["mode"]), ("web page", True, "static"))
+        self.assertIn("0 audit blockers", r["detail"])
+        self.assertIn("1 form(s) with a target", r["detail"])
+        self.assertIn("static check: Playwright is not set up", r["detail"])
+        # The CEO's next review reads the gate's result next to the finished task.
+        self.api.post(f"/api/companies/{cid}/cycle")
+
+        def finished_line():
+            for prompt in reversed(self.model.cycle_prompts):
+                line = next((ln for ln in prompt.splitlines() if ln.startswith(f"#{t['id']} [done]")), "")
+                if line:
+                    return line
+            return None
+        line = wait_for(finished_line, 60, what="a planning prompt that lists the finished pricing page")
+        self.assertIn("[gate: web page PASS (static)]", line)
+
+    def test_36_tainted_post_waits(self):
+        cid = self.kid
+        before = self.api.get(f"/api/companies/{cid}")["company"]["settings"].get("policies") or {}
+        self.addCleanup(lambda: self.api.patch(f"/api/companies/{cid}", {"settings": {"policies": before}}))
+        self.api.patch(f"/api/companies/{cid}", {"settings": {"policies": {**before, "social_post": "auto"}}})
+        echo = self.agent(cid, "marketing")
+        # Outside content: Echo fetched a page, so its post waits for the owner although posts run on their own.
+        t = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Share the vet article", "agent_id": echo["id"],
+                                                          "priority": 1, "kind": "post"})["task"]
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == t["id"])["status"] == "waiting", 60,
+                 what="the post task to wait for the owner")
+        [req] = [a for a in self.pending(cid) if a["action"] == "social_post" and a["task_id"] == t["id"]]
+        self.assertEqual(req["payload"]["_taint"], ["127.0.0.1"])
+        self.assertEqual(req["payload"]["_why_asked"], "asked because this session read outside content: 127.0.0.1")
+        self.assertIn("veterinary nutritionist", req["payload"]["content"])
+        audit = self.api.get(f"/api/audit?company_id={cid}&limit=50")["audit"]
+        self.assertFalse([r for r in audit if r["action"] == "social_post"
+                          and "veterinary nutritionist" in r["payload"].get("content", "")])
+        # Only the company's own files: the post goes out at once, under the automatic policy.
+        note = "# Launch note\n\nThe first weekly meal plans are ready.\n"
+        self.api.put(f"/api/companies/{cid}/file", {"path": "docs/launch-note.md", "content": note})
+        own = self.api.post(f"/api/companies/{cid}/tasks", {"title": "Post our launch note", "agent_id": echo["id"],
+                                                            "priority": 1, "kind": "post"})["task"]
+        wait_for(lambda: next(x for x in self.tasks(cid) if x["id"] == own["id"])["status"] == "done", 60,
+                 what="the post from the company's own note")
+        audit = self.api.get(f"/api/audit?company_id={cid}&limit=50")["audit"]
+        sent = [r for r in audit if r["action"] == "social_post" and "meal plans are ready" in r["payload"]["content"]]
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual(sent[0]["approved_by"], "policy:auto")
+        self.assertNotIn("_taint", sent[0]["payload"])
+        self.assertFalse([a for a in self.pending(cid) if a["task_id"] == own["id"]])
+
+    def test_37_trust_routes(self):
+        cid = self.kid
+        rows = {r["action"]: r for r in self.api.get(f"/api/companies/{cid}/trust")["actions"]}
+        old = rows["social_post"]
+        self.addCleanup(lambda: self.api.put(f"/api/companies/{cid}/trust", {
+            "action": "social_post", "level": old["level"], "cap_per_day": old["cap_per_day"]}))
+        self.assertEqual((old["level"], old["on_ladder"], old["locked"]), (0, True, False))
+        self.assertEqual((rows["spend_money"]["locked"], rows["spend_money"]["note"]), (True, "always asks"))
+        self.assertEqual(rows["run_code"]["note"], "follows its policy")
+        out = self.api.put(f"/api/companies/{cid}/trust", {"action": "social_post", "level": 1, "cap_per_day": 3})
+        row = next(r for r in out["actions"] if r["action"] == "social_post")
+        self.assertEqual((row["level"], row["cap_per_day"], row["level_name"]), (1, 3, "Auto with a daily cap"))
+        again = next(r for r in self.api.get(f"/api/companies/{cid}/trust")["actions"] if r["action"] == "social_post")
+        self.assertEqual((again["level"], again["cap_per_day"]), (1, 3))
+        for bad in ({"action": "social_post", "level": 5}, {"action": "social_post", "level": "high"},
+                    {"action": "social_post", "cap_per_day": 0}, {"action": "social_post"},
+                    {"action": "spend_money", "level": 2}, {"action": "run_code", "level": 1},
+                    {"action": "launch_rockets", "level": 1}):
+            with self.subTest(bad=bad):
+                self.assertTrue(self.api.put(f"/api/companies/{cid}/trust", bad, expect=400)["error"])
+        self.api.get("/api/companies/999999/trust", expect=404)
+        unchanged = next(r for r in self.api.get(f"/api/companies/{cid}/trust")["actions"]
+                         if r["action"] == "social_post")
+        self.assertEqual((unchanged["level"], unchanged["cap_per_day"]), (1, 3))
 
 
 if __name__ == "__main__":

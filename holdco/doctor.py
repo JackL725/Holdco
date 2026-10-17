@@ -336,7 +336,7 @@ def _connector_jobs(s: dict, recheck: bool) -> list[_Job]:
     """One job per configured connector per company (archived companies skipped), plus the global ones.
     Each job carries its company id, which _run_jobs stamps into the rows as "company_id"."""
     jobs: list[_Job] = []
-    for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
+    for c in db.q("SELECT * FROM companies WHERE status NOT IN ('archived', 'bench') ORDER BY id"):
         cs = db.company_settings(c)
         cid, cname = c["id"], c["name"]
         fix = _link("Company settings", f"#/c/{cid}/settings")

@@ -463,13 +463,22 @@ def approval_requested(approval: dict) -> None:
     if not approval:
         return
     try:
-        if not configured():
+        if not configured() or _bench(approval.get("company_id")):
             return
         text, buttons, kind = build_approval(approval)
     except Exception as e:
         _record_failure(f"could not announce request #{approval.get('id')}: {e}")
         return
     _enqueue(send, text, buttons, kind)
+
+
+def _bench(company_id) -> bool:
+    """Phase 3: a Holdco Bench company (status 'bench'): temporary and scripted, so its requests and errors never
+    reach the owner's phone (the bench's mocks catch them in its own thread; this covers every other thread)."""
+    if not company_id:
+        return False
+    row = db.one("SELECT status FROM companies WHERE id=?", (company_id,))
+    return bool(row and row["status"] == "bench")
 
 
 def _error_key(message: str) -> str:
@@ -488,7 +497,7 @@ def error(company: dict | None, message: str) -> None:
     """Hook for error events: one message per distinct error per hour. The once-an-hour decision is made
     here, synchronously, so it is deterministic; the send itself runs on the sender thread. Never raises."""
     try:
-        if not configured():
+        if not configured() or (company and (company.get("status") == "bench" or _bench(company.get("id")))):
             return
         key = _error_key(message)
         if not key:
@@ -599,7 +608,7 @@ def format_status() -> str:
     the summary."""
     s = db.get_settings()
     rows, pending_total, decisions_total = [], 0, 0
-    for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
+    for c in db.q("SELECT * FROM companies WHERE status NOT IN ('archived', 'bench') ORDER BY id"):
         open_n = db.scalar("SELECT COUNT(*) FROM tasks WHERE company_id=? AND status IN "
                            "('todo','in_progress','blocked','waiting')", (c["id"],)) or 0
         working = db.scalar("SELECT COUNT(*) FROM agents WHERE company_id=? AND status='working'", (c["id"],)) or 0

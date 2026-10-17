@@ -14,6 +14,10 @@ from . import (brain, bus, config, connectors, contracts, db, decisions, doctor,
 from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
 from .verify import summary_line as _gate_line   # _task_lines has a parameter named verify
 
+# Company statuses whose task and cycle runs may go on. 'bench' (Phase 3): a Holdco Bench company, run by the bench
+# itself (holdco/bench/runner.py); the scheduler never dispatches it, since it only looks at active companies.
+RUNNABLE = ("active", "bench")
+
 # agent_id -> kind of run currently executing
 _running: dict[int, str] = {}
 _running_lock = threading.Lock()
@@ -497,7 +501,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     company = db.get_company(agent["company_id"]) if agent else None
     # A task or a cycle for a company paused (or archived) after the scheduler picked it: no run row and no attempt
     # counted; the loop below would only stop it at its first step ("Paused by the owner").
-    if not agent or not company or (kind in ("task", "cycle") and company["status"] != "active"):
+    if not agent or not company or (kind in ("task", "cycle") and company["status"] not in RUNNABLE):
         with _running_lock:
             _running.pop(agent_id, None)
         return
@@ -607,7 +611,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                 if kind in ("task", "cycle"):
                     c = db.get_company(company["id"])
                     a = db.get_agent(agent_id)
-                    if not c or c["status"] != "active" or not a or not a["enabled"]:
+                    if not c or c["status"] not in RUNNABLE or not a or not a["enabled"]:
                         status, error = "stopped", "Paused by the owner."
                         break
                 if step == max_steps - 2 and kind != "chat":

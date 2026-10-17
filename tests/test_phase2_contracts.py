@@ -274,9 +274,10 @@ class TestCreateTaskContract(Base):
 
         # checks, due_days, budget_steps
         out = self.create(title="X4", goal_id=self.g1, checks="browser_check site/index.html\nlook at it closely")
+        # Phase 3 adds run_tests (the verification gate's code check)
         self.assertEqual(out, "ERROR: checks line 'look at it closely' must start with one of: browser_check, "
-                              "audit_page, review_text, check_contrast, fetch_url (one check per line, for example "
-                              "'browser_check site/index.html').")
+                              "audit_page, review_text, check_contrast, fetch_url, run_tests (one check per line, "
+                              "for example 'browser_check site/index.html').")
         self.assertEqual(self.create(title="X5", goal_id=self.g1, due_days=91),   # Phase 3: the schema's range
                          "ERROR: bad arguments for create_task: due_days must be an integer 1-90; you sent 91")
         for steps in (2, 61):   # the owner's task form shares the validator

@@ -291,7 +291,11 @@ class TestTools(unittest.TestCase):
         ctx = ctx_for(self.c, "engineering", db.get_task(tid))
         self.assertIn("Not finished yet", tools.execute(ctx, "finish", {"summary": "done"}))
         self.assertFalse(ctx.finished)
-        tools.execute(ctx, "write_file", {"path": "site/page.html", "content": "<html><body>" + "x" * 100 + "</body></html>"})
+        # a page the verification gate's static check passes (Phase 3): viewport and title, no audit blocker
+        tools.execute(ctx, "write_file", {"path": "site/page.html", "content": (
+            '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width, initial-scale=1"><title>Page</title></head><body><h1>Page</h1><p>'
+            + "x" * 100 + "</p></body></html>")})
         tools.execute(ctx, "finish", {"summary": "built it", "evidence": "audit ok"})
         self.assertTrue(ctx.finished)
         self.assertEqual(ctx.finish_status, "done")

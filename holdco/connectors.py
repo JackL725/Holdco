@@ -246,9 +246,10 @@ def _inactive_text(d: dict | None) -> str:
 
 
 def _active_rows() -> list[dict]:
-    """Enabled instances, leaving out those of archived (or deleted) companies."""
+    """Enabled instances, leaving out those of archived (or deleted) companies, and of Holdco Bench companies (Phase
+    3: their scripted connectors are never health-checked, polled or reported to the owner)."""
     return db.q("SELECT c.* FROM connectors c LEFT JOIN companies co ON co.id=c.company_id WHERE c.enabled=1 AND "
-                "(c.company_id IS NULL OR co.status!='archived') ORDER BY c.id")
+                "(c.company_id IS NULL OR co.status NOT IN ('archived', 'bench')) ORDER BY c.id")
 
 
 def _fields(d: dict | None) -> list[dict]:
@@ -1085,7 +1086,7 @@ def doctor_rows() -> list[dict]:
     rows = []
     for r in db.q("SELECT * FROM connectors WHERE enabled=1 ORDER BY id"):
         cid = r["company_id"]
-        if cid is not None and (cid not in companies or companies[cid]["status"] == "archived"):
+        if cid is not None and (cid not in companies or companies[cid]["status"] in ("archived", "bench")):
             continue
         d = DEFINITIONS.get(r["key"])
         if d and not _is_active(d, _inst(r)):
@@ -1135,7 +1136,8 @@ def _companies_for(inst: dict) -> list[dict]:
         return [c] if c and c["status"] != "archived" else []
     own = {r["company_id"] for r in db.q("SELECT company_id FROM connectors WHERE key=? AND enabled=1 AND "
                                          "company_id IS NOT NULL", (inst["key"],))}
-    return [c for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id") if c["id"] not in own]
+    return [c for c in db.q("SELECT * FROM companies WHERE status NOT IN ('archived', 'bench') ORDER BY id")
+            if c["id"] not in own]
 
 
 def poll_metrics(only: int | None = None) -> list[dict]:

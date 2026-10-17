@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import actions, agents, backup, bus, config, context, contracts, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
+from . import bench, trust  # noqa: F401  (Phase 3: their modules register the Bench and Trust routes)
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -62,6 +63,10 @@ def _stats(cid: int) -> dict:
     }
 
 
+# Phase 3: Holdco Bench companies (status 'bench') are temporary and never the owner's: rows of theirs stay out of
+# every list and count the dashboard shows. A condition on a column named company_id.
+NOT_BENCH = "company_id NOT IN (SELECT id FROM companies WHERE status='bench')"
+
 # ======================= overview & settings =======================
 
 @route("GET", "/api/state")
@@ -72,13 +77,14 @@ def api_state(h, m, body):
     s = db.get_settings()
     return {
         "companies": companies,
-        "approvals": db.scalar("SELECT COUNT(*) FROM approvals WHERE status='pending'") or 0,
+        "approvals": db.scalar(f"SELECT COUNT(*) FROM approvals WHERE status='pending' AND {NOT_BENCH}") or 0,
         "running": agents.running_count(False),
         "scheduler_enabled": s.get("scheduler_enabled", True),
         "kill_switch": bool(s.get("kill_switch")),
         "doctor": doctor.summary(),
         "model": s.get("default_model"),
-        "agents": db.q("SELECT id, company_id, name, role, preset, title, status, enabled FROM agents ORDER BY id"),
+        "agents": db.q("SELECT id, company_id, name, role, preset, title, status, enabled FROM agents "
+                       f"WHERE {NOT_BENCH} ORDER BY id"),
         "version": __import__("holdco").__version__,
     }
 
@@ -211,10 +217,11 @@ def api_kill(h, m, body):
 def api_audit(h, m, body):
     cid = _int(h.query.get("company_id", [0])[0])
     limit = max(1, min(_int(h.query.get("limit", [100])[0], 100), 500))
-    sql = "SELECT a.*, c.name AS company_name FROM audit a LEFT JOIN companies c ON c.id=a.company_id"
+    sql = ("SELECT a.*, c.name AS company_name FROM audit a LEFT JOIN companies c ON c.id=a.company_id "
+           "WHERE COALESCE(c.status, '')!='bench'")   # Phase 3: a running bench's actions are not the owner's
     params: list = []
     if cid:
-        sql += " WHERE a.company_id=?"
+        sql += " AND a.company_id=?"
         params.append(cid)
     rows = db.q(sql + f" ORDER BY a.id DESC LIMIT {limit}", params)
     for r in rows:
@@ -641,6 +648,8 @@ def api_events(h, m, body):
     if cid:
         sql += " AND company_id=?"
         params.append(cid)
+    else:   # Phase 3: the all-companies feed leaves out a running bench's companies
+        sql += f" AND (company_id IS NULL OR {NOT_BENCH})"
     agent = _int(qs.get("agent_id", [0])[0])
     if agent:
         sql += " AND agent_id=?"
@@ -667,7 +676,8 @@ def api_approvals(h, m, body):
     status = h.query.get("status", ["pending"])[0]
     cid = _int(h.query.get("company_id", [0])[0])
     sql = ("SELECT p.*, a.name AS agent_name, a.role AS agent_role, c.name AS company_name FROM approvals p "
-           "LEFT JOIN agents a ON a.id=p.agent_id LEFT JOIN companies c ON c.id=p.company_id WHERE ")
+           "LEFT JOIN agents a ON a.id=p.agent_id LEFT JOIN companies c ON c.id=p.company_id "
+           "WHERE COALESCE(c.status, '')!='bench' AND ")   # Phase 3: a running bench's requests never reach the Inbox
     params: list = []
     if status == "pending":
         sql += "p.status='pending'"

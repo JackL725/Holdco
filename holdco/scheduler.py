@@ -233,11 +233,12 @@ class Scheduler(threading.Thread):
 
     def _housekeeping(self, s: dict) -> None:
         """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller.
-        Phase 2 adds decision deadlines (the kill switch holds them itself) and the daily portfolio brief."""
+        Phase 2 adds decision deadlines (the kill switch holds them itself) and the daily portfolio brief, which
+        Phase 3 builds in its own thread: its narrative is a small-model call, and nothing here waits on a model."""
         from . import connectors   # Phase 1: connector health checks and metric pipes (both cheap when not due)
         for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller,
                      connectors.check_if_stale, connectors.poll_if_due,
-                     decisions.resolve_due, rhythms.portfolio_brief_if_due):   # Phase 2
+                     decisions.resolve_due, rhythms.portfolio_brief_in_background):   # Phase 2, 3
             try:
                 step()
             except NotImplementedError:

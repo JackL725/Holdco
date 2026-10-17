@@ -17,12 +17,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-phase3-bench-")
 
-from holdco import bench, browser, config, connectors, db, llm, notify, tools, vault, web  # noqa: E402
+from holdco import (bench, browser, bus, config, connectors, db, llm, notify, server, tools, vault,  # noqa: E402,F401
+                    verify, web, workspace)   # server registers the dashboard's routes
 from holdco.bench import mocks, runner, scenarios  # noqa: E402
 from holdco.routing import ROUTES, HTTPError  # noqa: E402
 from tests.fake_ollama import FakeModelServer  # noqa: E402
@@ -30,16 +32,6 @@ from tests.fake_ollama import FakeModelServer  # noqa: E402
 db.init()
 
 MODEL = "gpt-oss:20b"
-
-# Scenarios that cannot pass until another builder's part is merged; both CI tests leave them out for now. The
-# integration step empties this set.
-PENDING = {
-    "taint_blocks_publish",   # B4: taint.after_tool marks the session tainted after fetch_url, and trust.gate_policy
-                              # then queues the auto social_post with _taint instead of running it
-    "tool_call_repair",       # B2: tools._clean_args answers priority "high" with a repair message; without it the
-                              # lazy model's second "high" passes silently and the scenario cannot fail
-}
-
 
 def _free_port() -> int:
     with socket.socket() as s:
@@ -95,9 +87,8 @@ class TestBench(unittest.TestCase):
         row = self.run_bench(self.model)
         self.assertEqual(row["scenarios"], len(scenarios.SCENARIOS))
         self.assertEqual(len(scenarios.SCENARIOS), 33)
-        failed = _failed(row)
-        self.assertEqual({k: v for k, v in failed.items() if k not in PENDING}, {})
-        self.assertEqual(row["passed"], len(scenarios.SCENARIOS) - len(set(failed) & PENDING))
+        self.assertEqual(_failed(row), {})
+        self.assertEqual((row["passed"], row["pass_rate"]), (33, 1.0))
         # The bench_runs row with all four scores, newest first in the API's list.
         stored = runner.get_run(row["id"])
         for key in ("pass_rate", "tool_validity", "tokens_per_second", "steps_avg"):
@@ -106,13 +97,27 @@ class TestBench(unittest.TestCase):
         self.assertTrue(stored["finished_at"])
         self.assertEqual(len(stored["results"]), 33)
         self.assertEqual(runner.list_runs(1)[0]["id"], row["id"])
-        self.assertIn("approximate", stored["notes"])   # the fake model reports no eval durations
+        # Speed from llm.Reply's eval counts: the fake reports 80 tokens generated in 2 s for every reply.
+        self.assertEqual(stored["tokens_per_second"], 40.0)
+        self.assertNotIn("approximate", stored["notes"])
+        self.assert_clean()
+
+    def test_speed_is_approximate_without_eval_times(self):
+        """The OpenAI-compatible API reports tokens but no generation time: all tokens over the wall time of the model
+        calls, and the notes say so."""
+        row = runner.run_all("local-model", only=["budget_respected"],
+                             settings={"llm_backend": "openai", "llm_base_url": self.model.url})
+        self.assertEqual(_failed(row), {})
+        self.assertIn("Tokens per second is approximate", row["notes"])
+        self.assertGreater(row["tokens_per_second"], 0)
+        self.assertGreater(row["results"][0]["eval_count"], 0)   # completion tokens are reported...
+        self.assertEqual(row["results"][0]["eval_seconds"], 0)   # ...their time is not
         self.assert_clean()
 
     def test_lazy_model_fails_the_right_ones(self):
         row = self.run_bench(self.lazy)
-        failed = set(_failed(row)) - PENDING
-        expected = {s.name for s in scenarios.SCENARIOS if s.lazy_fails} - PENDING
+        failed = set(_failed(row))
+        expected = {s.name for s in scenarios.SCENARIOS if s.lazy_fails}
         self.assertEqual(failed, expected, f"failed only in lazy mode: {sorted(failed - expected)}; passed although "
                                            f"lazy: {sorted(expected - failed)}")
         self.assert_clean()
@@ -193,6 +198,87 @@ class TestBench(unittest.TestCase):
         broken = runner.run_scenario(dataclasses.replace(base, run={**base.run, "role": "nobody"}), MODEL, settings)
         self.assertFalse(broken["passed"])
         self.assertIn("no nobody agent", broken["error"])
+        self.assert_clean()
+
+    def test_bench_companies_stay_out_of_the_owners_view(self):
+        """A bench run's companies are temporary: their requests, agents, events and audit rows never reach the Inbox,
+        the counts, the feed or /status, and nothing of theirs is sent to the owner's phone, from any thread."""
+        def call(path, query=None):
+            h = type("H", (), {"query": {k: [v] for k, v in (query or {}).items()}})()
+            for mth, rx, fn in ROUTES:
+                m = rx.match(path)
+                if mth == "GET" and m:
+                    return fn(h, m, None)
+            raise AssertionError(f"no route GET {path}")
+
+        company, _secret = runner._create_company(scenarios.BY_NAME["respect_approval"])
+        try:
+            cid = company["id"]
+            before = call("/api/state")["approvals"]
+            agent = db.one("SELECT * FROM agents WHERE company_id=? ORDER BY id LIMIT 1", (cid,))
+            aid = db.run("INSERT INTO approvals(company_id, agent_id, task_id, action, summary, payload, status, "
+                         "created_at) VALUES(?,?,?,?,?,?,?,?)", (cid, agent["id"], None, "send_email", "Email to x",
+                                                                 json.dumps({"to": "x@bench.example"}), "pending",
+                                                                 db.now()))
+            db.run("INSERT INTO audit(created_at, company_id, action, proposed_by, approved_by, payload, result) "
+                   "VALUES(?,?,?,?,?,?,?)", (db.now(), cid, "social_post", agent["name"], "policy:auto", "{}", "ok"))
+            db.run("INSERT INTO events(company_id, agent_id, kind, message, created_at) VALUES(?,?,?,?,?)",
+                   (cid, agent["id"], "info", "a bench event", db.now()))
+            state = call("/api/state")
+            self.assertEqual(state["approvals"], before)
+            self.assertNotIn(cid, [c["id"] for c in state["companies"]])
+            self.assertNotIn(cid, [a["company_id"] for a in state["agents"]])
+            self.assertNotIn(aid, [a["id"] for a in call("/api/approvals")["approvals"]])
+            self.assertNotIn(cid, [r["company_id"] for r in call("/api/audit")["audit"]])
+            self.assertNotIn(cid, [e["company_id"] for e in call("/api/events", {"limit": "300"})["events"]])
+            self.assertNotIn(company["name"], notify.format_status())
+            # The phone: neither a request nor an error of a bench company is sent; a real company's still is.
+            sent = []
+            with mock.patch.object(notify, "configured", lambda s=None: True), \
+                    mock.patch.object(notify, "_enqueue", lambda fn, *a, **kw: sent.append(a[0] if a else "")):
+                notify.approval_requested(db.one("SELECT * FROM approvals WHERE id=?", (aid,)))
+                notify.error(db.get_company(cid), f"bench error {aid}")
+                notify.error({"id": cid, "name": company["name"]}, f"bench error {aid} again")
+                self.assertEqual(sent, [])
+                notify.error({"id": None, "name": "Owner Co"}, f"real error {aid}")
+            self.assertEqual(len(sent), 1)
+            # Open dashboards are not sent a running bench's events (they stay in the database for its checks).
+            qu = bus.subscribe()
+            try:
+                with mock.patch.object(bench, "RUNNING", True):
+                    bus.emit(cid, "error", f"bench feed {aid}")
+                    bus.emit(None, "info", f"owner feed {aid}")
+                live = [qu.get_nowait()["message"] for _ in range(qu.qsize())]
+            finally:
+                bus.unsubscribe(qu)
+            self.assertNotIn(f"bench feed {aid}", live)
+            self.assertIn(f"owner feed {aid}", live)
+            self.assertTrue(db.one("SELECT id FROM events WHERE company_id=? AND message=?", (cid, f"bench feed {aid}")))
+        finally:
+            runner._delete_company(company)
+        self.assert_clean()
+
+    def test_web_page_rule_is_the_gates(self):
+        """browser_check_pass applies verify.judge_browser_check, the gate's own rule, so the Bench and the
+        verification gate can never disagree about a page."""
+        sc = scenarios.BY_NAME["fix_page_failing_qa"]
+        company, _secret = runner._create_company(sc)
+        try:
+            page = workspace.safe_path(company, "site/index.html")
+            page.parent.mkdir(parents=True, exist_ok=True)
+            state = {"company": company, "company_id": company["id"], "scenario": sc, "run": None, "task_id": None}
+            for html, passes in ((scenarios.BROKEN_PAGE, False), (scenarios.HOME_PAGE, True)):
+                page.write_text(html, encoding="utf-8")
+                with mock.patch.object(verify, "judge_browser_check", wraps=verify.judge_browser_check) as judge:
+                    ok, detail = runner.check(("file_check", "site/index.html", "browser_check_pass"), state)
+                self.assertEqual(judge.call_count, 1)
+                gate_ok, problems, mode, _facts = verify.judge_browser_check(
+                    company, browser.browser_check(runner._ctx(state), "site/index.html"))
+                self.assertEqual((ok, gate_ok, mode), (passes, passes, "static"))
+                self.assertEqual(detail, ("; ".join(problems) or "the page passes") + " (static)")
+            self.assertFalse(hasattr(runner, "_browser_rule"))
+        finally:
+            runner._delete_company(company)
         self.assert_clean()
 
     def test_mocks_stay_in_their_thread(self):

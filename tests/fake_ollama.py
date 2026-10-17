@@ -16,10 +16,42 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# The form posts to Netlify: the verification gate (Phase 3) fails a page whose form sends its entries nowhere. The
+# unlabelled input stays, for QA's review to find.
 SITE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>PawPlan</title></head>
 <body><h1>Meal plans your dog will actually eat</h1><p>Tell us about your dog.</p>
-<form><input placeholder="you@email.com"><button>Join the waitlist</button></form></body></html>"""
+<form name="waitlist" method="POST" data-netlify="true"><input placeholder="you@email.com"><button>Join the waitlist</button></form></body></html>"""
+
+# Phase 3: public pages the fake agents read with fetch_url and cite, served by the fake server itself at
+# GET /pages/<name> (the e2e app counts 127.0.0.1 as public through HOLDCO_ALLOW_LOCAL). The research gate passes a
+# research file only when the task fetched every URL it cites, so the researcher cites the page it read.
+PAGE_TEXTS = {
+    "pricing": "<!doctype html><html><head><title>Dog meal plan prices</title></head><body><h1>Dog meal plan prices"
+               "</h1><p>PawChef's Weekly plan costs $49 per month.</p><p>Kibble and Co's Fresh plan costs $12 per "
+               "week.</p></body></html>",
+    "vet-article": "<!doctype html><html><head><title>Home-cooked dog food: what vets say</title></head><body><h1>"
+                   "Home-cooked dog food: what vets say</h1><p>Owners who cook for their dogs should follow a recipe "
+                   "a veterinary nutritionist balanced.</p></body></html>",
+}
+PAGES = "http://127.0.0.1:9/pages"   # this server's /pages base; FakeModelServer.start() sets the real one
+
+
+def competitors_file(pages: str) -> str:
+    """Scout's competitor scan: every price line cites the page it came from, which Scout fetched first."""
+    return (f"# Competitors\n\n| Name | Price | Source |\n|---|---|---|\n"
+            f"| PawChef | $49 per month | {pages}/pricing |\n| Kibble and Co | $12 per week | {pages}/pricing |\n")
+
+
+# Phase 3: the pricing page the fake engineer builds in the e2e static gate test: first with a form that sends its
+# entries nowhere (the gate pushes it back), then with a target.
+PRICING_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>PawPlan pricing: one plan, one price</title>
+<meta name="description" content="One weekly meal plan for your dog, with a shopping list."></head>
+<body><h1>One plan, one price</h1><p>A weekly meal plan for your dog, with a shopping list.</p>
+<form name="pricing-waitlist" method="POST" data-netlify="true"><label for="pe">Email</label><input id="pe" type="email">
+<button>Join the waitlist</button></form></body></html>"""
+PRICING_NO_TARGET = PRICING_PAGE.replace('<form name="pricing-waitlist" method="POST" data-netlify="true">', "<form>")
 
 
 def tc(_n, **args):
@@ -178,6 +210,37 @@ def payment_link_step(messages: list[dict], step: int):
     return seq[min(step, len(seq) - 1)]
 
 
+def pricing_page_step(c: "Conv"):
+    """Phase 3 static gate (e2e test_35): Forge builds a page whose form sends its entries nowhere, finishes, is
+    pushed back by the verification gate, fixes the form and finishes again."""
+    if not c.called("write_file"):
+        return tc("write_file", path="site/pricing.html", content=PRICING_NO_TARGET)
+    if not c.called("finish"):
+        return tc("finish", summary="Pricing page built.", deliverable="site/pricing.html")
+    if c.result("finish").startswith("Not finished yet") and c.called("write_file") < 2:
+        return tc("write_file", path="site/pricing.html", content=PRICING_PAGE)
+    return tc("finish", summary="Pricing page built with a labelled waitlist form.", deliverable="site/pricing.html")
+
+
+def post_step(c: "Conv", pages: str, outside: bool):
+    """Phase 3 taint (e2e test_36): Echo posts about a page it fetched (outside content: the post waits for the
+    owner even under an automatic policy), or about a note it read from the company's own files (posts at once)."""
+    if outside and not c.called("fetch_url"):
+        return tc("fetch_url", url=f"{pages}/vet-article")
+    if not outside and not c.called("read_file"):
+        return tc("read_file", path="docs/launch-note.md")
+    if not c.called("social_post"):
+        text = ("Cooking for your dog? Vets say: follow a recipe a veterinary nutritionist balanced." if outside
+                else "PawPlan's first weekly meal plans are ready. Join the waitlist.")
+        return tc("social_post", platform="x", content=text, link=f"{pages}/vet-article" if outside else "")
+    queued = c.result("social_post").startswith(("Queued", "Already waiting"))
+    if queued:
+        return tc("finish", summary="The post waits for the owner's approval.", status="waiting")
+    # (no "the post is out": without a posting webhook the owner posts it by hand, and truth's claims check knows)
+    return tc("finish", summary="Handed the launch note to social_post; it ran under the automatic policy.",
+              status="done")
+
+
 # Phase 2 rhythms: a brief may only use numbers from its data block (write_brief refuses others), so the bodies
 # are built from the "## Data for this brief" JSON in the task prompt and state no number of their own.
 BRIEF_KINDS = {"Evening brief": "daily", "Weekly review": "weekly", "Monthly strategy check": "monthly"}
@@ -286,7 +349,9 @@ def decision_step(user: str, step: int):
     return seq[min(step, len(seq) - 1)]
 
 
-def script(messages: list[dict], tools: list[dict], lazy: bool = False):
+def script(messages: list[dict], tools: list[dict], lazy: bool = False, pages: str = ""):
+    """The next move. pages: the /pages base of the server answering (PAGES when not given)."""
+    pages = pages or PAGES
     system = messages[0]["content"]
     user = messages[1]["content"]
     bench = BENCH_RE.search(system)
@@ -327,6 +392,10 @@ def script(messages: list[dict], tools: list[dict], lazy: bool = False):
                   content=SITE.replace("<input", '<label for="e">Email</label><input id="e"')),
                tc("finish", summary="Fixed labels", deliverable="site/index.html")]
         return seq[min(step, len(seq) - 1)]
+    if role == "Forge" and "Build the pricing page" in user:   # Phase 3: the static web page gate (e2e test_35)
+        return pricing_page_step(Conv(messages, tools))
+    if role == "Echo" and ("Share the vet article" in user or "Post our launch note" in user):
+        return post_step(Conv(messages, tools), pages, outside="Share the vet article" in user)   # e2e test_36
     seqs = {
         "Forge": [tc("write_file", path="site/index.html", content=SITE), tc("deploy_site"),
                   tc("finish", summary="Landing page built; deploy queued.", deliverable="site/index.html")],
@@ -337,8 +406,10 @@ def script(messages: list[dict], tools: list[dict], lazy: bool = False):
                    tc("send_email", to="jo@happypaws.co", subject="Quick idea for Happy Paws",
                       body="Hi Jo,\n\nWe built PawPlan. Worth a look? Reply 'no' and I won't follow up.\n\nPawPlan"),
                    tc("finish", summary="Leads saved; first email queued.", deliverable="sales/leads.md")],
+        # Phase 3: the research gate wants every cited URL fetched in the task, so Scout reads the page it cites.
         "Scout": [tc("web_search", query="dog meal plan app pricing"),
-                  tc("write_file", path="research/competitors.md", content="# Competitors\n\n| Name | Price |\n|---|---|\n"),
+                  tc("fetch_url", url=f"{pages}/pricing"),
+                  tc("write_file", path="research/competitors.md", content=competitors_file(pages)),
                   tc("add_lesson", text="Competitors charge $9-15/month; lead with the plan, not the price."),
                   tc("finish", summary="Competitor scan saved.", deliverable="research/competitors.md")],
         "Ledger": [tc("record_metric", name="waitlist_signups", value=0, note="baseline"),
@@ -1024,6 +1095,7 @@ class FakeModelServer:
                                 "size": 14_000_000_000, "size_vram": 14_000_000_000}]
         self.prompt_tokens = 900          # what each chat reply reports as prompt_eval_count (context use)
         self.schema_misses: list[str] = []   # scripted tools a JSON-schema request did not allow (should stay empty)
+        self.cycle_prompts: list[str] = []   # Phase 3: the planning-cycle prompts received (the newest 20)
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -1042,6 +1114,19 @@ class FakeModelServer:
                     pass  # the app was restarted mid-request (restart test)
 
             def do_GET(self):
+                name = self.path.partition("?")[0][len("/pages/"):] if self.path.startswith("/pages/") else None
+                if name is not None:   # Phase 3: a public page the fake agents fetch and cite
+                    page = PAGE_TEXTS.get(name)
+                    b = (page or "<html><head><title>Not found</title></head><body>Not found</body></html>").encode()
+                    self.send_response(200 if page else 404)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 if self.path == "/api/tags":
                     return self._json(200, {"models": [{"name": "gpt-oss:20b"}, {"name": "notools:latest"}]})
                 if self.path == "/v1/models":
@@ -1067,6 +1152,9 @@ class FakeModelServer:
                 time.sleep(outer.delay)
                 msgs, tools = body["messages"], body.get("tools") or []
                 ping = "Call the ping tool" in msgs[-1]["content"]
+                first = str((msgs[1] if len(msgs) > 1 else {}).get("content") or "")
+                if first.startswith("Run a planning cycle"):   # Phase 3: tests read what the CEO's review sees
+                    outer.cycle_prompts = (outer.cycle_prompts + [first])[-20:]
                 if self.path == "/v1/chat/completions":
                     r = tc("ping", message="ok") if ping else outer.script(msgs, tools)
                     if isinstance(r, str):
@@ -1106,10 +1194,17 @@ class FakeModelServer:
         self.port = self.httpd.server_address[1]
         self.url = f"http://127.0.0.1:{self.port}"
 
+    @property
+    def pages(self) -> str:
+        """The base URL of this server's public pages (Phase 3): f"{pages}/pricing" and f"{pages}/vet-article"."""
+        return f"{self.url}/pages"
+
     def script(self, messages: list[dict], tools: list[dict]):
-        return script(messages, tools, lazy=self.lazy)
+        return script(messages, tools, lazy=self.lazy, pages=self.pages)
 
     def start(self):
+        global PAGES
+        PAGES = self.pages   # for callers of script() that pass no server (the newest server started)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         return self
 

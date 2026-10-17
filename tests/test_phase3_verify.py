@@ -783,6 +783,130 @@ class TestGate(Base):
         self.assertFalse(truth.suppressed("max@stop-verify.com"))
 
 
+# =============================================================================================== integration
+
+TEST_CALC = ("import unittest\nfrom code.calc import add\n\n\nclass TestAdd(unittest.TestCase):\n"
+             "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n")
+
+
+class TestIntegration(Base):
+    """Seams between the gate, finish, the tools and the Bench, settled when Phase 3's parts were merged."""
+
+    def test_static_rule_checks_every_form(self):
+        """The static fallback reads the forms from the page's HTML too, so a form that sends its entries nowhere fails
+        without Playwright as it does with it (the Bench's browser_check_pass applies this same rule)."""
+        c = make_company("FormCo")
+        task = make_task(c, "engineering", "Build the waitlist page", deliverable="site/index.html")
+        ctx = ctx_for(c, "engineering", task)
+        write(ctx, "site/index.html", PAGE)
+        write(ctx, "site/about.html", ABOUT)
+        server = PreviewServer(c)
+        self.addCleanup(server.stop)
+        with connections({}), mock.patch.object(config, "PORT", server.port):
+            problem = verify.finish_problem(ctx, "site/index.html", "", "")
+            self.assertTrue(problem.startswith("web page: site/index.html: form 1 (waitlist) has no action or "
+                                               "data-netlify attribute (submissions go nowhere)"), problem)
+            [r] = verification(task)
+            self.assertEqual((r["passed"], r["mode"]), (False, "static"))
+            write(ctx, "site/index.html", FIXED)
+            self.assertIsNone(verify.finish_problem(ctx, "site/index.html", "", ""))
+            self.assertIn("1 form(s) with a target", verification(task)[0]["detail"])
+
+    def test_finish_waits_on_the_test_run(self):
+        """No sandbox and run_code on 'approve': the tests wait for the owner. That is nothing the agent can fix, so
+        finish ends the task 'waiting' on the request at once, as Phase 0.5's waiting tasks do; with another failure
+        as well, finish pushes back once and then waits on the request instead of ending partial."""
+        c = make_company("WaitCo")
+        task = make_task(c, "engineering", "Write the price calculator", deliverable="code/calc.py")
+        ctx = ctx_for(c, "engineering", task, start_run(c, "engineering", task))
+        write(ctx, "code/__init__.py", "")
+        write(ctx, "code/calc.py", CALC_GOOD)
+        write(ctx, "code/test_calc.py", TEST_CALC)
+        self.assertEqual(tools.execute(ctx, "finish", {"summary": "Calculator written"}), "Session ended.")
+        req = db.one("SELECT id FROM approvals WHERE task_id=? AND action='run_code' AND status='pending'",
+                     (task["id"],))
+        self.assertEqual(ctx.finish_status, "waiting")
+        self.assertFalse(ctx.verify_warned)   # no push-back: there was nothing to fix
+        self.assertIn(f"Waiting on the owner: #{req['id']}", ctx.finish_summary)
+        self.assertIn(f"Verification waits on the owner: code: tests need to run: approve request #{req['id']}",
+                      ctx.finish_summary)
+        # A failing page as well: pushed back once, then the task waits on the test run.
+        other = make_company("WaitPageCo")
+        page = make_task(other, "engineering", "Build the calculator page", deliverable="site/index.html")
+        pctx = ctx_for(other, "engineering", page, start_run(other, "engineering", page))
+        write(pctx, "site/index.html", PAGE)
+        write(pctx, "site/about.html", ABOUT)
+        write(pctx, "code/test_page.py", TEST_CALC)   # a test file written in this task: the code kind applies
+        server = PreviewServer(other)
+        self.addCleanup(server.stop)
+        with connections({}), mock.patch.object(config, "PORT", server.port):
+            first = tools.execute(pctx, "finish", {"summary": "Page built"})
+            self.assertTrue(first.startswith("Not finished yet: web page: site/index.html: form 1"), first)
+            self.assertIn("(also failing: code)", first)
+            self.assertEqual(tools.execute(pctx, "finish", {"summary": "Page built"}), "Session ended.")
+        waits_on = db.one("SELECT id FROM approvals WHERE task_id=? AND action='run_code' AND status='pending'",
+                          (page["id"],))
+        self.assertEqual(pctx.finish_status, "waiting")
+        self.assertIn("Verification failed: web page: site/index.html: form 1", pctx.finish_summary)
+        self.assertIn(f"Waiting on the owner: #{waits_on['id']}", pctx.finish_summary)
+
+    def test_run_code_network_flag(self):
+        """run_code asks for the network only when the task says network=true; the owner's "Allow network" box on the
+        card (an edit of the request) reaches the sandbox."""
+        c = make_company("NetCo")
+        plain = make_task(c, "engineering", "Count the words in the FAQ")
+        online = make_task(c, "engineering", "Fetch today's exchange rates",
+                           description="Download the rates with a script. network=true")
+        rows = {}
+        for task, want in ((plain, False), (online, True)):
+            out = tools.execute(ctx_for(c, "engineering", task), "run_code", {"code": f"print({int(want)})"})
+            self.assertTrue(out.startswith("Queued for the owner's approval as request #"), out)
+            rows[want] = db.one("SELECT * FROM approvals WHERE task_id=? AND action='run_code'", (task["id"],))
+            self.assertIs(json.loads(rows[want]["payload"])["network"], want)
+        seen = []
+        with mock.patch.object(sandbox, "run", lambda company, lang, code, timeout, network=False:
+                               seen.append(network) or "Sandbox: docker\nExit code 0\n"):
+            actions.decide(rows[False]["id"], "approve", payload={"network": True})
+            actions.decide(rows[True]["id"], "approve")
+        self.assertEqual(seen, [True, True])
+
+    def test_daily_cap_is_one_rule(self):
+        """send_email and outreach_check read the daily limit the same way (0 means agents send none) and word it the
+        same way; at finish a waiting email is counted once, and one that already went out is not held to the cap."""
+        c = make_company("CapCo", daily_email_limit=0)
+        task = make_task(c, "sales", "Email the dog shops")
+        run_id = start_run(c, "sales", task)
+        ctx = ctx_for(c, "sales", task, run_id)
+        dee = "dee@shop-cap-verify.com"
+        email = {"to": dee, "subject": "Hi", "body": "Hi Dee, CapCo plans dog meals. Worth a look?\n\nCapCo, 1 Main St, "
+                                                     "Springfield\nReply 'stop' and we won't email you again."}
+        refused = "daily email limit reached: 0 sent or queued today and the limit is 0; send the rest tomorrow"
+        self.assertEqual(tools.execute(ctx, "send_email", email), f"ERROR: email not sent: {refused}")
+        self.assertEqual(verify.outreach_check(ctx, email), [refused])
+        self.assertFalse(db.q("SELECT id FROM approvals WHERE company_id=?", (c["id"],)))
+        # A limit of 1: the first email is queued, the second refused in the same words.
+        set_settings(c, daily_email_limit=1)
+        ctx = ctx_for(c, "sales", task, run_id)
+        queued = tools.execute(ctx, "send_email", email)
+        self.assertTrue(queued.startswith("Queued for the owner's approval as request #"), queued)
+        self.assertEqual(tools.execute(ctx, "send_email", {**email, "to": "eve@shop-cap-verify.com"}),
+                         "ERROR: email not sent: daily email limit reached: 1 sent or queued today and the limit is 1; "
+                         "send the rest tomorrow")
+        # At finish the queued email is among today's count already: it brings the count up to the limit, not over.
+        self.assertIsNone(verify.finish_problem(ctx, "", "", ""))
+        self.assertEqual([(r["kind"], r["passed"]) for r in verification(task)], [("outreach", True)])
+        # Once it went out, a lower limit no longer concerns it (the other rules still do).
+        aid = int(queued.split("#")[1].split(".")[0])
+        db.update("approvals", aid, status="done", decided_at=db.now())
+        db.run("INSERT INTO emails(company_id, direction, to_addr, subject, body, status, created_at) "
+               "VALUES(?,?,?,?,?,?,?)", (c["id"], "out", dee, "Hi", "x", "sent", db.now()))
+        set_settings(c, daily_email_limit=0)
+        self.assertIsNone(verify.finish_problem(ctx_for(c, "sales", task, run_id), "", "", ""))
+        self.suppress(dee, "replied stop")
+        self.assertIn("recipient is on the do-not-email list",
+                      verify.finish_problem(ctx_for(c, "sales", task, run_id), "", "", ""))
+
+
 # =============================================================================================== the sandbox
 
 class TestSandbox(Base):
