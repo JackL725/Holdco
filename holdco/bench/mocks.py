@@ -1215,6 +1215,44 @@ def _scripted_page(pages: dict, url: str) -> tuple[int, str, bytes, str]:
     return 200, "text/html; charset=utf-8" if is_html else "text/plain; charset=utf-8", text.encode("utf-8"), url
 
 
+STOPWORDS = frozenset("the and for with what who how where why when are was were has have this that from into your our "
+                      "you their they them its about over under per can does not any all new best top site www com "
+                      "org net http https".split())
+
+
+def _words(text: str) -> set[str]:
+    """The search keys of a text: its words in lower case without stopwords or one- and two-letter words, each cut to
+    its first four letters after a plural s, so "prices" and "pricing", "cooked" and "cooking", "community" and
+    "communities" meet."""
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+        if len(w) < 3 or w in STOPWORDS:
+            continue
+        if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+            w = w[:-1]
+        out.add(w[:4])
+    return out
+
+
+def relevant(rows: list[dict], query: str) -> list[dict]:
+    """The scripted results a query finds, best first, as a search engine would. A result is found when it shares a
+    telling word with the query: one that at most half of the results have ("dog" tells nothing in a world of dog
+    food pages, so "dog owners population united states" finds nothing there). A query made only of common words
+    finds every result that has one of them. Before Phase 3's bench gate every query got the same results, and real
+    models searched again and again for pages the scenario does not have."""
+    q = _words(query)
+    texts = [_words(" ".join(str(r.get(k) or "") for k in ("title", "url", "snippet"))) for r in rows]
+    common = {w for w in set().union(*texts) if sum(w in t for t in texts) * 2 > len(texts)} if len(texts) > 1 \
+        else set()
+    telling = q - common
+    scored = []
+    for i, (r, words) in enumerate(zip(rows, texts)):
+        hits = q & words
+        if hits and (not telling or hits & telling):
+            scored.append((-len(hits), i, r))
+    return [r for _s, _i, r in sorted(scored, key=lambda x: (x[0], x[1]))]
+
+
 def _patch_web(m: Mocks) -> None:
     from .. import doctor, web
     orig_search, orig_get, orig_check, orig_status = web.search, web.http_get, web.check_public_url, \
@@ -1228,7 +1266,7 @@ def _patch_web(m: Mocks) -> None:
         if blocked:
             raise web.WebError("All search providers failed: " + BLOCKED_REASONS)
         rows = [dict(r) for r in (m.spec.get("search") or []) if isinstance(r, dict) and r.get("url")]
-        return rows[:max(1, min(int(n or 6), 10))]
+        return relevant(rows, str(query))[:max(1, min(int(n or 6), 10))]
 
     def http_get(url, headers=None, timeout=25):
         if not m.mine():
@@ -1461,9 +1499,11 @@ def _record(m: Mocks) -> None:
             m._depth.n = depth
         # llm.Reply carries what the server measured: eval_count tokens generated in eval_seconds (Ollama). The OpenAI
         # API reports no generation time (eval_seconds 0), so the runner falls back to tokens over this wall time.
+        # text is for the scenario's trace: a reply the run's transcript does not keep (a chat's final answer).
         m.replies.append({"kind": m.kind, "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
                           "eval_count": int(reply.eval_count or 0), "eval_seconds": float(reply.eval_seconds or 0.0),
-                          "calls": len(reply.tool_calls or []), "mode": reply.mode})
+                          "calls": len(reply.tool_calls or []), "mode": reply.mode,
+                          "text": str(reply.content or "")[:2000]})
         return reply
 
     def execute(ctx, name, args):

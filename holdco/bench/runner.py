@@ -87,7 +87,7 @@ def run_scenario(sc: scenarios.Scenario, model: str, overrides: dict | None = No
     out = {"name": sc.name, "purpose": sc.purpose, "job": sc.job, "kind": sc.run.get("kind") or "job",
            "lazy_fails": sc.lazy_fails, "passed": False, "seconds": 0.0, "steps": 0, "replies": 0, "valid": 0,
            "tokens": 0, "eval_count": 0, "eval_seconds": 0.0, "model_seconds": 0.0, "assertions": [], "failed": [],
-           "error": ""}
+           "error": "", "trace": []}
     company = handle = None
     try:
         company, secret = _create_company(sc)
@@ -113,6 +113,7 @@ def run_scenario(sc: scenarios.Scenario, model: str, overrides: dict | None = No
         if sc.job == "main":
             watchdog.tick()   # one pass of the watchdog, as the scheduler's next tick would do
         state = _state(sc, company, handle, secret, info, job)
+        out["trace"] = trace(handle, state)
         for a in sc.assertions:
             try:
                 ok, detail = check(a, state)
@@ -494,10 +495,11 @@ def _a_tool_not_called(state, name, args=None):
     return False, f"{len(hits)} call(s), e.g. {hits[0]['name']}({_text(hits[0]['args'])[:200]})"
 
 
-def _a_valid_args(state, name=None, after_step=0):
-    """Every call (to name, after step after_step) passed the argument check. With no such call there is nothing to
-    repair: a model that got the call right at the first step passes, and tool_called decides whether it was made."""
-    calls = [c for c in state["calls"] if (name is None or _matches(c["name"], name)) and c["step"] > after_step]
+def _a_valid_args(state, name=None, after_step=0, args=None):
+    """Every call (to name, after step after_step, with arguments matching args) passed the argument check. With no
+    such call there is nothing to repair: a model that got the call right at the first step passes, and tool_called
+    decides whether it was made."""
+    calls = [c for c in (_calls(state, name, args) if name else state["calls"]) if c["step"] > after_step]
     if not calls:
         return True, f"no call to {name or 'any tool'}" + (f" after step {after_step}" if after_step else "")
     bad = [c for c in calls if REPAIR_RE.match(str(c["result"]))]
@@ -588,16 +590,29 @@ def _a_escalation(state, pattern):
     return n == 1, f"{n} pending question(s) with pattern {pattern}"
 
 
-def _a_decision_asked(state, min_options=2):
-    rows = [db.loads(r["payload"], {}) or {} for r in _approvals(state, "decision", "pending")]
-    for p in rows:
+def _a_decision_asked(state, min_options=2, about=None):
+    """A pending choice for the owner with at least min_options options and a recommendation among them: a decision
+    (ask_decision), or a question asked with options and a recommendation (ask_owner turns those into the same
+    buttons; its description asks for them "whenever there is a choice"). about: a regex the question or its
+    options must match, so an unrelated choice (a goal change queues Keep or Revert) does not count. Until the
+    Phase 3 bench gate only decisions counted, whatever they were about."""
+    rows = [("decision", db.loads(r["payload"], {}) or {}) for r in _approvals(state, "decision", "pending")]
+    rows += [("question", db.loads(r["payload"], {}) or {}) for r in _approvals(state, "question", "pending")]
+    near = 0
+    for kind, p in rows:
         opts = [str(o) for o in (p.get("options") or [])]
+        text = "\n".join([str(p.get("question") or "")] + opts)
+        if about and not re.search(about, text):
+            continue
+        near += 1
         if len(opts) >= int(min_options) and str(p.get("recommended") or "") in opts:
-            return True, f"decision with {len(opts)} options, recommended: {p.get('recommended')}"
+            return True, f"{kind} with {len(opts)} options, recommended: {p.get('recommended')}"
+    if near:
+        return False, (f"{near} pending decision(s) or question(s) on it, none with {min_options}+ options and a "
+                       f"recommendation among them")
     if rows:
-        return False, f"{len(rows)} pending decision(s), none with {min_options}+ options and a recommendation"
-    asked = len(_approvals(state, "question", "pending"))
-    return False, "no pending decision" + (f" ({asked} plain question(s) instead)" if asked else "")
+        return False, f"{len(rows)} pending decision(s) or question(s), none about {about}"
+    return False, "nothing was asked: no pending decision or question"
 
 
 def _norm_url(url: str) -> str:
@@ -783,6 +798,85 @@ CHECKS = {
 }
 
 
+# ======================================================================== the trace: what the model did
+
+TRACE_CAP = 12_000      # characters of trace per scenario (as JSON); the middle steps go first
+TRACE_ARGS = 300        # characters of a call's arguments
+TRACE_RESULT = 300      # characters of a tool result
+TRACE_TEXT = 600        # characters of a plain-text reply, a run's summary or a job's output
+
+
+def _clip(text, n: int) -> str:
+    """Whitespace folded to single spaces, at most n characters with an ellipsis."""
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n - 1].rstrip() + "…"
+
+
+def trace(handle: mocks.Mocks, state: dict) -> list[dict]:
+    """A compact record of what the model did in a scenario, for diagnosing failures on the bench page. One entry per
+    tool call {step, tool, args, result}, a plain-text reply {step, text}, the end of each run {run, status, steps,
+    summary}, and for a small-model job its output. Capped at TRACE_CAP characters: the first and the last steps
+    stay, the middle ones are replaced by one {note} entry.
+
+    Each run's transcript is the source, so calls the loop guard answered instead of running are there with its
+    answer; replies a transcript does not keep (a chat's final answer, the last of three nudged replies) come from
+    the replies the mocks recorded. step counts the model's replies across the scenario's runs."""
+    if state["scenario"].job != "main":
+        return [{"step": 1, "text": _clip((state.get("job") or {}).get("output"), TRACE_TEXT * 3)}]
+    replies = [r for r in handle.replies if r["kind"] in AGENT_KINDS + ("chat",)]
+    entries: list[dict] = []
+    step = 0
+    for run in state["runs"]:
+        first = step
+        msgs = state["transcripts"].get(run["id"]) or []
+        for i, m in enumerate(msgs):
+            if m.get("role") != "assistant":
+                continue
+            step += 1
+            calls = m.get("tool_calls") or []
+            if not calls:
+                entries.append({"step": step, "text": _clip(m.get("content"), TRACE_TEXT) or "(no tool call and no text)"})
+                continue
+            results = [x for x in msgs[i + 1:i + 1 + len(calls)] if x.get("role") == "tool"]
+            for j, c in enumerate(calls):
+                entries.append({"step": step, "tool": str(c.get("name") or ""),
+                                "args": _clip(json.dumps(c.get("arguments") or {}, ensure_ascii=False, default=str),
+                                              TRACE_ARGS),
+                                "result": _clip(results[j].get("content") if j < len(results) else "(not run)",
+                                                TRACE_RESULT)})
+        while step < first + int(run["steps"] or 0):   # replies the transcript does not keep
+            step += 1
+            text = replies[step - 1].get("text") if step <= len(replies) else ""
+            entries.append({"step": step, "text": _clip(text, TRACE_TEXT) or "(no tool call and no text)"})
+        entries.append({"run": run["kind"], "status": run["status"], "steps": int(run["steps"] or 0),
+                        "summary": _clip(run.get("summary"), TRACE_TEXT)})
+    return cap_trace(entries)
+
+
+def cap_trace(entries: list[dict], cap: int = TRACE_CAP) -> list[dict]:
+    """entries within cap characters (as JSON): the head and the tail kept, the middle replaced by one note."""
+    sizes = [len(json.dumps(e, ensure_ascii=False)) + 2 for e in entries]
+    if sum(sizes) <= cap:
+        return entries
+    room = cap - 120   # the note
+    head: list[dict] = []
+    used = 0
+    i = 0
+    while i < len(entries) and used + sizes[i] <= room // 2:
+        head.append(entries[i])
+        used += sizes[i]
+        i += 1
+    tail: list[dict] = []
+    j = len(entries) - 1
+    while j >= i and used + sizes[j] <= room:
+        tail.insert(0, entries[j])
+        used += sizes[j]
+        j -= 1
+    left_out = j - i + 1
+    return head + [{"note": f"{left_out} more entr{'y' if left_out == 1 else 'ies'} left out to keep the trace "
+                            "short"}] + tail
+
+
 # ======================================================================== scores and the bench_runs row
 
 def _score_replies(out: dict, handle: mocks.Mocks, state: dict) -> None:
@@ -876,4 +970,10 @@ def get_run(run_id) -> dict | None:
 
 
 def list_runs(limit: int = 20) -> list[dict]:
-    return [_row(r) for r in db.q("SELECT * FROM bench_runs ORDER BY id DESC LIMIT ?", (max(1, int(limit)),))]
+    """The newest runs. Their scenario results leave out the traces (up to TRACE_CAP characters each, 33 per run):
+    the list never shows them, and get_run, the page of one run, has them."""
+    out = [_row(r) for r in db.q("SELECT * FROM bench_runs ORDER BY id DESC LIMIT ?", (max(1, int(limit)),))]
+    for row in out:
+        row["results"] = [{k: v for k, v in s.items() if k != "trace"} if isinstance(s, dict) else s
+                          for s in row["results"]]
+    return out
