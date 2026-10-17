@@ -153,7 +153,8 @@ class TestFactsSection(Quiet):
         self.assertIn("UTC", lines[1])
         self.assertIn("Company founded 11 hours ago.", f)
         self.assertIn("Website: local preview only; not deployed.", f)
-        self.assertIn("Email: not connected: you cannot send email until the owner adds a mailbox. Sent so far: 0.", f)
+        self.assertIn("Email: not connected: nothing goes out until the owner adds a mailbox; send_email still queues "
+                      "an email for the owner to review. Sent so far: 0.", f)
         self.assertIn("Social posting: no webhook or account.", f)
         self.assertIn("Accounts this company has: none besides the local website. Do not link to or claim any other "
                       "account", f)

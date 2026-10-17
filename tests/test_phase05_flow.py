@@ -332,9 +332,10 @@ class TestWaitingTasks(Base):
         task = make_task(self.c, "marketing", "Write the FAQ")
         ctx = ctx_for(self.c, "marketing", task=task)
         out = tools.execute(ctx, "finish", {"summary": "Waiting.", "status": "waiting"})
-        self.assertEqual(out, "Not finished yet: nothing is waiting on the owner for this task. Ask with ask_owner "
-                              "(one question with options and your recommendation), or finish with status "
-                              "'blocked' and say what blocks you.")
+        self.assertEqual(out, "Not finished yet: nothing is waiting on the owner for this task. If only the owner "
+                              "can unblock it, ask with ask_owner (one question with options and your "
+                              "recommendation). Otherwise save what you have and finish with status 'partial' when "
+                              "another attempt can carry on, or 'blocked' and say what blocks you.")
         self.assertFalse(ctx.finished)
         tools.execute(ctx, "finish", {"summary": "Waiting.", "status": "waiting"})
         self.assertEqual(ctx.finish_status, "blocked")

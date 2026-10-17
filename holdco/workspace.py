@@ -152,8 +152,13 @@ def lease(company: dict, rel_path: str, ctx) -> str | None:
             holder = (db.get_agent(row["agent_id"]) or {}).get("name") if row.get("agent_id") else None
             until = (db.parse_time(row["expires_at"]) or now_dt).strftime("%H:%M")
             what = f" (task #{row['task_id']})" if row.get("task_id") else ""
-            return (f"ERROR: {rel_path} is being edited by {holder or 'another agent'}{what} until {until} UTC; "
-                    f"work on something else or wait.")
+            # Phase 3: the refusal says what to do. "Work on something else or wait" left agents nothing to do in
+            # the session, and the real-model bench run finished 'blocked', where the task stays until someone
+            # unblocks it by hand.
+            return (f"ERROR: {rel_path} is being edited by {holder or 'another agent'}{what} until {until} UTC, so "
+                    f"it can't be changed now. Don't wait for it: save your version in another file (for example "
+                    f"drafts/{rel_path}), say in your finish where it is so it can be applied once that edit is done, "
+                    f"and finish with status 'partial'.")
         if not run_id:
             return None
         expires = (now_dt + _dt.timedelta(minutes=LEASE_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")

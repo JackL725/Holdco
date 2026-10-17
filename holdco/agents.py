@@ -104,8 +104,12 @@ def _shared_rules(kind: str, max_steps: int) -> str:
         "owner hasn't approved.",
         "Check your notes and the file list before starting so you don't redo work. If you need a teammate, create "
         "a task for them with a deliverable.",
-        "Outside services (payments, email, a browser, social posting) are reached through find_tool; what you load "
-        "may wait for the owner's approval, like email.",
+        # Phase 3 bench gate: this used to say email and social posting are reached through find_tool, while
+        # send_email and social_post sit on the belt; a marketer looked for a posting service, found none, and
+        # finished its post task blocked.
+        "Use the tools on your list directly (send_email and social_post included, when you have them). Services "
+        "the owner connected (payments, a browser, other apps) are reached through find_tool; what you load may "
+        "wait for the owner's approval, like email.",
     ]
     if kind == "chat":
         rules[0] = (f"You have {max_steps} tool calls for this reply; use them only if they help, then answer in "
@@ -351,6 +355,17 @@ def chat_prompt(company: dict, agent: dict, latest: str) -> str:
 
 # ---------------------------------------------------------------- the loop
 
+# A failed call whose result asks for a retry ("the disk was busy ... Try again", "busy with another call; try again")
+# may be made again: the loop guard used to answer the retry with "You already made this exact call" and then stop the
+# session for repeating it (Phase 3 bench gate, tool_error_recovery).
+RETRY_INVITED = re.compile(r"^ERROR\b.*\btry again\b(?! next week)", re.I | re.S)
+RETRIES_INVITED = 2
+
+# The reply to a reply with no tool call. Phase 3 bench gate: it used to say "Use your tools to do the work", and a
+# CEO that had written its five planned create_task calls as text read that as "do the work yourself": it wrote the
+# landing page and ten invented customer interviews instead of planning.
+NUDGE = ("That reply was text, so nothing happened: only tool calls act, and a call written out as text is not run. "
+         "Make your next tool call now, or call finish with a summary if the work is done.")
 SUMMARY_MIN_CHARS = 700   # Phase 3: an old tool result longer than this is summarised by the small model, not cut
 SUMMARY_SYSTEM = ("You shorten one tool result from an AI agent's work session so the agent can keep working with "
                   "less text. Keep every number, price, date, URL, file path, name and error message exactly as "
@@ -589,6 +604,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
     tokens, steps, nudges, status, error = 0, 0, 0, "done", ""
     max_prompt = 0         # Phase 3: the largest prompt this run sent (runs.max_prompt_tokens, Settings' context use)
     seen_calls: dict[str, int] = {}
+    retry_ok: dict[str, int] = {}   # fingerprint -> retries its last result asked for (RETRY_INVITED)
     chat_checked = False   # a chat reply that failed the claims check gets one rewrite
     chat_draft = ""        # ... and is kept, with Holdco's records appended, if the steps run out first
     # Chat holds its own slot for the whole reply. Phase 3: other runs take the GPU slot for each model call and
@@ -647,6 +663,11 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                         fp = c.name + json.dumps(c.arguments, sort_keys=True, default=str)
                         seen_calls[fp] = seen_calls.get(fp, 0) + 1
                         repeatable = c.name in ("check_inbox", "list_tasks", "finish")
+                        if seen_calls[fp] >= 2 and retry_ok.get(fp, 0) > 0:
+                            # The last result of this very call said to try again (a busy disk, a busy service):
+                            # the retry is what it asked for, not a loop. Up to RETRIES_INVITED times per call.
+                            retry_ok[fp] -= 1
+                            seen_calls[fp] = 1
                         if seen_calls[fp] == 2 and not repeatable:
                             result = ("You already made this exact call in this session; its result is above. "
                                       "Do something different, or finish.")
@@ -659,6 +680,8 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                             result = tools.execute(ctx, c.name, c.arguments)
                             if c.name in _WORKSPACE_CHANGERS and not result.startswith("ERROR"):
                                 _forget_reads(seen_calls)
+                            if RETRY_INVITED.search(result) and fp not in retry_ok:
+                                retry_ok[fp] = RETRIES_INVITED
                         messages.append({"role": "tool", "name": c.name, "tool_call_id": c.id or f"call_{step}_{i}",
                                          "content": result})
                         bus.emit(company["id"], "result", f"{c.name}: {result[:200]}".replace("\n", " "), agent_id,
@@ -696,8 +719,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                     ctx.finish_summary = f"Status: partial\nSummary: {content[:2000]}"
                     break
                 messages.append({"role": "assistant", "content": content, "thinking": reply.thinking})
-                messages.append({"role": "user", "content": "Use your tools to do the work. When you're completely "
-                                 "done, call the finish tool with a summary."})
+                messages.append({"role": "user", "content": NUDGE})
             else:
                 if kind == "chat" and ctx.reply is None and chat_draft:
                     ctx.reply = chat_draft + "\n\n" + _records_line(company, chat_draft)

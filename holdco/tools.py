@@ -963,8 +963,12 @@ def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     return None
 
 
-WAITING_REFUSAL = ("Not finished yet: nothing is waiting on the owner for this task. Ask with ask_owner (one question "
-                   "with options and your recommendation), or finish with status 'blocked' and say what blocks you.")
+# Phase 3 bench gate: the refusal names 'partial' too. It used to offer only ask_owner or 'blocked', and real-model runs
+# that had work left for another attempt (a leased file, a guide half written) took 'blocked', where a task stays.
+WAITING_REFUSAL = ("Not finished yet: nothing is waiting on the owner for this task. If only the owner can unblock it, "
+                   "ask with ask_owner (one question with options and your recommendation). Otherwise save what you "
+                   "have and finish with status 'partial' when another attempt can carry on, or 'blocked' and say "
+                   "what blocks you.")
 WAITING_ON_LABEL = "Waiting on the owner: "
 
 
@@ -1001,6 +1005,15 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         # The brief is the deliverable, not the file path the model names for it (the real-model run named
         # briefs/daily-<date>.md, which never exists, and the next planning cycle flagged it MISSING).
         target = f"the {rhythms.BRIEF_LABEL[brief['kind']]} (brief #{brief['id']}, on the Overview)"
+    if ctx.kind == "founding" and status == "waiting":
+        # A founding stage never waits: the next stage starts (or founding completes) either way, and a question
+        # the stage asked stays in the owner's Inbox. Kept as 'waiting', the plan stage that asked for a domain (as
+        # its prompt says to) counted as founding cut short and sent the owner a "founding stopped" question too.
+        status = "done"
+        asked = int(db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND status='pending'",
+                              (ctx.company["id"],)) or 0)
+        if asked:
+            open_issues = (open_issues + f"\nWaiting on the owner: {asked} request(s) in the Inbox.").strip()
     if ctx.kind == "founding" and ctx.founding_stage:
         # Phase 0.5: founding runs have no task, so each stage's own deliverable is checked instead, whatever the
         # status. Once: the stage gets one more chance to save it, then its finish is accepted with a note.

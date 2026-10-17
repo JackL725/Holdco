@@ -884,8 +884,10 @@ def cycle_header(company: dict, requested: bool = False) -> str:
 
 FOUNDING_STAGES = ("research", "charter", "critic", "plan")
 # Phase 2: the charter stage also writes the strategy and one to three goals (two more calls than before, plus room
-# for one refused attempt).
-STAGE_STEPS = {"research": 12, "charter": 12, "critic": 6, "plan": 12}
+# for one refused attempt). Phase 3 bench gate: the plan stage asks for two reads, 5 to 8 tasks, the welcome brief,
+# one question and finish, up to 13 calls, so 12 could not hold its own instructions; a real run that created six
+# tasks (one refused) sent the brief and the question and had no call left to finish.
+STAGE_STEPS = {"research": 12, "charter": 12, "critic": 6, "plan": 16}
 STAGE_TEXT = {"research": "researching the market", "charter": "writing the charter",
               "critic": "a skeptical investor is reviewing the charter", "plan": "planning the first week"}
 STAGE_THINK = {"research": "medium", "charter": "high", "critic": "high", "plan": "high"}
@@ -1013,13 +1015,21 @@ def _research_text(steps: int, search_down: bool) -> str:
             "quote copied exactly from the page you fetched).\n"
             if _tool_ready("record_fact") else
             "3. For every price or number you will rely on, open the page with fetch_url so you can cite it.\n")
+    # With search down, step 1 must not ask for 3 to 6 searches when the note above allows one: the two lines
+    # contradicted each other until the Phase 3 bench gate.
+    first = ("1. Research the market with fetch_url on addresses you already know (web search is down: no more "
+             "than one try): who the customers are, what they pay for this today and to whom, competitors with "
+             "their prices, and where these customers can be reached. What you cannot open goes on the Gaps list.\n"
+             if search_down else
+             "1. Research the market with web_search and fetch_url (3 to 6 searches): who the customers are, what "
+             "they pay for this today and to whom, at least three real competitors with their prices, and where "
+             "these customers can be reached (communities, directories, search terms, events). When searches keep "
+             "returning the same pages, stop searching and write down what you have.\n")
     return (
         f"\nThis stage: research the market. You have {steps} tool calls: save your findings and finish by call "
         f"{max(2, steps - 2)}.\n" + note
         + "\nDo this, in order:\n"
-        "1. Research the market with web_search and fetch_url (3 to 6 searches): who the customers are, what they "
-        "pay for this today and to whom, at least three real competitors with their prices, and where these "
-        "customers can be reached (communities, directories, search terms, events).\n"
+        + first +
         f"2. Write {RESEARCH_PATH} early, as soon as you have the first findings, and append to it as you go "
         "(write_file with append=true): a source URL or [fact N] next to every price and number, and a Gaps list "
         "for what you could not find. Pages you only read are lost when this stage ends; what you save is what "
@@ -1243,7 +1253,8 @@ def _plan_text(company: dict, steps: int) -> str:
         "5. If the company needs something only the owner can give (a mailbox, a postal address for email, a "
         "domain, a budget), ask one consolidated question with ask_owner: the options one per line and your "
         "recommendation. Ask nothing else.\n"
-        "6. Call finish."
+        "6. Call finish with status 'done'. A question to the owner does not hold founding up: the team starts on "
+        "the tasks while the owner answers."
     )
 
 

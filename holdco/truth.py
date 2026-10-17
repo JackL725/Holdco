@@ -323,8 +323,10 @@ def _state(company: dict) -> dict:
         if not inbox:
             line += " The inbox is not connected, so replies cannot be read."
     else:
-        line = (f"Email: not connected: you cannot send email until the owner adds a mailbox. Sent so far: "
-                f"{len(out_rows)}.")
+        # Phase 3 bench gate: "you cannot send email" alone read as "send_email fails", and a sales agent told to
+        # queue one intro email saved it as a file instead; send_email queues it for the owner either way.
+        line = (f"Email: not connected: nothing goes out until the owner adds a mailbox; send_email still queues an "
+                f"email for the owner to review. Sent so far: {len(out_rows)}.")
         if em_pending:
             line += (f" {_plural(len(em_pending), 'email request')} queued; none can go out until a mailbox is "
                      "connected.")
@@ -2492,19 +2494,57 @@ _STAT_WORDS = re.compile(
     r"salary|income|spend|budget|worth|valued|valuation|employees|downloads|visitors|traffic|leads)\b", re.I)
 
 
-def _states_number(line: str) -> bool:
-    """Does this line state a number, price, percentage or statistic? Years, dates, times, list numbering, ids and
-    step or week numbers do not count."""
+_MONTHS = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+           r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?")
+
+
+def _number_text(line: str) -> str:
+    """A line with what is not a stated number taken out: URLs, references, dates, years, times, list numbering,
+    ids and step or week numbers."""
     s = _URL_RE.sub(" ", line)
     s = re.sub(r"\[\^?[\w ]+\]", " ", s)                                  # [fact 3], [1], [^2]
     s = re.sub(r"(?<!\d)20\d{2}[-_/]\d{1,2}[-_/]\d{1,2}(?!\d)", " ", s)   # ISO dates
+    # "September 30, 2026", "30 Sept": a date, not a claim (Phase 3 bench gate: a research file's "landing pages
+    # accessed on September 30" was refused as an unsourced number)
+    s = re.sub(rf"\b{_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?\b|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}(?!\w)",
+               " ", s, flags=re.I)
     s = re.sub(r"\b(?:19|20)\d{2}s?\b", " ", s)                            # years
     s = re.sub(r"\b\d{1,2}:\d{2}\b", " ", s)                                # times
     s = re.sub(r"^\s*(?:[-*+]\s+)?\d+[.)]\s+", " ", s)                      # list numbering
     s = re.sub(r"#\d+", " ", s)                                             # request #5, task #3
     s = re.sub(r"\b(?:step|week|day|phase|stage|month|q|h|v|version|tier|level|round|part|section|option|item)\s*\d+"
                r"(?:\.\d+)*\b", " ", s, flags=re.I)
-    s = re.sub(r"\b24/7\b|\b1:1\b|\b\d+(?:st|nd|rd|th)\b", " ", s, flags=re.I)
+    return re.sub(r"\b24/7\b|\b1:1\b|\b\d+(?:st|nd|rd|th)\b", " ", s, flags=re.I)
+
+
+def _line_numbers(s: str) -> set[float]:
+    """The numbers a line (already through _number_text) states."""
+    return {float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", s)
+            if n.replace(",", "").replace(".", "", 1).isdigit()}
+
+
+def _own_numbers(cid: int) -> set[float]:
+    """The numbers the company set itself: its strategy (the price above all) and its active goals. A line whose
+    numbers are all among them needs no source ("Targets and prices you set do not need a source", as the refusal
+    says; Phase 3 bench gate: a research file's "our $9 / month position" was refused as unsourced)."""
+    texts: list[str] = []
+    try:
+        row = db.one("SELECT * FROM strategy WHERE company_id=?", (cid,)) or {}
+        texts += [str(v) for k, v in row.items() if k not in ("company_id", "updated_at") and v]
+        for g in db.q("SELECT title, target FROM goals WHERE company_id=? AND status='active'", (cid,)):
+            texts += [str(g.get("title") or ""), str(g.get("target") or "")]
+    except Exception:   # an older database without the brain tables: nothing is the company's own
+        return set()
+    return _line_numbers(_number_text(" ".join(texts)))
+
+
+_OURS = re.compile(r"\b(?:our|ours|we|us)\b", re.I)
+
+
+def _states_number(line: str) -> bool:
+    """Does this line state a number, price, percentage or statistic? Years, dates, times, list numbering, ids and
+    step or week numbers do not count."""
+    s = _number_text(line)
     if re.search(r"[$£€]\s?\d|\b\d[\d,.]*\s?(?:usd|eur|gbp|dollars?|euros?|pounds?)\b", s, re.I):
         return True
     if re.search(r"\d\s?%|\b\d[\d,.]*\s?(?:percent|pct)\b", s, re.I):
@@ -2587,6 +2627,7 @@ def source_problems(company: dict, text: str, charter: bool = False) -> list[tup
         if m:
             refs[m.group(1).lower()] = m.group(2)
     out = []
+    own: set[float] | None = None   # the company's own numbers, read once when a line needs them
     in_fence = False
     sections: list[tuple[int, bool]] = []   # (heading level, checked) for a charter
     checked = not charter
@@ -2622,6 +2663,11 @@ def source_problems(company: dict, text: str, charter: bool = False) -> list[tup
             continue
         if not _states_number(s) or re.search(r"\bestimat(?:e|ed|es|ion)\b", s, re.I):
             continue
+        if own is None:
+            own = _own_numbers(cid)
+        nums = _line_numbers(_number_text(s))
+        if nums and nums <= own and (_OURS.search(s) or (company.get("name") or "\0").lower() in s.lower()):
+            continue   # the company's own price or target, said as ours
         cited = [int(n) for n in re.findall(r"\[fact\s*#?(\d+)\]", s, re.I)]
         if any(n in facts for n in cited):
             continue

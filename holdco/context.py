@@ -1477,9 +1477,18 @@ def read_file(ctx: Ctx, path: str, offset: int = 0, start_line: int = 0, end_lin
               outline: bool = False) -> str:
     """The read_file tool body: numbered lines (200 by default, with a pointer to the next range), an outline of
     the headings, or the old character offset when one is given. context: and global: read the owner's library;
-    page:<url> reads the saved text of a web page this company fetched."""
-    if (path or "").strip().lower().startswith(PAGE_PREFIX):
-        url = path.strip()[len(PAGE_PREFIX):].strip()
+    page:<url> reads the saved text of a web page this company fetched; so does a bare http(s) address (Phase 3 bench
+    gate: a real support run dropped the page: prefix its task spelled out, was told the "file" does not exist, and
+    asked the owner for a policy the team had saved)."""
+    raw_path = (path or "").strip()
+    if re.match(r"^https?://", raw_path, re.I):
+        if page_path(ctx.company, raw_path) is None:
+            raise ToolError(f"{raw_path} is a web address, and this company has no saved copy of it. Read it with "
+                            "fetch_url; read_file opens company files and pages your team already fetched "
+                            "(page:<url>).")
+        raw_path = PAGE_PREFIX + raw_path
+    if raw_path.lower().startswith(PAGE_PREFIX):
+        url = raw_path[len(PAGE_PREFIX):].strip()
         p = page_path(ctx.company, url)
         if p is None:
             raise ToolError(f"{url or 'that page'} has not been fetched by this company, or its saved copy expired "
