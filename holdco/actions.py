@@ -62,7 +62,7 @@ TAG_OF_ACTION = {"send_email": "contact", "social_post": "publish", "deploy_site
 
 
 def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: dict,
-         policy_action: str | None = None) -> str:
+         policy_action: str | None = None, tainted: list[str] | None = None) -> str:
     # Phase 2: a decision is queued like a question (always asks, deduplicated), never run by a policy.
     """Called by agent tools for any outbound action. policy_action (Phase 1) names the policy to apply when it
     differs from the action, as for connector_call, whose policy comes from the tool's risk tag."""
@@ -72,6 +72,13 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    if action not in ("question", "decision"):
+        # Phase 3: a session that read outside content asks, and the trust ladder sits in front of the policy.
+        from . import taint, trust   # imported here: both import modules that import this one
+        sources = taint.current_sources() if tainted is None else list(tainted)
+        policy, why = trust.gate_policy(company, policy_action or action, payload, policy, sources)
+        if why and policy == "approve":
+            payload = {**payload, "_why_asked": why}
     killed = False
     if policy == "auto" and db.get_settings().get("kill_switch"):
         policy, killed = "approve", True   # the kill switch freezes outbound actions: queue instead of running
@@ -218,7 +225,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     if row["task_id"]:
         t = db.get_task(row["task_id"])
         if t and t["status"] in ("waiting", "blocked"):
-            db.update("tasks", t["id"], status="todo", updated_at=ts,
+            db.update("tasks", t["id"], status="todo", updated_at=ts, followup_at=ts,   # Phase 3: dispatched first
                       description=(t["description"] or "") + f"\n\n[Update] {update or note}")
     agent = db.get_agent(row["agent_id"]) if row["agent_id"] else None
     if status == "rejected" and feedback.strip() and agent and agent["enabled"] and row["action"] != "decision":
@@ -237,6 +244,13 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
             watchdog.resolve(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), result)
         except NotImplementedError:
             pass
+    if row["action"] not in ("question", "decision") and status in ("done", "failed", "rejected"):
+        from . import trust   # Phase 3: clean approvals build the streak; edits reset it; rejections demote
+        try:
+            trust.after_decision(db.one("SELECT * FROM approvals WHERE id=?", (approval_id,)), decision,
+                                 edited=bool(payload) and p != db.loads(row["payload"], {}))
+        except Exception as e:   # the ladder is advice; the owner's decision stands
+            print(f"trust update failed: {e}")
     _reopen_waiting(company["id"], approval_id, ts)
     _records_changed(company["id"])
     db.update("companies", company["id"], cycle_requested=1)
@@ -274,7 +288,7 @@ def _reopen_waiting(company_id: int, approval_id: int, ts: str) -> None:
             if named and int(named[-1]) in pending:
                 continue
             note = f"[Holdco] The owner answered #{approval_id}; continue."
-            db.update("tasks", t["id"], status="todo", updated_at=ts,
+            db.update("tasks", t["id"], status="todo", updated_at=ts, followup_at=ts,   # Phase 3: dispatched first
                       result=((t["result"] or "") + "\n" + note).strip()[-6000:])
             reopened += 1
         if reopened:
@@ -442,7 +456,11 @@ def _deploy_netlify(company: dict) -> str:
     return f"Website deployed: {url}"
 
 
-def run_code(company: dict, language: str, code: str, timeout: int = 60) -> str:
+def run_code(company: dict, language: str, code: str, timeout: int = 60, network: bool = False) -> str:
+    from . import sandbox   # Phase 3: inside a container when Docker or Podman is available
+    boxed = sandbox.run(company, language, code, timeout, network=network)
+    if boxed is not None:
+        return boxed
     ws = workspace.root(company)
     runs = ws / ".runs"
     runs.mkdir(parents=True, exist_ok=True)

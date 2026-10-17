@@ -319,6 +319,18 @@ def _parse_args(raw) -> dict:
     return {}
 
 
+# ---------------- model routing (Phase 3) ----------------
+
+JOBS = ("main", "triage", "summary", "classify")
+
+
+def pick_model(job: str = "main", settings: dict | None = None, agent_model: str = "") -> str:
+    """The model for a job: 'main' is the agent's or the default model; triage, summary and classify use the small
+    model when the owner set one. Scaffold: always the main model."""
+    s = settings or db.get_settings()
+    return agent_model or s.get("default_model", "")
+
+
 # ---------------- sampling ----------------
 
 def is_gpt_oss(model: str) -> bool:

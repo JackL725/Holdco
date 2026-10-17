@@ -47,6 +47,11 @@ class Ctx:
     loaded_by_name: dict = field(default_factory=dict)
     brief_written: str = ""   # Phase 2: the kind of brief write_brief stored in this run (a brief is a deliverable)
     brief_warned: bool = False   # Phase 2: write_brief refused once a brief with numbers its data does not hold
+    # Phase 3: outside content this session read (search results, fetched pages, inbound email...): its sources,
+    # and the verification gate's one push-back at finish
+    tainted: bool = False
+    taint_sources: list = field(default_factory=list)
+    verify_warned: bool = False
 
 
 @dataclass
@@ -137,7 +142,9 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
     if name in ctx.loaded_by_name:   # Phase 1: a connector tool find_tool loaded into this session
         spec = ctx.loaded_by_name[name]
         try:
-            out = str(connectors.call(ctx, name, clean_args(spec, args)))
+            with taint.current(ctx):
+                out = str(connectors.call(ctx, name, clean_args(spec, args)))
+            out = taint.after_tool(ctx, name, args, out)   # Phase 3: external reads taint the session
         except (ToolError, ValueError) as e:
             out = f"ERROR: {e}"
         except Exception as e:   # a connected service must never crash the run
@@ -152,7 +159,9 @@ def execute(ctx: Ctx, name: str, args: dict) -> str:
         return (f"ERROR: there's no tool called '{name}' available to you.{hint} Your tools are: "
                 f"{', '.join(sorted(ctx.allowed))}.")
     try:
-        out = t.fn(ctx, **_clean_args(t, args))
+        with taint.current(ctx):   # Phase 3: actions.gate sees what this session read
+            out = t.fn(ctx, **_clean_args(t, args))
+        out = taint.after_tool(ctx, name, args, out)
     except TypeError as e:
         out = f"ERROR: bad arguments for {name}: {e}. Expected: {json.dumps(t.parameters['properties'])}"
     except (ToolError, workspace.PathError, web.WebError, ValueError) as e:
@@ -572,6 +581,9 @@ def send_email(ctx: Ctx, to: str, subject: str, body: str, reply_to_email_id: in
     payload = {"to": to.strip(), "subject": subject, "body": body}
     if reply_to_email_id:
         payload["reply_to_email_id"] = int(reply_to_email_id)
+    problems = verify.outreach_check(ctx, payload)   # Phase 3: no trust level or auto policy skips these rules
+    if problems:
+        return "ERROR: email not sent: " + "; ".join(problems)
     return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "send_email", payload)
 
 
@@ -868,6 +880,16 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         if problem:
             status = "partial"
             open_issues = (open_issues + f"\nDeliverable check failed: {problem}.").strip()
+    if status == "done" and ctx.task:
+        # Phase 3: the verification gate, by kind of work and by the task's checks; once, like the deliverable check
+        problem = verify.finish_problem(ctx, target, summary, evidence)
+        if problem and not ctx.verify_warned:
+            ctx.verify_warned = True
+            return (f"Not finished yet: {problem}. Fix it and call finish again, or finish with status 'partial' and "
+                    f"explain.")
+        if problem:
+            status = "partial"
+            open_issues = (open_issues + f"\nVerification failed: {problem}.").strip()
     if status == "done":
         problem = truth.finish_guard(ctx, status, target, summary, evidence)
         if problem and not ctx.claims_warned:
@@ -906,5 +928,6 @@ from . import watchdog  # noqa: E402,F401  (note_progress lives with the working
 from . import context, planning, truth  # noqa: E402,F401  (Phase 0.5: search, guards, owner questions)
 from . import connectors, browser  # noqa: E402,F401  (Phase 1: find_tool, connector routing, browser_check)
 from . import brain, contracts, decisions, rhythms  # noqa: E402,F401  (Phase 2: brain, contracts, rhythms, decisions)
+from . import taint, verify  # noqa: E402,F401  (Phase 3: taint tracking, the verification gate)
 for _name, _t in REGISTRY.items():   # tools registered before BUILTIN_RISK existed in a module keep their tag
     _t.risk = _t.risk if _t.risk != "write" else BUILTIN_RISK.get(_name, "write")

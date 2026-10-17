@@ -11,7 +11,8 @@ import threading
 import time
 import traceback
 
-from . import agents, backup, bus, contracts, db, decisions, doctor, emailer, notify, planning, rhythms, roles, watchdog
+from . import (agents, backup, bench, bus, contracts, db, decisions, doctor, emailer, notify, planning, rhythms,
+               roles, watchdog)
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -95,6 +96,8 @@ class Scheduler(threading.Thread):
         self._resume_founding()
         if not s.get("scheduler_enabled", True):
             return
+        if bench.RUNNING:
+            return   # Phase 3: a Holdco Bench run has the GPU; dispatch and cycles wait (chat still works)
         capacity = max(1, int(s.get("max_concurrent_runs", 2)))
         # 1) CEO planning cycles first: they create the work.
         for c in companies:

@@ -110,6 +110,19 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE TABLE IF NOT EXISTS briefs (
     id INTEGER PRIMARY KEY, company_id INTEGER, kind TEXT, body TEXT, data TEXT DEFAULT '{}', created_at TEXT
 );
+-- Phase 3: Holdco Bench scores, the trust ladder and the global do-not-email list
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id INTEGER PRIMARY KEY, model TEXT, started_at TEXT, finished_at TEXT, settings TEXT DEFAULT '{}',
+    scenarios INTEGER DEFAULT 0, passed INTEGER DEFAULT 0, pass_rate REAL, tool_validity REAL,
+    tokens_per_second REAL, steps_avg REAL, results TEXT DEFAULT '[]', notes TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS trust (
+    company_id INTEGER, action TEXT, level INTEGER DEFAULT 0, streak INTEGER DEFAULT 0, cap_per_day INTEGER DEFAULT 0,
+    updated_at TEXT, PRIMARY KEY (company_id, action)
+);
+CREATE TABLE IF NOT EXISTS suppression (
+    email TEXT PRIMARY KEY, reason TEXT DEFAULT '', company_id INTEGER, created_at TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_goals_company ON goals(company_id, status);
 CREATE INDEX IF NOT EXISTS ix_contacts_company ON contacts(company_id, stage);
 CREATE INDEX IF NOT EXISTS ix_briefs_company ON briefs(company_id, kind, id);
@@ -179,7 +192,9 @@ MIGRATIONS = {
               # Phase 2: the task contract
               "goal_id": "INTEGER", "expected": "TEXT DEFAULT ''", "inputs": "TEXT DEFAULT ''",
               "depends_on": "TEXT DEFAULT '[]'", "due_at": "TEXT DEFAULT ''", "budget_steps": "INTEGER DEFAULT 0",
-              "budget_tokens": "INTEGER DEFAULT 0", "checks": "TEXT DEFAULT ''", "tokens_used": "INTEGER DEFAULT 0"},
+              "budget_tokens": "INTEGER DEFAULT 0", "checks": "TEXT DEFAULT ''", "tokens_used": "INTEGER DEFAULT 0",
+              # Phase 3: the verification gate's results (JSON list) and when an owner's answer reopened the task
+              "verification": "TEXT DEFAULT ''", "followup_at": "TEXT DEFAULT ''"},
     # Phase 2: who decided a decision (owner, telegram or deadline)
     "approvals": {"decided_by": "TEXT DEFAULT ''"},
     # Phase 0.5: the change stamp and backoff that stop idle re-planning
@@ -188,6 +203,8 @@ MIGRATIONS = {
     "metrics": {"source": "TEXT DEFAULT 'manual'"},
     # Phase 1: the Message-ID an inbound email answers, so replies to outreach can be counted
     "emails": {"in_reply_to": "TEXT DEFAULT ''"},
+    # Phase 3: the largest prompt a run sent, for the context-use display
+    "runs": {"max_prompt_tokens": "INTEGER DEFAULT 0"},
 }
 
 

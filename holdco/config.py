@@ -53,6 +53,8 @@ DEFAULT_SETTINGS: dict = {
     "review_model": "",               # stronger model for the critic pass and QA reviews; blank = CEO/agent model
     "embedding_model": "",            # optional Ollama embedding model (e.g. nomic-embed-text) for meaning search
     "pinned_context": [],             # files under data/context/ included in every prompt ("always include")
+    # Verify (Phase 3)
+    "small_model": "",                # optional small model for triage, summaries and classification; blank = default
 }
 
 # What happens when an agent tries an outbound action.
@@ -114,6 +116,7 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "pinned_context": [],        # files under this company's context/ included in every prompt
     "founding_stage": "",        # research | charter | critic | plan while founding (staged founding)
     # Phase 2 budgets
+    "quiet_hours": "23:00-07:00",     # Phase 3: low-value research runs in this local window
     "gpu_hours_per_day": 6,      # model time per day; over it the company gets no dispatch or cycles until tomorrow
     "steps_per_task": 0,         # tool calls per task attempt; 0 = the global max_steps_per_run
     "posts_per_week": 10,        # social posts approved or pending in the last 7 days

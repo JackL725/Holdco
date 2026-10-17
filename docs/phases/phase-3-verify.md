@@ -8,10 +8,35 @@ approvals; a small model and an embedding model take the jobs that do not need t
 gets priorities; and Settings shows real context use. This is the implementation spec. The reasons are in
 [reliability.md](../reliability.md) and [safety.md](../safety.md).
 
-Status: Planned. Branch `claude/phase-3-verify`, PR based on Phase 2. Depends on Phase 0 (watchdog, notify),
-Phase 1 (`connectors.py`, `browser_check`, `conn_stripe.py`, `find_tool`, the vault, `metrics.source`) and
-Phase 2 (`brain.py`, `tasks.checks`, `tasks.goal_id`, decisions). See [testing.md](../testing.md) for how the
-Bench fits the test suite and [connectors.md](../connectors.md) for the connector framework it mocks.
+Status: in progress. Branch `claude/phase-3-verify`, based on Phase 2 (pull request JackL725/Holdco#5). Depends on
+Phase 0 (watchdog, notify), Phase 1 (`connectors.py`, `browser_check`, `conn_stripe.py`, `find_tool`, the vault,
+`metrics.source`) and Phase 2 (`brain.py`, `tasks.checks`, `tasks.goal_id`, decisions). See
+[testing.md](../testing.md) for how the Bench fits the test suite and [connectors.md](../connectors.md) for the
+connector framework it mocks.
+
+What Phases 0.5, 1 and 2 change in this design, decided at the start of the build:
+- Embeddings exist since Phase 0.5: `context.embed_texts` embeds every indexed chunk, memory included, into
+  `search_vectors`, and `recall` already ranks by meaning through `context.search`. No `memory_vectors` table:
+  `embeddings.py` adds cosine similarity and `nearest_memory` for the small model's duplicate check in `remember`.
+- Unknown arguments stay dropped without an error. The real-model runs of Phases 1 and 2 showed gpt-oss adding
+  harmless extra keys (`offset`, `outline`, a removed `budget_steps`); refusing them would fail calls that work today.
+  Only an unknown key that is a near miss of a declared argument the call lacks (`titel` for `title`) gets the repair
+  message. Every other row of the repair table applies as written.
+- Outreach: Phase 0.5's `truth.outreach_guard` already adds the company's identity, postal address and opt-out line
+  to every commercial email. `verify.outreach_check` runs on the final payload: the global `suppression` table
+  (which `truth.suppressed` also reads, next to Phase 0.5's stop replies and Phase 2's unsubscribed contacts), EU
+  contacts without consent, the daily cap and `review_text`'s hard issues. The finish-time gate re-checks every email
+  the run queued or sent.
+- Research citations are checked against Phase 0.5's `fetched` table (every page `fetch_url` read, with its task).
+- Taint reaches `actions.gate` through a context variable that `tools.execute` sets for the tool running now, so every
+  outbound tool and connector call is covered without changing its call site; `gate(..., tainted=[...])` still
+  overrides it. Taint and the trust ladder are decided in one place, `trust.gate_policy`, in the order of section 6,
+  and the reason the owner is asked is stored in the payload as `_why_asked`.
+- `finish` runs the gate after Phase 2's brief check and the deliverable check, before Phase 0.5's claims check,
+  with its own one push-back (`ctx.verify_warned`).
+- Tests are split by area like Phase 2's: `tests/test_phase3_bench.py`, `test_phase3_models.py` (structured calls,
+  routing, embeddings, context use), `test_phase3_verify.py` (gate, sandbox) and `test_phase3_safety.py` (taint,
+  trust, scheduler). End-to-end tests continue from `test_34`.
 
 ## Scope
 

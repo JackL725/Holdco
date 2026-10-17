@@ -67,7 +67,7 @@ def _stats(cid: int) -> dict:
 @route("GET", "/api/state")
 def api_state(h, m, body):
     companies = []
-    for c in db.q("SELECT * FROM companies ORDER BY status='archived', id"):
+    for c in db.q("SELECT * FROM companies WHERE status!='bench' ORDER BY status='archived', id"):   # Phase 3
         companies.append({**_public_company(c), "stats": _stats(c["id"])})
     s = db.get_settings()
     return {
