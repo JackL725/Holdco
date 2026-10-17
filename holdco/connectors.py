@@ -698,6 +698,13 @@ def find_tool(ctx: tools.Ctx, query: str) -> str:
     extra = [f"Could not list tools from {p}." for p in problems]
     if not matches:
         services = ", ".join(_service_names(ctx.company)) or "none"
+        offered = [e for e in entries if e["allowed"]]
+        if offered:
+            # Phase 3 bench gate: "calculator" and "math" found nothing in a service whose tool "adds two numbers",
+            # and the agent asked the owner to connect a calculator. What is there, so the next search can hit it.
+            extra.append("What they offer: " + "; ".join(f"{e['name']} ({_one_line(e['description'], 60)})"
+                                                         for e in offered[:FIND_SHOWN * 2])
+                         + ". Search again with words from these.")
         own = _own_tools_for(ctx, words)
         if own:
             extra.append(f"Your own tools already do this: {', '.join(own)}. Call {'it' if len(own) == 1 else 'them'} "

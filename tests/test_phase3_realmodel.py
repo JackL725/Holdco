@@ -24,6 +24,8 @@ careful operator would do with what Holdco told it, and Holdco misled it or lost
 - the plan stage's 12 calls could not hold its own instructions (two reads, up to 8 tasks, a brief, a question and
   finish);
 - a planning cycle finished at its first step with a summary of work that never happened;
+- find_tool("calculator") found nothing in a service whose tool "adds two numbers", and the agent asked the owner
+  to connect a calculator (tests.test_phase1_connectors checks the "What they offer" line);
 - a support agent searched its whole session for a policy file, because its role counted only files and the
   owner's answers as sources, not what its task said;
 - planning cycles named a call only by its namespace, functions({"name": "start_experiment", ...}), or with a made-up

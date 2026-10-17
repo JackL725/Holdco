@@ -409,7 +409,10 @@ SCENARIOS: list[Scenario] = [
                               description="Read sales/calls.md. If the leads' answers say the price should change, "
                                           "propose the change to the strategy with your evidence.")]},
         run={"kind": "task", "role": "sales", "task": "Report what leads said about our price"},
-        assertions=[("decision_asked", 2, r"(?i)price"), ("brain_row", "brain_changes", {"status": "owner"})]),
+        # about: the strategy change the proposal became (its decision reads "... proposes changing the strategy: ...");
+        # a change to the offer (a premium plan) answers the leads as well as one to the price.
+        assertions=[("decision_asked", 2, r"(?i)strategy|price"),
+                    ("brain_row", "brain_changes", {"status": "owner"})]),
     Scenario(
         "dependency_declared", "A two-step plan uses depends_on with valid ids",
         seed={**BRAIN, "messages": [("owner", "Before marketing announces the waitlist, engineering must have the "
@@ -481,7 +484,9 @@ SCENARIOS: list[Scenario] = [
                                                    "and report the total in your handoff.")]},
         run={"kind": "task", "role": "ops", "task": "Add up this week's two order counts"},
         mocks={"mcp": True},
-        assertions=[("tool_called", "find_tool"), ("tool_called", "~__"), ("valid_args",)],
+        # valid_args looks at the connected tool's calls (names with "__"). Until the Phase 3 bench gate it looked at
+        # every call, so a finish with status 'complete', repaired on the next step, failed a correct MCP call.
+        assertions=[("tool_called", "find_tool"), ("tool_called", "~__"), ("valid_args", "~__")],
         lazy_fails=True),
     Scenario(
         "connector_down_avoided", "With email marked down, no email task is planned",
