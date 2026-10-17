@@ -10,7 +10,7 @@ gets priorities; and Settings shows real context use. This is the implementation
 
 Status: built. Branch `claude/phase-3-verify`, based on Phase 2 (pull request JackL725/Holdco#5). Gate on the owner's
 GPU: Holdco Bench runs in CI against the scripted model (33 of 33, and the lazy model fails exactly the scenarios it
-should), and gpt-oss:20b scores 22 to 29 of 33 on the final code across runs (see Real-model gate below). Depends on
+should), and gpt-oss:20b scores 22 to 29 of 33 across runs once the gate's fixes were in (see Real-model gate below). Depends on
 Phase 0 (watchdog, notify), Phase 1 (`connectors.py`, `browser_check`, `conn_stripe.py`, `find_tool`, the vault,
 `metrics.source`) and Phase 2 (`brain.py`, `tasks.checks`, `tasks.goal_id`, decisions). See
 [testing.md](../testing.md) for how the Bench fits the test suite and [connectors.md](../connectors.md) for the
