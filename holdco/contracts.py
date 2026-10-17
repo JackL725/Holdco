@@ -520,7 +520,7 @@ def post_budget_problem(ctx) -> str | None:
 
 def budget_status(company: dict) -> dict:
     """The Overview and the Budgets section: GPU hours used today against the budget, and the weekly posts."""
-    from . import tools   # imported here: tools imports this module at its end
+    from . import verify   # imported here: verify loads with tools, which imports this module at its end
     cs = db.company_settings(company)
     since_month = _now().strftime("%Y-%m-01T00:00:00Z")
     money = 0.0
@@ -535,8 +535,8 @@ def budget_status(company: dict) -> dict:
     return {"gpu_hours_today": round(used, 2), "gpu_hours_per_day": budget,
             "over_gpu_budget": bool(budget > 0 and used > budget),
             "posts_this_week": posts_this_week(company["id"]), "posts_per_week": post_budget(company),
-            "emails_today": tools._emails_today(company["id"]),
-            "daily_email_limit": int(cs.get("daily_email_limit") or 0),
+            "emails_today": verify.emails_today(company["id"]),
+            "daily_email_limit": verify.daily_email_limit(company),
             "steps_per_task": int(float(cs.get("steps_per_task") or 0)),
             "money_usd": float(cs.get("money_usd") or 0), "money_approved_month": round(money, 2)}
 

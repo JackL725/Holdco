@@ -642,7 +642,7 @@ def budget_status() -> list[dict]:
     """Every company that is not archived: [{company_id, name, used, budget, over}] for the Doctor and the
     dashboard. budget 0 means no limit."""
     out = []
-    for c in db.q("SELECT * FROM companies WHERE status!='archived' ORDER BY id"):
+    for c in db.q("SELECT * FROM companies WHERE status NOT IN ('archived', 'bench') ORDER BY id"):
         budget = daily_budget(c)
         used = tokens_today(c["id"])
         out.append({"company_id": c["id"], "name": c["name"], "used": used, "budget": budget,

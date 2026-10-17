@@ -556,7 +556,11 @@ class TestSearchFindsOwnerContext(Replay):
 
 
 class TestEditFileOneLine(Replay):
-    PAGE = "\n".join(f"<p>line {i}</p>" for i in range(1, 400)) + "\n"
+    # The head shares the first line, so line 200 is still the 200th: a page the verification gate's static check
+    # passes (Phase 3: a viewport and a title, no audit blocker).
+    HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width, initial-scale=1"><title>EditCo: the landing page</title></head><body>')
+    PAGE = HEAD + "\n".join(f"<p>line {i}</p>" for i in range(1, 400)) + "\n"
 
     def test_edit_file_changes_one_line_of_a_large_page_and_nothing_else(self):
         c = make_company("EditCo", members=("ceo", "engineering"))

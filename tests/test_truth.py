@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-truth-")
 
 from holdco import (actions, agents, checks, db, doctor, llm, notify, roles, routing, tools, truth,  # noqa: E402
-                    web, workspace)
+                    verify, web, workspace)
 
 db.init()
 
@@ -40,9 +40,10 @@ GOOD_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <label for="email">Email</label><input id="email" name="email" type="email"><button>Join the waitlist</button></form>
 <a href="about.html">About PawPlan</a></body></html>"""
 
-FAKE_SITE = """<!doctype html><html><head><meta charset="utf-8"><title>PawPlan</title></head>
+# A page the verification gate's static check passes (Phase 3): a viewport, and a form with a target.
+FAKE_SITE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PawPlan</title></head>
 <body><h1>Meal plans your dog will actually eat</h1><p>Tell us about your dog.</p>
-<form><input placeholder="you@email.com"><button>Join the waitlist</button></form></body></html>"""
+<form data-netlify="true"><input placeholder="you@email.com"><button>Join the waitlist</button></form></body></html>"""
 
 ADDRESS = "1 Main Street, Springfield, IL 62701"
 
@@ -781,7 +782,10 @@ class TestActionTasks(Quiet):
         ctx = ctx_for(self.c, "research", t)
         tools.execute(ctx, "write_file", {"path": "research/pricing.md", "content":
                                           "# Pricing\n\nRoofr charges $99 per month.\nThe market is worth $5 billion.\n"})
-        out = tools.execute(ctx, "finish", {"summary": "Pricing saved.", "deliverable": "research/pricing.md"})
+        # Phase 3's verification gate runs first and would refuse a research file that cites no URL at all; this
+        # test is about Phase 0.5's line-by-line source check behind it.
+        with mock.patch.object(verify, "finish_problem", lambda *a, **kw: None):
+            out = tools.execute(ctx, "finish", {"summary": "Pricing saved.", "deliverable": "research/pricing.md"})
         self.assertIn("research/pricing.md has 2 lines with numbers and no source", out)
         self.assertIn("check_sources", out)
 

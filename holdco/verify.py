@@ -4,7 +4,8 @@ pass when it is queued, and the global do-not-email list.
 
 - web page: the deliverable is a page under site/ (or a checks line says browser_check). browser_check must report
   HTTP 200, no console errors, a target on every form, no broken link and the phone screenshot. Its static fallback
-  counts only while the playwright connector is not enabled: 0 audit blockers and no broken same-site link.
+  counts only while the playwright connector is not enabled: 0 audit blockers, a target on every form and no broken
+  same-site link. judge_browser_check is the one copy of this rule; Holdco Bench's browser_check_pass uses it too.
 - code: the deliverable is under code/, a test file under code/ was written in this task, or a checks line says
   run_tests. The tests must exit 0: in the sandbox, else through the run_code policy (approve queues them, and the
   owner's run of them within 24 h counts).
@@ -25,7 +26,7 @@ import email.utils
 import json
 import re
 
-from . import actions, checks, db, web, workspace
+from . import actions, checks, config, db, web, workspace
 
 WEB_SUFFIXES = (".html", ".htm")
 TEST_TIMEOUT = 180                 # seconds the gate's own test run may take
@@ -183,6 +184,7 @@ def finish_problem(ctx, target: str, summary: str, evidence: str) -> str | None:
     except Exception as e:   # the stored copy is for the dashboard and the CEO; the answer below still counts
         print(f"verification not stored: {e}")
     failed = [r for r in results if not r["passed"]]
+    ctx.verify_failed = failed
     if not failed:
         return None
     first = failed[0]
@@ -195,6 +197,13 @@ def waiting_request(ctx) -> int | None:
     """The run_code request the gate queued for the owner in its last check (the tests need their approval), so
     tools.finish can end the task 'waiting' on it instead of 'partial'. None when the gate queued nothing."""
     return getattr(ctx, "verify_waiting_on", None)
+
+
+def only_waiting(ctx) -> bool:
+    """The gate's last check failed only because the tests wait for the owner's approval: nothing the agent can fix,
+    so tools.finish ends the task 'waiting' at once instead of pushing back."""
+    failed = getattr(ctx, "verify_failed", None) or []
+    return bool(failed) and waiting_request(ctx) is not None and all(r.get("mode") == "waiting" for r in failed)
 
 
 def results_of(task: dict) -> list[dict]:
@@ -301,6 +310,10 @@ def judge_browser_check(company: dict, out: str) -> tuple[bool, list[str], str, 
                 facts.append("0 audit blockers")
         elif status != 200:
             problems.append(f"the page answered HTTP {status or 'nothing'}, not 200")
+        # The Forms line is read from the page's HTML, so the static check sees a form that sends its entries nowhere
+        # as well as the browser does: the rule holds in both modes (a page must not pass only because Playwright is
+        # not set up).
+        _forms(out, lines, problems, facts)
     elif first.startswith("Browser check (Playwright)"):
         mode = "browser"
         if status != 200:
@@ -315,14 +328,7 @@ def judge_browser_check(company: dict, out: str) -> tuple[bool, list[str], str, 
             problems.append(f"{n} console error(s): " + " | ".join(errs) if errs else f"{n} console error(s)")
         else:
             facts.append("no console errors")
-        forms = re.search(r"^Forms: (\d+) found, (\d+) with a target", out or "", re.M)
-        if forms and forms.group(1) != forms.group(2):
-            missing = [re.sub(r": submissions go nowhere$", "", ln[2:]) for ln in lines
-                       if re.match(r"- form \d+", ln)]
-            problems += [f"{m} (submissions go nowhere)" for m in missing] or \
-                [f"{int(forms.group(1)) - int(forms.group(2))} form(s) have no action or data-netlify attribute"]
-        elif forms and forms.group(1) != "0":
-            facts.append(f"{forms.group(1)} form(s) with a target")
+        _forms(out, lines, problems, facts)
         if site:
             shots = re.search(r"^Screenshots: (.*)$", out or "", re.M)
             entries = [s.strip() for s in shots.group(1).split(",")] if shots else []
@@ -343,6 +349,17 @@ def judge_browser_check(company: dict, out: str) -> tuple[bool, list[str], str, 
     if mode == "static":
         facts.append(f"static check: {first.partition(':')[2].strip()}")
     return not problems, problems, mode, ", ".join(facts)
+
+
+def _forms(out: str, lines: list[str], problems: list[str], facts: list[str]) -> None:
+    """Every form on the page has a target (an action or data-netlify), from browser_check's Forms line."""
+    forms = re.search(r"^Forms: (\d+) found, (\d+) with a target", out or "", re.M)
+    if forms and forms.group(1) != forms.group(2):
+        missing = [re.sub(r": submissions go nowhere$", "", ln[2:]) for ln in lines if re.match(r"- form \d+", ln)]
+        problems += [f"{m} (submissions go nowhere)" for m in missing] or \
+            [f"{int(forms.group(1)) - int(forms.group(2))} form(s) have no action or data-netlify attribute"]
+    elif forms and forms.group(1) != "0":
+        facts.append(f"{forms.group(1)} form(s) with a target")
 
 
 # ---------------------------------------------------------------- code
@@ -538,13 +555,36 @@ def is_suppressed(email: str) -> bool:
     return _suppression_reason(email) is not None
 
 
-def _emails_today(cid: int) -> int:
-    """Emails sent today (UTC) plus those waiting for the owner, as tools.send_email counts them."""
+def emails_today(cid: int) -> int:
+    """Emails sent today (UTC) plus those waiting for the owner: what the daily limit counts. An email is counted
+    once: a sent one is an outgoing row of the emails table, a waiting one a pending request."""
     sent = db.scalar("SELECT COUNT(*) FROM emails WHERE company_id=? AND direction='out' AND created_at >= ?",
                      (cid, db.now()[:10]))
     pending = db.scalar("SELECT COUNT(*) FROM approvals WHERE company_id=? AND action='send_email' "
                         "AND status='pending'", (cid,))
     return (sent or 0) + (pending or 0)
+
+
+def daily_email_limit(company: dict) -> int:
+    """The company's daily_email_limit (Phase 2 budgets: 0 means agents send none); the default when unreadable."""
+    default = int(config.DEFAULT_COMPANY_SETTINGS["daily_email_limit"])
+    try:
+        value = db.company_settings(company).get("daily_email_limit")
+        return default if value in (None, "") else max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def cap_problem(company: dict, counted: bool = False) -> str | None:
+    """The daily-limit failure for one more email, or None. counted: the email is already among today's (a pending
+    request the finish-time gate re-checks), so it may bring the count up to the limit but not over. tools.send_email
+    and outreach_check both use this, so the cap reads the same everywhere."""
+    limit = daily_email_limit(company)
+    n = emails_today(company["id"])
+    if (n > limit) if counted else (n >= limit):
+        return (f"daily email limit reached: {n} sent or queued today and the limit is {limit}; send the rest "
+                "tomorrow")
+    return None
 
 
 def _is_reply(company: dict, payload: dict, a: str) -> bool:
@@ -575,8 +615,10 @@ def _issues(report: str) -> list[str]:
     return [ln.strip()[2:] for ln in lines[at + 1:] if ln.strip().startswith("- ")] if at is not None else []
 
 
-def _outreach(ctx, payload: dict, queued: bool = False) -> tuple[list[str], list[str]]:
-    """(failures, warnings) for one email. queued: the email is already counted among today's (the finish check)."""
+def _outreach(ctx, payload: dict, queued: bool = False, decided: bool = False) -> tuple[list[str], list[str]]:
+    """(failures, warnings) for one email. queued: the email is a pending request, already counted among today's
+    (the finish check), so the daily cap does not count it twice. decided: it was sent or decided already, so the cap
+    no longer applies to it (the other rules still say whether it should have gone)."""
     company = db.get_company(ctx.company["id"]) or ctx.company
     cs = db.company_settings(company)
     to = str(payload.get("to") or "")
@@ -605,11 +647,10 @@ def _outreach(ctx, payload: dict, queued: bool = False) -> tuple[list[str], list
             fails.append(HARD_ISSUES[hard].format(hits=hits))
         else:
             warnings.append(issue)
-    limit = int(cs.get("daily_email_limit") or 20)
-    n = _emails_today(company["id"])
-    if (n > limit) if queued else (n >= limit):
-        fails.append(f"daily email limit reached: {n} sent or queued today and the limit is {limit}; send the rest "
-                     "tomorrow")
+    if not decided:   # an email that already went out (or was decided) can no longer be held back by the cap
+        cap = cap_problem(company, counted=queued)
+        if cap:
+            fails.append(cap)
     tld = a.rpartition(".")[2] if "@" in a else ""
     if commercial and tld in EU_TLDS:
         row = db.one("SELECT consent FROM contacts WHERE company_id=? AND lower(email)=? ORDER BY id DESC LIMIT 1",
@@ -621,28 +662,30 @@ def _outreach(ctx, payload: dict, queued: bool = False) -> tuple[list[str], list
     return fails, warnings
 
 
-def outreach_check(ctx, payload: dict, queued: bool = False) -> list[str]:
+def outreach_check(ctx, payload: dict, queued: bool = False, decided: bool = False) -> list[str]:
     """The compliance failures of one email payload (to, subject, body); an empty list means it may be queued.
-    queued=True re-checks an email already counted among today's (the finish-time gate)."""
-    return _outreach(ctx, payload, queued)[0]
+    queued=True re-checks a pending request, already counted among today's (the finish-time gate); decided=True an
+    email that was sent or decided, which the daily cap no longer concerns."""
+    return _outreach(ctx, payload, queued, decided)[0]
 
 
-def _run_emails(ctx, task: dict) -> list[tuple[str, dict]]:
-    """(label, payload) of every email this run queued or sent: send_email requests of this task created since the
-    run started, and emails an auto policy sent at once (audit rows without a request)."""
+def _run_emails(ctx, task: dict) -> list[tuple[str, dict, bool]]:
+    """(label, payload, waiting) of every email this run queued or sent: send_email requests of this task created
+    since the run started, and emails an auto policy sent at once (audit rows without a request). waiting: the
+    request still waits for the owner (the only state in which the daily cap can hold it back)."""
     since = _run_started(ctx)
     out = []
-    for r in db.q("SELECT id, payload FROM approvals WHERE company_id=? AND task_id=? AND action='send_email' "
+    for r in db.q("SELECT id, payload, status FROM approvals WHERE company_id=? AND task_id=? AND action='send_email' "
                   "AND status IN ('pending','running','done','failed') AND created_at>=? ORDER BY id",
                   (ctx.company["id"], task["id"], since)):
         p = db.loads(r["payload"], {}) or {}
-        out.append((f"request #{r['id']} to {p.get('to')}", p))
+        out.append((f"request #{r['id']} to {p.get('to')}", p, r["status"] == "pending"))
     if since:   # without the run's start every email this agent ever sent would count
         for r in db.q("SELECT payload FROM audit WHERE company_id=? AND action='send_email' AND approval_id IS NULL "
                       "AND proposed_by=? AND created_at>=? ORDER BY id",
                       (ctx.company["id"], (ctx.agent or {}).get("name", ""), since)):
             p = db.loads(r["payload"], {}) or {}
-            out.append((f"the email sent to {p.get('to')}", p))
+            out.append((f"the email sent to {p.get('to')}", p, False))
     return out
 
 
@@ -651,8 +694,8 @@ def _outreach_kind(ctx, task: dict) -> list[dict]:
     if not emails:
         return []
     fails, warnings = [], []
-    for label, payload in emails[:20]:
-        f, w = _outreach(ctx, payload, queued=True)
+    for label, payload, waiting in emails[:20]:
+        f, w = _outreach(ctx, payload, queued=waiting, decided=not waiting)
         for problem in f:
             short, _, fix = problem.partition(": ")
             fails.append(f"{short} in {label}: {fix}" if fix else f"{problem} in {label}")

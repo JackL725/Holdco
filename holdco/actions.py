@@ -162,7 +162,9 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     company = db.get_company(row["company_id"])
     p = db.loads(row["payload"], {})
     if payload:
-        p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")})
+        # network: the run_code card's "Allow network" box (Phase 3; a request queued before it existed lacks it)
+        p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")
+                  or (k == "network" and row["action"] == "run_code")})
     ts = db.now()
     label = ACTION_LABELS.get(row["action"], row["action"])
 

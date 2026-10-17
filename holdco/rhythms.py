@@ -678,9 +678,42 @@ def _active_companies() -> list[dict]:
 
 
 def portfolio_brief_if_due() -> int | None:
-    """Scheduler (every tick, so cheap when not due): once per local day, when every active company has a daily
-    brief less than PORTFOLIO_FRESH_HOURS old, or PORTFOLIO_WAIT_HOURS after the first company brief of the day.
-    Returns the new brief's id."""
+    """Once per local day, when every active company has a daily brief less than PORTFOLIO_FRESH_HOURS old, or
+    PORTFOLIO_WAIT_HOURS after the first company brief of the day. Returns the new brief's id. The scheduler calls
+    portfolio_brief_in_background instead: with a small model set, the brief waits for its narrative."""
+    companies = _portfolio_due()
+    return portfolio_brief(companies) if companies is not None else None
+
+
+_portfolio_lock = threading.Lock()   # one portfolio brief is built at a time
+
+
+def portfolio_brief_in_background() -> bool:
+    """Scheduler (every tick, so cheap when not due): when the portfolio brief is due, build it in its own thread.
+    Phase 3: its narrative is a small-model call of up to a minute, and the tick (watchdog, phone poller, dispatch)
+    must never wait on a model. Returns whether a build started."""
+    if _portfolio_lock.locked() or _portfolio_due() is None:
+        return False
+    if not _portfolio_lock.acquire(blocking=False):
+        return False
+
+    def build() -> None:
+        try:
+            portfolio_brief_if_due()   # due is checked again: another process may have sent it meanwhile
+        except Exception as e:   # the next tick tries again; the scheduler keeps going either way
+            print(f"[rhythms] portfolio brief failed: {type(e).__name__}: {e}")
+        finally:
+            _portfolio_lock.release()
+    try:
+        threading.Thread(target=build, daemon=True, name="holdco-portfolio-brief").start()
+    except Exception:
+        _portfolio_lock.release()
+        raise
+    return True
+
+
+def _portfolio_due() -> list[dict] | None:
+    """The active companies, when the portfolio brief is due (see portfolio_brief_if_due); otherwise None."""
     last = db.one("SELECT created_at FROM briefs WHERE company_id IS NULL AND kind='daily' ORDER BY id DESC LIMIT 1")
     if last and _local_date(last["created_at"]) == _local_date():
         return None
@@ -702,7 +735,7 @@ def portfolio_brief_if_due() -> int | None:
     waited = min(b["first"] for b in by_company.values()) <= _ago(hours=PORTFOLIO_WAIT_HOURS)
     if not (everyone or waited):
         return None
-    return portfolio_brief(companies)
+    return companies
 
 
 def _move(m: dict) -> float:

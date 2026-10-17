@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -470,6 +471,41 @@ class TestRouting(Base):
         finally:
             db.run("DELETE FROM briefs WHERE company_id IS NULL")
 
+    def test_portfolio_narrative_never_holds_the_tick(self):
+        """The narrative is a small-model call of up to a minute: the scheduler's housekeeping (watchdog, phone poller,
+        dispatch after it) starts the brief in its own thread and moves on; one brief is built at a time."""
+        from holdco import backup, connectors, decisions, doctor, scheduler, watchdog
+        db.run("DELETE FROM briefs WHERE company_id IS NULL")
+        release, asked = threading.Event(), threading.Event()
+
+        def slow_job(*a, **kw):
+            asked.set()
+            release.wait(10)
+            return "Work moved forward and nothing waits for you."
+        quiet_steps = [mock.patch.object(m, n, lambda *a, **kw: None) for m, n in (
+            (watchdog, "tick"), (doctor, "refresh_if_stale"), (backup, "maybe_run"), (notify, "ensure_poller"),
+            (connectors, "check_if_stale"), (connectors, "poll_if_due"), (decisions, "resolve_due"))]
+        try:
+            db.set_settings({"small_model": "tiny:1b"})
+            with contextlib.ExitStack() as stack:
+                for p in quiet_steps:
+                    stack.enter_context(p)
+                stack.enter_context(mock.patch.object(llm, "run_job", slow_job))
+                stack.enter_context(mock.patch.object(rhythms, "_portfolio_due", lambda: [db.get_company(self.c["id"])]))
+                started = time.monotonic()
+                scheduler.Scheduler()._housekeeping(db.get_settings())
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertTrue(asked.wait(5), "the brief was never started")
+                self.assertFalse(rhythms.portfolio_brief_in_background(), "a second build while the first runs")
+                release.set()
+                self.assertTrue(wait_until(lambda: not rhythms._portfolio_lock.locked(), 10))
+            body = db.one("SELECT body FROM briefs WHERE company_id IS NULL ORDER BY id DESC LIMIT 1")["body"]
+            self.assertTrue(body.startswith("Work moved forward and nothing waits for you."), body)
+        finally:
+            release.set()
+            wait_until(lambda: not rhythms._portfolio_lock.locked(), 10)
+            db.run("DELETE FROM briefs WHERE company_id IS NULL")
+
 
 class TestEmbeddings(Base):
     def setUp(self):
@@ -560,7 +596,10 @@ class TestScheduler(Base):
             seen["running"] = agents.running_count()
             return []
 
-        with mock.patch.object(web, "search", search):
+        # Scout cites the page it fetches from the fake server (the research gate checks that), so that server counts
+        # as public here, as HOLDCO_ALLOW_LOCAL makes it for the end-to-end app.
+        with mock.patch.object(web, "search", search), \
+                mock.patch.object(web, "ALLOW_LOCAL", [f"127.0.0.1:{self.server.port}"]):
             agents.run(scout["id"], "task", task_id=first["id"])
             self.assertTrue(wait_until(lambda: not agents.is_running(echo["id"]), 30))
         self.assertTrue(seen["second_called"], "the second session never got the model during the first's tool")

@@ -284,17 +284,15 @@ def _run_agent(sc: scenarios.Scenario, company: dict, handle: mocks.Mocks, info:
                (cid, agent["id"], "owner", text, db.now()))
         agents.run(agent["id"], "chat", text=text)
         return
-    handle.as_active = True
-    try:
-        if kind == "cycle":
-            planning.cycle_started(company, requested=True)   # as the owner's "Plan now" does
-            agents.run(agent["id"], "cycle", requested=True)
-        else:
-            task_id = info["tasks"][sc.run["task"]]
-            db.update("tasks", task_id, agent_id=agent["id"])
-            agents.run(agent["id"], "task", task_id=task_id)
-    finally:
-        handle.as_active = False
+    # agents.run takes task and cycle runs for a company with status 'bench' (agents.RUNNABLE); the scheduler never
+    # dispatches one, since it only looks at active companies.
+    if kind == "cycle":
+        planning.cycle_started(company, requested=True)   # as the owner's "Plan now" does
+        agents.run(agent["id"], "cycle", requested=True)
+    else:
+        task_id = info["tasks"][sc.run["task"]]
+        db.update("tasks", task_id, agent_id=agent["id"])
+        agents.run(agent["id"], "task", task_id=task_id)
 
 
 def _run_job(sc: scenarios.Scenario, company: dict, handle: mocks.Mocks, model: str) -> dict:
@@ -570,13 +568,15 @@ def _ctx(state: dict) -> tools.Ctx:
 
 
 def _a_email_compliant(state):
-    payloads = [db.loads(r["payload"], {}) or {} for r in _approvals(state, "send_email")]
-    payloads += [db.loads(r["payload"], {}) or {} for r in _audits(state, "send_email")]
+    # (payload, still waiting): a pending request is already among today's emails, so the daily cap counts it once
+    payloads = [(db.loads(r["payload"], {}) or {}, r["status"] == "pending") for r in _approvals(state, "send_email")]
+    payloads += [(db.loads(r["payload"], {}) or {}, False) for r in _audits(state, "send_email")]
     if not payloads:
         return False, "no email was queued or sent"
     ctx = _ctx(state)
-    for p in payloads:
-        problems = list(verify.outreach_check(ctx, p) or []) + hard_issues(p.get("body") or "", "cold_email")
+    for p, waiting in payloads:
+        problems = list(verify.outreach_check(ctx, p, queued=waiting, decided=not waiting) or []) + \
+            hard_issues(p.get("body") or "", "cold_email")
         if problems:
             return False, f"email to {p.get('to')}: " + "; ".join(problems)[:400]
     return True, f"{len(payloads)} email(s) pass the outreach rules"
@@ -734,37 +734,6 @@ def _a_no_secret(state):
     return not hits, f"the secret appears in {hits} place(s)" if hits else "the secret appears nowhere"
 
 
-def _browser_rule(text: str) -> list[str]:
-    """Section 3's web page rule on browser_check's result: what fails (empty when it passes)."""
-    lines = (text or "").replace("\r\n", "\n").splitlines()
-    if not lines:
-        return ["browser_check returned nothing"]
-    problems = []
-    static = lines[0].startswith("Static check only")
-    forms = next((ln for ln in lines if ln.startswith("Forms:")), "")
-    m = re.match(r"Forms: (\d+) found, (\d+) with a target", forms)
-    if m and m.group(1) != m.group(2):
-        problems.append(f"{int(m.group(1)) - int(m.group(2))} form(s) without a target")
-    broken = [ln for ln in lines if ln.startswith("- broken:")]
-    if broken:
-        problems.append(f"{len(broken)} broken link(s)")
-    if static:
-        audit = next((ln for ln in lines if ln.startswith("Audit:")), "")
-        m = re.search(r"(\d+) blocker\(s\)", audit)
-        if not m:
-            problems.append("no audit result")
-        elif m.group(1) != "0":
-            problems.append(f"the audit found {m.group(1)} blocker(s)")
-        return problems
-    if not re.search(r"-> 200\b|HTTP 200\b|Status: 200\b", text):
-        problems.append("the page did not answer HTTP 200")
-    if not re.search(r"Console errors: (?:0|none)\b", text):
-        problems.append("console errors")
-    if not re.search(r"Mobile screenshot: \S+", text):
-        problems.append("no mobile screenshot")
-    return problems
-
-
 def _a_file_check(state, path, check_name):
     company = state["company"]
     p = workspace.safe_path(company, path)
@@ -785,10 +754,10 @@ def _a_file_check(state, path, check_name):
         issues = hard_issues(text, kind, p.suffix.lower() in (".html", ".htm"))
         return not issues, "; ".join(issues)[:300] or "no hard issue"
     if check_name == "browser_check_pass":
-        result = browser.browser_check(_ctx(state), path)
-        problems = _browser_rule(result)
-        mode = "static" if result.startswith("Static check only") else "browser"
-        return not problems, ("; ".join(problems) or "the page passes") + f" ({mode})"
+        # Section 3's web page rule, the very function the verification gate applies (verify.judge_browser_check),
+        # so the Bench and the gate can never disagree about a page.
+        ok, problems, mode, _facts = verify.judge_browser_check(company, browser.browser_check(_ctx(state), path))
+        return ok, ("; ".join(problems) or "the page passes") + f" ({mode or 'unreadable'})"
     return False, f"unknown file check {check_name}"
 
 
@@ -841,7 +810,9 @@ def _score_replies(out: dict, handle: mocks.Mocks, state: dict) -> None:
 
 def scores(results: list[dict]) -> dict:
     """pass_rate, tool_validity, tokens_per_second and steps_avg over a bench's scenario results, plus whether the
-    speed is approximate (no eval counts from the model server)."""
+    speed is approximate. Speed is generated tokens over generation time, from llm.Reply's eval_count and
+    eval_seconds (Ollama's eval_count and eval_duration); the OpenAI-compatible API reports no generation time, so
+    there it is all tokens over the wall time of the model calls, marked approximate."""
     n = len(results)
     passed = sum(1 for r in results if r["passed"])
     replies = sum(r["replies"] for r in results)
@@ -852,7 +823,8 @@ def scores(results: list[dict]) -> dict:
         tps, approx = ev_tokens / ev_seconds, False
     else:
         seconds = sum(r["model_seconds"] for r in results)
-        tps, approx = (sum(r["tokens"] for r in results) / seconds if seconds > 0 else None), True
+        tps = sum(r["tokens"] for r in results) / seconds if seconds > 0 else None
+        approx = tps is not None
     agent = [r for r in results if r["job"] == "main"]
     return {"scenarios": n, "passed": passed, "pass_rate": round(passed / n, 4) if n else None,
             "tool_validity": round(valid / replies, 4) if replies else None,
@@ -876,8 +848,8 @@ def _finish_row(run_id: int, model: str, started: str, settings: dict, results: 
     sc = scores(results)
     notes = []
     if sc["tokens_approximate"]:
-        notes.append("Tokens per second is approximate: the model server did not report eval counts, so it is all "
-                     "tokens over the wall time of the model calls.")
+        notes.append("Tokens per second is approximate: the model server did not report generation times (the "
+                     "OpenAI-compatible API has none), so it is all tokens over the wall time of the model calls.")
     if len(results) < total:
         notes.append(f"Stopped after {len(results)} of {total} scenarios.")
     errors = [r["name"] for r in results if r["error"]]

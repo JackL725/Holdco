@@ -1103,7 +1103,6 @@ class Mocks:
         self.settings = dict(settings or {})   # overrides of the owner's settings, in the bench thread only
         self.deadline = deadline               # time.monotonic() after which the run is stopped (timeout_s)
         self.kill_after: int | None = None     # the kill switch comes on once this many tool calls ran
-        self.as_active = False                 # the bench company reads as active (see _patch_company)
         self.kind = ""                         # the kind of run going on: founding, cycle, task, chat or job
         self.replies: list[dict] = []
         self.calls: list[dict] = []
@@ -1167,7 +1166,6 @@ def install(spec: dict | None, company: dict | None = None, settings: dict | Non
     m = Mocks(spec, company, settings, deadline)
     try:
         _patch_settings(m)
-        _patch_company(m)
         _patch_web(m)
         _patch_phone(m)
         _patch_connectors(m)
@@ -1196,22 +1194,6 @@ def _patch_settings(m: Mocks) -> None:
             s["kill_switch"] = True   # agents.run stops at the next step boundary
         return s
     m.patch(db, "get_settings", get_settings)
-
-
-def _patch_company(m: Mocks) -> None:
-    """agents.run refuses task and cycle runs for a company that is not active; a bench company has status 'bench'
-    so the scheduler never dispatches it. While the runner sets as_active, the bench thread reads it as active.
-    (Not needed once agents.run accepts status 'bench'; founding runs never set it, so a finished stage does not start
-    the next one in the background.)"""
-    from .. import db
-    orig = db.get_company
-
-    def get_company(cid):
-        row = orig(cid)
-        if row and m.as_active and m.mine() and row.get("id") == m.company_id and row.get("status") == "bench":
-            row = {**row, "status": "active"}
-        return row
-    m.patch(db, "get_company", get_company)
 
 
 # ---------------------------------------------------------------- search and web pages
@@ -1477,9 +1459,10 @@ def _record(m: Mocks) -> None:
             reply = orig_chat(messages, tools, model, settings, *args, **kwargs)
         finally:
             m._depth.n = depth
+        # llm.Reply carries what the server measured: eval_count tokens generated in eval_seconds (Ollama). The OpenAI
+        # API reports no generation time (eval_seconds 0), so the runner falls back to tokens over this wall time.
         m.replies.append({"kind": m.kind, "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
-                          "eval_count": int(getattr(reply, "eval_count", 0) or 0),
-                          "eval_seconds": float(getattr(reply, "eval_seconds", 0.0) or 0.0),
+                          "eval_count": int(reply.eval_count or 0), "eval_seconds": float(reply.eval_seconds or 0.0),
                           "calls": len(reply.tool_calls or []), "mode": reply.mode})
         return reply
 
