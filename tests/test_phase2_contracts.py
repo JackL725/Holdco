@@ -360,7 +360,7 @@ class TestContractPrompts(Base):
         loose = make_task(c, "engineering", "Refactor the CSS")
         owner = make_task(c, "engineering", "Owner's idea", created_by="owner")
         routine = make_task(c, "ceo", "Morning report", created_by="routine", routine="ceo:Morning report")
-        today = _dt.date.today()
+        today = _dt.datetime.now(_dt.timezone.utc).date()   # UTC, like contracts' own dates
         db.run("INSERT INTO experiments(company_id, goal_id, hypothesis, metric, start, stop, verdict, created_at) "
                "VALUES(?,?,?,?,?,?,?,?)", (c["id"], g2, "A vet line lifts signups", "forms.signups", str(today),
                                             str(today + _dt.timedelta(days=7)), "pending", db.now()))

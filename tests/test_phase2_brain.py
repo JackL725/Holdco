@@ -89,7 +89,8 @@ def run(ctx, tool_name, /, **args) -> str:
 
 
 def in_days(n: int) -> str:
-    return (_dt.date.today() + _dt.timedelta(days=n)).isoformat()
+    # UTC, like the brain's dates (db.now()): a local date fails these tests in the hours around midnight UTC
+    return (_dt.datetime.now(_dt.timezone.utc).date() + _dt.timedelta(days=n)).isoformat()
 
 
 def call(method: str, path: str, body=None):
