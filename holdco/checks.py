@@ -523,10 +523,23 @@ def _plain(text: str, is_html: bool) -> str:
     return text
 
 
+# Typographic punctuation local models write ("opt‑out" with a non-breaking hyphen, "won’t", a narrow no-break
+# space before a unit) mapped to the plain characters the checks' patterns are written for.
+_PUNCT = {**{c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"},
+          **{c: "'" for c in "\u2018\u2019\u201b\u2032"}, **{c: '"' for c in "\u201c\u201d\u201f\u2033"},
+          **{c: " " for c in "\u00a0\u202f\u2007\u2009\u200a"}, "\u200b": ""}
+_PUNCT_TABLE = str.maketrans(_PUNCT)
+
+
+def plain_punct(text: str) -> str:
+    """text with typographic dashes, quotes and spaces replaced by plain ones, for pattern checks."""
+    return (text or "").translate(_PUNCT_TABLE)
+
+
 def review_text(text: str, kind: str = "general", is_html: bool = False) -> str:
     kind = kind if kind in GRADE_TARGET else "general"
     raw = text
-    text = _plain(text, is_html)
+    text = plain_punct(_plain(text, is_html))
     words = re.findall(r"[A-Za-z][A-Za-z'’-]*", text)
     n = len(words)
     if not n:
@@ -576,7 +589,7 @@ def review_text(text: str, kind: str = "general", is_html: bool = False) -> str:
         elif q > 2:
             issues.append(f"{q} questions: keep to one clear ask.")
         if not re.search(r"unsubscribe|opt[ -]?out|not interested|won'?t (email|follow up|reach out)|reply .{0,12}\bno\b"
-                         r"|let me know if you'?d rather|stop hearing", low):
+                         r"|reply .{0,12}\bstop\b|let me know if you'?d rather|stop hearing", low):
             issues.append("No opt-out line (e.g. \"Not relevant? Reply 'no' and I won't follow up.\").")
         if len(re.findall(r"https?://", raw)) > 1:
             issues.append("More than one link hurts deliverability; use one or none.")

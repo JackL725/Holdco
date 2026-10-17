@@ -392,5 +392,34 @@ class TestReadFileTakesAPageAddress(Base):
         self.assertIn("is a web address, and this company has no saved copy of it. Read it with fetch_url", out)
 
 
+class TestFromTheFinalGateRun(Base):
+    """The last full Bench run on the merged code: gpt-oss wrote "Feel free to opt‑out." with a non-breaking hyphen
+    (U+2011), review_text said the opt-out line was missing, and the agent spent its session rewriting a compliant
+    email; elsewhere it finished partial naming a draft it never saved."""
+
+    def test_typographic_punctuation_counts_as_an_opt_out(self):
+        from holdco import checks
+        for line in ("Feel free to opt\u2011out.", "Not relevant? Reply \u2018no\u2019 and I won\u2019t follow up.",
+                     "If you\u2019d rather not hear from us, simply reply \u2018stop\u2019."):
+            body = "Hi Sam,\n\nOur 2\u2011week pilot could help your clients. Worth a look?\n\n" + line + "\n\nAva, PawPlan"
+            self.assertNotIn("No opt-out line", checks.review_text(body, "cold_email"), line)
+        self.assertTrue(truth.is_stop_request("Re: hi", "Please stop e\u2011mailing me."))
+
+    def test_partial_finish_naming_an_unsaved_file_is_pushed_back_once(self):
+        c = make_company("DraftCo")
+        task = make_task(c, "engineering", "Update the hero copy", status="in_progress")
+        ctx = ctx_for(c, "engineering", task=task)
+        out = tools.execute(ctx, "finish", {"summary": "Draft saved", "status": "partial",
+                                            "deliverable": "drafts/site/index.html"})
+        self.assertTrue(out.startswith("Not finished yet: drafts/site/index.html doesn't exist."), out)
+        self.assertFalse(ctx.finished)
+        tools.execute(ctx, "finish", {"summary": "Draft saved", "status": "partial",
+                                      "deliverable": "drafts/site/index.html"})
+        self.assertTrue(ctx.finished)
+        # a partial handoff without a file, or naming one that exists, is not refused
+        ctx2 = ctx_for(c, "engineering", task=task)
+        self.assertEqual(tools.execute(ctx2, "finish", {"summary": "Half done", "status": "partial"}), "Session ended.")
+
+
 if __name__ == "__main__":
     unittest.main()

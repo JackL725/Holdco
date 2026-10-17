@@ -2128,7 +2128,7 @@ _STOP_REQUEST = re.compile(
 def is_stop_request(subject: str, own_words: str) -> bool:
     """Does an inbound email ask not to be emailed again? Looks at the subject and at the lines the sender wrote
     (_own_words: quoted text, where our own opt-out line comes back, is already cut)."""
-    return bool(_STOP_REQUEST.search(subject or "") or _STOP_REQUEST.search(own_words or ""))
+    return bool(_STOP_REQUEST.search(checks.plain_punct(subject)) or _STOP_REQUEST.search(checks.plain_punct(own_words)))
 OPT_OUT = "Reply 'stop' and we won't email you again."
 _OPT_OUT_RE = re.compile(r"\b(?:stop|unsubscribe|opt[ -]?out)\b|won'?t\s+(?:e-?mail|follow\s+up|contact|reach\s+out)|"
                          r"reply\s+.{0,12}\bno\b", re.I)
@@ -2216,7 +2216,7 @@ def outreach_guard(ctx: Ctx, to: str, subject: str, body: str) -> tuple[str | No
         footer = []
         if name.lower() not in flat or " ".join(address.lower().split()) not in flat:
             footer += [name, address]
-        if not _OPT_OUT_RE.search(body or ""):
+        if not _OPT_OUT_RE.search(checks.plain_punct(body)):   # "opt‑out" with a non-breaking hyphen counts
             footer.append(OPT_OUT)
         if footer:
             body = (body or "").rstrip() + "\n\n--\n" + "\n".join(x for x in footer if x)

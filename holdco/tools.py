@@ -943,6 +943,17 @@ def _written_for_task(ctx: Ctx, rel_path: str, is_dir: bool) -> bool:
     return False
 
 
+def _missing_named_file(ctx: Ctx, deliverable: str) -> str | None:
+    """The path a finish call names as its deliverable when that is a file path that does not exist, else None."""
+    d = (deliverable or "").strip().strip("`'\"")
+    if not d or " " in d or not re.fullmatch(r"[\w./-]+", d) or "." not in d.rsplit("/", 1)[-1]:
+        return None
+    try:
+        return None if workspace.safe_path(ctx.company, d).exists() else d
+    except workspace.PathError:
+        return None
+
+
 def _deliverable_ok(ctx: Ctx, deliverable: str) -> str | None:
     """None if fine, otherwise what's wrong. Only checks things that look like file paths."""
     # Phase 2: the deliverable of a brief rhythm (evening brief, weekly review, monthly check) is the brief it
@@ -1055,6 +1066,14 @@ def finish(ctx: Ctx, summary: str, status: str = "done", deliverable: str = "", 
         if waiting_on is None:
             status = "blocked"
             open_issues = (open_issues + "\nNothing was waiting on the owner for this task.").strip()
+    if status == "partial" and ctx.task and not ctx.finish_warned:
+        # A partial handoff that names a file the agent never saved (a real-model run said "draft in
+        # drafts/site/index.html" after the write was refused) would send the next attempt looking for it.
+        missing = _missing_named_file(ctx, deliverable)
+        if missing:
+            ctx.finish_warned = True
+            return (f"Not finished yet: {missing} doesn't exist. Save what you have there with write_file, or call "
+                    f"finish again without a deliverable and say in open_issues what is missing.")
     if status == "done" and ctx.task:
         problem = _deliverable_ok(ctx, target)
         if problem and not ctx.finish_warned:
