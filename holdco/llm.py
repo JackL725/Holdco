@@ -323,9 +323,10 @@ def unwrap_call(name: str, args: dict, tool_names: set[str]) -> tuple[str, dict]
         inner = _parse_args(inner)
         if inner_name == name and inner:
             return name, inner
-        # Only the harmony namespace as the name, the call inside: functions({"name": "start_experiment",
-        # "arguments": {...}}) opened both real-model planning cycles of the Phase 3 bench gate.
-        if name not in tool_names and name in NAMESPACES and inner_name in tool_names and inner:
+        # A name that is no tool of this session, the call inside: functions({"name": "start_experiment",
+        # "arguments": {...}}) opened both real-model planning cycles of the Phase 3 bench gate, and a prompt-based
+        # run sent container.exec({"tool": "list_tasks", "args": {}}) three times.
+        if name not in tool_names and inner_name in tool_names and inner_name != name:
             return inner_name, inner
     return name, args
 

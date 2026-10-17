@@ -804,6 +804,7 @@ TRACE_CAP = 12_000      # characters of trace per scenario (as JSON); the middle
 TRACE_ARGS = 300        # characters of a call's arguments
 TRACE_RESULT = 300      # characters of a tool result
 TRACE_TEXT = 600        # characters of a plain-text reply, a run's summary or a job's output
+NO_REPLY = "(no tool call and no text)"
 
 
 def _clip(text, n: int) -> str:
@@ -835,7 +836,7 @@ def trace(handle: mocks.Mocks, state: dict) -> list[dict]:
             step += 1
             calls = m.get("tool_calls") or []
             if not calls:
-                entries.append({"step": step, "text": _clip(m.get("content"), TRACE_TEXT) or "(no tool call and no text)"})
+                entries.append({"step": step, "text": _clip(m.get("content"), TRACE_TEXT) or NO_REPLY})
                 continue
             results = [x for x in msgs[i + 1:i + 1 + len(calls)] if x.get("role") == "tool"]
             for j, c in enumerate(calls):
@@ -847,7 +848,7 @@ def trace(handle: mocks.Mocks, state: dict) -> list[dict]:
         while step < first + int(run["steps"] or 0):   # replies the transcript does not keep
             step += 1
             text = replies[step - 1].get("text") if step <= len(replies) else ""
-            entries.append({"step": step, "text": _clip(text, TRACE_TEXT) or "(no tool call and no text)"})
+            entries.append({"step": step, "text": _clip(text, TRACE_TEXT) or NO_REPLY})
         entries.append({"run": run["kind"], "status": run["status"], "steps": int(run["steps"] or 0),
                         "summary": _clip(run.get("summary"), TRACE_TEXT)})
     return cap_trace(entries)

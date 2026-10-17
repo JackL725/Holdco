@@ -94,7 +94,8 @@ class Base(unittest.TestCase):
 
 class TestArgumentsWrittenAsText(Base):
     """The research stage's last reply: finish's arguments as the message text, no tool named."""
-    TEXT = ('{"deliverable":"research/market.md","evidence":"research/market.md exists with content and facts recorded",'
+    TEXT = ('{"deliverable":"research/market.md",'
+            '"evidence":"research/market.md exists with content and facts recorded",'
             '"next_step":"Gather missing competitor pricing.","open_issues":"Incomplete pricing data.",'
             '"status":"partial","summary":"1. Searched dog meal plan markets. 2. Saved partial findings."}')
 
@@ -157,10 +158,12 @@ class TestCallsWrittenAsText(Base):
                  "stop_days": 14}
         self.assertEqual(llm.unwrap_call("functions", {"name": "start_experiment", "arguments": inner}, names),
                          ("start_experiment", inner))
-        # not a namespace, or not a tool inside: left for the unknown-tool error to explain
-        self.assertEqual(llm.unwrap_call("helpers", {"name": "start_experiment", "arguments": inner}, names)[0],
-                         "helpers")
+        # any name that is no tool here, around a call of one (gpt-oss's built-in container.exec in prompt-based mode)
+        self.assertEqual(llm.unwrap_call("container.exec", {"tool": "list_tasks", "args": {}}, names | {"list_tasks"}),
+                         ("list_tasks", {}))
+        # no tool of this session inside: left for the unknown-tool error to explain
         self.assertEqual(llm.unwrap_call("functions", {"name": "rm_rf", "arguments": {"x": 1}}, names)[0], "functions")
+        self.assertEqual(llm.unwrap_call("container.exec", {"cmd": ["bash", "-lc", "ls"]}, names)[0], "container.exec")
         # a made-up namespace on the name and the call wrapped once more (tool_call_repair, prompt-based mode)
         args = {"title": "Build the waitlist landing page", "assign_to": "engineering", "priority": 1}
         self.assertEqual(llm.unwrap_call("server.create_task", {"tool": "create_task", "args": args}, names),
@@ -302,9 +305,10 @@ class TestAnInvitedRetryIsNoLoop(Base):
         return run, results, c
 
     def test_the_same_write_is_retried(self):
-        write = ("write_file", {"path": "marketing/notes.md", "content": "# Launch notes\n\n- Dog parks: a flyer with the waitlist link.\n- r/dogs: one helpful post.\n"})
-        run, results, c = self.run_task([write, write, write,
-                                         ("finish", {"summary": "Saved the notes.", "deliverable": "marketing/notes.md"})])
+        notes = "# Launch notes\n\n- Dog parks: a flyer with the waitlist link.\n- r/dogs: one helpful post.\n"
+        write = ("write_file", {"path": "marketing/notes.md", "content": notes})
+        done = ("finish", {"summary": "Saved the notes.", "deliverable": "marketing/notes.md"})
+        run, results, c = self.run_task([write, write, write, done])
         self.assertEqual([r.split(" ")[0] for r in results], ["ERROR:", "ERROR:", "Saved", "Session"], results)
         self.assertEqual(run["status"], "done")
         self.assertTrue(workspace.safe_path(c, "marketing/notes.md").is_file())
@@ -326,9 +330,9 @@ class TestSourcesCheckKnowsOurNumbers(Base):
         c = make_company("PriceCo")
         db.run("INSERT INTO strategy(company_id, price, offer, updated_at) VALUES(?,?,?,?)",
                (c["id"], "$9 per month (to test).", "A weekly meal plan.", db.now()))
-        db.run("INSERT INTO goals(company_id, title, metric, target, current, deadline, owner_role, status, created_at) "
-               "VALUES(?,?,?,?,?,?,?,?,?)", (c["id"], "200 waitlist signups", "waitlist_signups", 200, 40,
-                                            "2026-12-01", "marketing", "active", db.now()))
+        db.run("INSERT INTO goals(company_id, title, metric, target, current, deadline, owner_role, status, "
+               "created_at) VALUES(?,?,?,?,?,?,?,?,?)", (c["id"], "200 waitlist signups", "waitlist_signups", 200,
+                                                         40, "2026-12-01", "marketing", "active", db.now()))
         text = ("All prices were captured from the pricing pages on September 30, 2026.\n"
                 "Prices checked again on 2 Oct.\n"
                 "Our $9 / month position sits well below these prices.\n"
