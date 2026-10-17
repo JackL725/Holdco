@@ -25,7 +25,10 @@ tag_for_call_lowers is true (Stripe's allowlist of safe writes); check_result(to
 (checked after every MCP result: a text replaces the result with an error, after reset_call (tool, args) has been
 sent); page_of(text) -> url or None with page_query (tool, args) (a call that is not read is tied to the page the
 browser was on when it was asked for, and refused after approval when the page changed);
-metric_prefix (metric names become "<metric_prefix>.<name>"; default the key), launch(inst) -> (command, args) for a
+metric_prefix (metric names become "<metric_prefix>.<name>"; default the key), external (Phase 3: True when every tool
+returns outside content, such as other sites' pages or people's messages, or a list of tool-name globs; an api tool
+may carry its own "external": True; a session that read such a tool is tainted, see taint.py; the GitHub, forms and
+inbound-mail definitions of Phase 4 mark their reads), launch(inst) -> (command, args) for a
 stdio server's command line, mcp_url(inst) and mcp_headers(inst) for an HTTP server's address and headers,
 active(inst) -> bool with parent and parent_field (the instance only works while its parent's card has that field
 ticked), enabled_by_default (bool, default true), beta (bool), and on fields: secret, hidden (kept off the card,
@@ -551,6 +554,18 @@ def _role_keys(agent) -> set:
     return {k for k in (agent.get("role"), roles.preset_key(agent)) if k}
 
 
+def is_external(d: dict | None, tool: str, entry: dict | None = None) -> bool:
+    """Phase 3: does this tool return outside content (a page of another site, an inbound message, an issue someone
+    wrote), so that a session that read it loses its automatic permissions? The definition's external flag (True for
+    every tool, or a list of globs) or the tool's own entry says so; Stripe's own data is not outside content."""
+    if entry and entry.get("external"):
+        return True
+    flag = (d or {}).get("external")
+    if isinstance(flag, (list, tuple, set)):
+        return any(fnmatch.fnmatchcase(tool, str(g)) for g in flag)
+    return bool(flag)
+
+
 def _allowed(d: dict, tool: str, tag: str, role_keys: set) -> bool:
     """api and builtin connectors allow every role. MCP connectors allow read tools for every role, and the
     rest only when a glob in the allow map matches for the agent's role (or for "*")."""
@@ -617,17 +632,18 @@ def _catalog(company, agent) -> tuple[list[dict], list[str]]:
                     continue
                 blocked = _blocked(d)
                 raw = [(str(t["name"]), str(t.get("description") or ""), t.get("inputSchema") or {},
-                        _classify(d, str(t["name"]))) for t in _mcp_tools(inst) if str(t["name"]) not in blocked]
+                        _classify(d, str(t["name"])), False) for t in _mcp_tools(inst) if str(t["name"]) not in blocked]
             else:
-                raw = [(t["name"], str(t.get("description") or ""), t.get("parameters") or {}, t["tag"])
-                       for t in _api_tools(d, inst)]
+                raw = [(t["name"], str(t.get("description") or ""), t.get("parameters") or {}, t["tag"],
+                        bool(t.get("external"))) for t in _api_tools(d, inst)]
         except Exception as e:
             problems.append(f"{label}: {_error_text(e)}")
             continue
-        for tool, desc, params, tag in raw:
+        for tool, desc, params, tag, external in raw:
             entries.append({"name": f"{key}__{tool}", "description": desc, "parameters": _slim(params), "tag": tag,
                             "instance_id": inst["id"], "allowed": _allowed(d, tool, tag, role_keys),
-                            "connector": key, "tool": tool, "label": label})
+                            "connector": key, "tool": tool, "label": label,
+                            "external": external or is_external(d, tool)})   # Phase 3: reading it taints
     return entries, problems
 
 
@@ -667,7 +683,7 @@ def find_tool(ctx: tools.Ctx, query: str) -> str:
         note = "" if e["tag"] == "read" else ", may wait for the owner's approval"
         spec = {"name": e["name"], "description": f"{e['description'][:900]} [{e['label']}: {e['tag']}{note}]".strip(),
                 "parameters": e["parameters"], "tag": e["tag"], "instance_id": e["instance_id"], "allowed": True,
-                "connector": e["connector"], "tool": e["tool"]}
+                "connector": e["connector"], "tool": e["tool"], "external": e["external"]}
         ctx.loaded_tools.append(spec)
         ctx.loaded_by_name[e["name"]] = spec
     lines = []

@@ -2,17 +2,24 @@
 
 Every few seconds it: lets each CEO re-plan when a cycle is due, hands queued tasks to idle agents
 (respecting the GPU concurrency limit), and checks company inboxes.
+
+Phase 3 (docs/phases/phase-3-verify.md section 8): queued tasks go out by class, then priority and id across
+companies: 1 follow-ups (the owner's answer reopened them within the hour), 2 due within a day, 3 priority 1,
+4 normal, 5 routines, 6 low-value research (research or discovery, priority 3, no deadline), which runs only inside
+the company's quiet_hours window (local time) unless nothing in classes 1 to 5 could start. Classes 1 and 2 go out
+before the CEO cycles; the rest after them, as before.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import threading
 import time
 import traceback
 
-from . import (agents, backup, bench, bus, contracts, db, decisions, doctor, emailer, notify, planning, rhythms,
-               roles, watchdog)
+from . import (agents, backup, bench, bus, config, contracts, db, decisions, doctor, emailer, notify, planning,
+               rhythms, roles, watchdog)
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -21,6 +28,20 @@ MODEL_RECHECK_MINUTES = 5      # while the model server is down, the Doctor is a
 MODEL_WAIT_TEXT = ("Waiting for the model server: it is unreachable, so tasks and planning are on hold. The health "
                    "checks retry every few minutes.")
 MODEL_BACK_TEXT = "The model server is back. Tasks and planning resume."
+# Phase 3: dispatch classes
+FOLLOWUP_SECONDS = 3600        # a task the owner's answer reopened is a follow-up (class 1) for this long
+DUE_SOON_HOURS = 24            # a task due within this many hours (or overdue) is class 2
+URGENT_CLASSES = (1, 2)        # dispatched before the CEO cycles
+RESEARCH_CLASS = 6             # low-value research: inside the quiet window, or when nothing else can start
+QUEUE_LIMIT = 200              # queued tasks looked at per tick
+# The class of a todo task, in SQL so the tick's LIMIT keeps the most urgent ones; first match wins.
+_CLASS_SQL = ("CASE WHEN COALESCE(t.followup_at, '')>=? THEN 1 "
+              "WHEN COALESCE(t.due_at, '')!='' AND t.due_at<=? THEN 2 "
+              "WHEN t.priority<=1 THEN 3 "
+              "WHEN COALESCE(t.created_by, '')='routine' THEN 5 "
+              "WHEN (t.role IN ('research', 'discovery') OR t.role GLOB 'research_[0-9]*' OR "
+              "t.role GLOB 'discovery_[0-9]*') AND t.priority>=3 AND COALESCE(t.due_at, '')='' THEN 6 "
+              "ELSE 4 END")
 
 
 def _seconds_ago(n: float) -> str:
@@ -56,6 +77,42 @@ def _at_hour_due(c: dict, key: str, r: dict) -> bool:
     window = (now - at) + _dt.timedelta(hours=max(0.0, float(r.get("every_hours") or 24) - 24))
     return not db.one("SELECT id FROM tasks WHERE company_id=? AND routine=? AND created_at>=? LIMIT 1",
                       (c["id"], key, _seconds_ago(window.total_seconds())))
+
+
+def _window(text) -> tuple[int, int] | None:
+    """'23:00-07:00' as (start, end) minutes after midnight, or None when it is not two times."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", str(text or ""))
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if h1 > 24 or h2 > 24 or m1 > 59 or m2 > 59:
+        return None
+    return (h1 * 60 + m1) % 1440, (h2 * 60 + m2) % 1440
+
+
+def in_quiet_hours(c: dict) -> bool:
+    """Phase 3: is the company inside its quiet_hours window, by the PC's local time? A window may wrap midnight
+    (23:00-07:00); equal ends mean all day; a blank setting means no quiet window, and one that cannot be read
+    falls back to the default."""
+    text = str(db.company_settings(c).get("quiet_hours") or "").strip()
+    if not text:
+        return False
+    start, end = _window(text) or _window(config.DEFAULT_COMPANY_SETTINGS["quiet_hours"])
+    now = _local_now()
+    minute = now.hour * 60 + now.minute
+    if start == end:
+        return True
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def _queue() -> list[dict]:
+    """Phase 3: todo tasks of active companies in dispatch order, each with its dispatch_class (1 to 6)."""
+    due_by = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=DUE_SOON_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return db.q(f"SELECT t.*, {_CLASS_SQL} AS dispatch_class FROM tasks t JOIN companies c ON c.id=t.company_id "
+                f"WHERE c.status='active' AND t.status='todo' ORDER BY dispatch_class, t.priority, t.id LIMIT ?",
+                (_seconds_ago(FOLLOWUP_SECONDS), due_by, QUEUE_LIMIT))
 
 
 class Scheduler(threading.Thread):
@@ -99,27 +156,58 @@ class Scheduler(threading.Thread):
         if bench.RUNNING:
             return   # Phase 3: a Holdco Bench run has the GPU; dispatch and cycles wait (chat still works)
         capacity = max(1, int(s.get("max_concurrent_runs", 2)))
-        # 1) CEO planning cycles first: they create the work.
+        over: dict[int, bool] = {}   # the daily budgets (tokens, GPU hours), looked up once per company per tick
+        started: set[int] = set()    # tasks handed out this tick
+        # 1) Phase 3: follow-ups on the owner's answers and work due within a day go out before planning.
+        queue = _queue()
+        deps = contracts.dependency_status(queue)   # Phase 2: one query for every dependency in the queue
+        ready = self._dispatch([t for t in queue if t["dispatch_class"] in URGENT_CLASSES], capacity, deps, over,
+                               started)
+        # 2) CEO planning cycles: they create the work.
         for c in companies:
             if agents.running_count() >= capacity:
                 break   # full: no cycle now, but the recurring duties below are still created
             self._maybe_cycle(c)
-        # 2) Recurring duties from each agent's preset (morning report, follow-ups, weekly reviews...). A company
+        # 3) Recurring duties from each agent's preset (morning report, follow-ups, weekly reviews...). A company
         #    over its token or GPU budget, or a scheduler at capacity, still gets them: they queue until a run
         #    slot is free and the budget resets (only creating a task here; dispatch below checks both).
         for c in companies:
             if time.time() - self._last_routines.get(c["id"], 0) >= ROUTINE_CHECK_SECONDS:
                 self._last_routines[c["id"]] = time.time()
                 self._routines(c)
-        # 3) Hand out tasks, highest priority first across all companies.
-        open_tasks = db.q(
-            "SELECT t.* FROM tasks t JOIN companies c ON c.id=t.company_id "
-            "WHERE c.status='active' AND t.status='todo' ORDER BY t.priority, t.id LIMIT 200")
-        deps = contracts.dependency_status(open_tasks)   # Phase 2: one query for every dependency in the queue
-        over: dict[int, bool] = {}   # the daily budgets (tokens, GPU hours), looked up once per company per tick
-        for t in open_tasks:
+        # 4) Hand out the rest by class, then priority, across all companies (the routines just created included).
+        #    Low-value research waits for its company's quiet hours unless nothing else could start.
+        known = {t["id"] for t in queue}
+        queue = _queue()
+        new = [t for t in queue if t["id"] not in known]
+        if new:   # tasks created since the first look (routines, a cycle's plan): their dependencies too
+            deps.update(contracts.dependency_status(new))
+        quiet: dict[int, bool] = {}   # company id -> inside its quiet hours now
+        later = []                    # research outside the quiet window
+        for t in queue:
             if agents.running_count() >= capacity:
                 return
+            if t["dispatch_class"] == RESEARCH_CLASS:
+                if t["company_id"] not in quiet:
+                    quiet[t["company_id"]] = in_quiet_hours(db.get_company(t["company_id"]) or {})
+                if not quiet[t["company_id"]]:
+                    later.append(t)
+                    continue
+            if self._dispatch([t], capacity, deps, over, started) and t["dispatch_class"] != RESEARCH_CLASS:
+                ready = True
+        if not ready:   # nothing in classes 1 to 5 could start: the GPU would idle, so research runs anyway
+            self._dispatch(later, capacity, deps, over, started)
+
+    def _dispatch(self, tasks: list[dict], capacity: int, deps: dict, over: dict, started: set) -> bool:
+        """Start these tasks in order while a run slot is free. Phase 2's rules hold: every dependency done or
+        cancelled, an enabled and idle agent of the role, and a company over its token or GPU budget waits (tasks
+        the owner created excepted). Returns whether any of them could start."""
+        ready = False
+        for t in tasks:
+            if agents.running_count() >= capacity:
+                break
+            if t["id"] in started:
+                continue
             if not contracts.dispatchable(t, deps):
                 continue   # Phase 2: a dependency is not done or cancelled yet
             agent = db.get_agent(t["agent_id"]) if t["agent_id"] else None
@@ -138,7 +226,10 @@ class Scheduler(threading.Thread):
                                                               or contracts.over_gpu_budget(company)))
                 if over[t["company_id"]]:
                     continue   # the company used its daily tokens or GPU hours; owner chat and owner tasks still work
+            ready = True
+            started.add(t["id"])
             agents.start(agent["id"], "task", task_id=t["id"])
+        return ready
 
     def _housekeeping(self, s: dict) -> None:
         """Phase 0 hooks that must run even when autopilot is off: watchdog, health checks, backups, phone poller.

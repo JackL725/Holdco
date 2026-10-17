@@ -4,7 +4,7 @@ options, a recommendation and a deadline after which a reversible decision takes
 Shared interface (used by brain.py for owner-routed proposals and goal changes, and by rhythms.py for the monthly
 check): create() queues the decision; payload["origin"] says who asked, and on_decided() hands the answer back to
 that module (brain.on_owner_decision for origin kinds "brain_change" and "goals"; the monthly check's "Kill" pauses
-the company).
+the company; Phase 3: trust.apply_promotion for origin kind "trust").
 
 A decision is an approvals row of action 'decision'. It follows Phase 0.5's rules for owner questions: the owner
 reads it on a phone (planning.question_problem), one open question per topic (planning.find_duplicate), and the
@@ -158,6 +158,9 @@ def on_decided(row: dict, answer: str, decided_by: str) -> None:
     if kind in ("brain_change", "goals"):
         from . import brain   # imported here: brain imports tools, which imports this module
         brain.on_owner_decision(cid, origin, answer)
+    elif kind == "trust":   # Phase 3: a promotion on the trust ladder
+        from . import trust
+        trust.apply_promotion(cid, origin, answer)
     elif kind == "monthly" and str(answer or "").strip().lower().startswith("kill"):
         company = db.get_company(cid)
         if company and company["status"] not in ("paused", "archived"):
