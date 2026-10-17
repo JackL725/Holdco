@@ -26,6 +26,7 @@ import json
 import re
 import secrets
 import shutil
+import sqlite3
 import time
 import traceback
 import types
@@ -111,7 +112,9 @@ def run_scenario(sc: scenarios.Scenario, model: str, overrides: dict | None = No
         timed_out = handle.timed_out
         handle.deadline = handle.kill_after = None   # the run is over: the checks below run without either
         if sc.job == "main":
-            watchdog.tick()   # one pass of the watchdog, as the scheduler's next tick would do
+            # one pass of the watchdog over this company, as the scheduler's next tick would do (only this one:
+            # the bench's thread must not act on the owner's companies)
+            watchdog.tick(only=db.get_company(company["id"]))
         state = _state(sc, company, handle, secret, info, job)
         for a in sc.assertions:
             try:
@@ -122,6 +125,15 @@ def run_scenario(sc: scenarios.Scenario, model: str, overrides: dict | None = No
         if timed_out:
             out["error"] = f"timed out after {sc.timeout_s} s"
         _score_replies(out, handle, state)
+        if sc.job == "main" and not out["error"]:
+            # no_repeat, tool_not_called and run_status_not hold for a run that never got a reply: without a model
+            # answer, or with a run that ended in an error, a pass would be a pass that did not happen.
+            broken = [r for r in state["runs"] if r.get("status") == "error"]
+            if not handle.replies:
+                out["error"] = "the model never answered"
+            elif broken:
+                why = " ".join(str(broken[0].get("summary") or "").split())
+                out["error"] = f"the run ended with an error: {why[:200]}"
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         traceback.print_exc()
@@ -157,11 +169,18 @@ def _create_company(sc: scenarios.Scenario) -> tuple[dict, str]:
         cs[k] = {**(cs.get(k) or {}), **v} if isinstance(v, dict) and isinstance(cs.get(k), dict) else v
     ts = db.now()
     slug = f"bench-{sc.name.replace('_', '-')}-{int(time.time() * 1000)}"
-    cid = db.run("INSERT INTO companies(name, slug, idea, mission, charter, status, stage, settings, created_at, "
-                 "last_cycle_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                 (sc.company_name, slug, seed.get("idea") or scenarios.IDEA,
-                  "" if founding else scenarios.STRATEGY["one_liner"], "" if founding else scenarios.CHARTER,
-                  "bench", "idea" if founding else "building", json.dumps(cs), ts, ts))
+    for attempt in range(5):
+        cid = _fresh_company_id()
+        try:
+            db.run("INSERT INTO companies(id, name, slug, idea, mission, charter, status, stage, settings, created_at, "
+                   "last_cycle_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (cid, sc.company_name, slug, seed.get("idea") or scenarios.IDEA,
+                    "" if founding else scenarios.STRATEGY["one_liner"], "" if founding else scenarios.CHARTER,
+                    "bench", "idea" if founding else "building", json.dumps(cs), ts, ts))
+            break
+        except sqlite3.IntegrityError:   # a company created at the same moment took the id
+            if attempt == 4:
+                raise
     company = db.get_company(cid)
     try:
         workspace.create(company)
@@ -173,6 +192,22 @@ def _create_company(sc: scenarios.Scenario) -> tuple[dict, str]:
         _delete_company(company)
         raise
     return db.get_company(cid), secret
+
+
+def _fresh_company_id() -> int:
+    """An id no row names yet. companies.id is reused after a delete (no AUTOINCREMENT), and deleting a company keeps
+    rows such as the audit log and the global do-not-email list; a bench company with that id would see them in its
+    assertions and _delete_company would remove them."""
+    top = int(db.scalar("SELECT MAX(id) FROM companies") or 0)
+    for table in _company_tables():
+        top = max(top, int(db.scalar(f"SELECT MAX(company_id) FROM {table}") or 0))
+    try:
+        from .. import vault   # company.<id>.* secrets of a company deleted while the vault was locked
+        ids = [int(n.split(".")[1]) for n in vault.names() if re.match(r"^company\.\d+\.", n)]
+        top = max([top, *ids])
+    except Exception:
+        pass
+    return top + 1
 
 
 def _days(n) -> str:
@@ -656,13 +691,20 @@ def _a_brain_row(state, section, where=None):
     return bool(hits), f"{len(hits)} matching row(s) in {table}"
 
 
+# Dates and times in a brief's data (every metric's "at", a brief's created_at): their digits are no numbers a brief
+# may state, and they change with the clock, so an invented "37" passed whenever a stamp held minute 37.
+_STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b")
+
+
 def _numbers(x, out: set) -> set:
-    """Every number in a brief's data: values, and the numbers written inside its strings and names."""
+    """Every number in a brief's data: values, and the numbers written inside its strings and names (not the digits
+    of its dates and times)."""
     if isinstance(x, bool) or x is None:
         return out
     if isinstance(x, (int, float)):
         out.add(abs(float(x)))
     elif isinstance(x, str):
+        x = _STAMP_RE.sub(" ", x)
         out.update(abs(float(n.replace(",", ""))) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", x)
                    if n.replace(",", "").replace(".", "", 1).isdigit())
     elif isinstance(x, dict):
@@ -791,7 +833,7 @@ def _score_replies(out: dict, handle: mocks.Mocks, state: dict) -> None:
     for c in handle.calls:
         by_step.setdefault(c["step"], []).append(c)
     replies = valid = 0
-    for i, r in enumerate(handle.replies, 1):
+    for r in handle.replies:
         out["tokens"] += r["tokens"]
         out["eval_count"] += r["eval_count"]
         out["eval_seconds"] += r["eval_seconds"]
@@ -799,7 +841,7 @@ def _score_replies(out: dict, handle: mocks.Mocks, state: dict) -> None:
         if r["kind"] not in AGENT_KINDS:
             continue
         replies += 1
-        results = [str(c["result"]) for c in by_step.get(i, [])]
+        results = [str(c["result"]) for c in by_step.get(r["step"], [])]
         if r["calls"] and not any(REPAIR_RE.match(x) or x.startswith(UNKNOWN_TOOL) for x in results):
             valid += 1
     out["replies"], out["valid"] = replies, valid

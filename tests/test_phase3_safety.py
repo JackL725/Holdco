@@ -405,6 +405,10 @@ class TestTrust(Base):
                (c["id"], "Kim", "Kim@Known.example", "", db.now()))
         self.assertTrue(email("kim@known.example").startswith("Queued"))
         db.run("UPDATE contacts SET last_touch='2026-10-01' WHERE company_id=?", (c["id"],))
+        # (Kim wrote to the company: a last touch counts only next to a real exchange, since agents can write it.)
+        db.run("INSERT INTO emails(company_id, direction, from_addr, subject, body, status, created_at) "
+               "VALUES(?,?,?,?,?,?,?)", (c["id"], "in", "Kim <kim@known.example>", "Call", "Thanks", "handled",
+                                         "2026-10-01T09:00:00Z"))
         self.assertEqual(email("kim@known.example", "Following up on our call."), "Email sent to kim@known.example.")
         self.assertEqual(audits(c, "send_email")[-1]["approved_by"], "trust:2")
         # A legal commitment always asks, even to a known contact at level 2.

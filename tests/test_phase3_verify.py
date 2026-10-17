@@ -566,6 +566,8 @@ class TestGate(Base):
         for known in ("dee@shop-d-verify.com", "eve@shop-e-verify.com"):   # not a first contact (trust ladder)
             db.run("INSERT INTO contacts(company_id, name, email, consent, last_touch, created_at) VALUES(?,?,?,?,?,?)",
                    (c["id"], known.split("@")[0].title(), known, "", "2026-10-01", db.now()))
+            db.run("INSERT INTO emails(company_id, direction, to_addr, subject, body, status, created_at) "
+                   "VALUES(?,?,?,?,?,?,?)", (c["id"], "out", known, "Intro", "Hi", "sent", "2020-01-01T09:00:00Z"))
         cases = [
             # "stop" in the body keeps outreach_guard from adding its opt-out line; review_text finds none
             ({"to": "ann@shop-a-verify.com", "subject": "Hi", "body": "Hi Ann, SendCo helps stop leaks. Worth a look?"},

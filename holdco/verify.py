@@ -588,9 +588,9 @@ def cap_problem(company: dict, counted: bool = False) -> str | None:
 
 
 def _is_reply(company: dict, payload: dict, a: str) -> bool:
-    """Someone who wrote to the company first gets a reply, not commercial email (truth.outreach_guard's rule)."""
-    if payload.get("reply_to_email_id"):
-        return True
+    """Someone who wrote to the company first gets a reply, not commercial email (truth.outreach_guard's rule). The
+    recipient must have written in: a reply_to_email_id alone proves nothing (any number, another company's email or
+    another sender's), so it would let a cold email skip the opt-out and EU consent rules."""
     return bool(a) and any(_addr(r["from_addr"]) == a for r in db.q(
         "SELECT from_addr FROM emails WHERE company_id=? AND direction='in' AND lower(from_addr) LIKE ?",
         (company["id"], f"%{a}%")))

@@ -457,10 +457,12 @@ def is_model_connection_error(text: str | None) -> bool:
     return bool(_MODEL_DOWN_RE.search(low))
 
 
-def tick() -> None:
-    """Cheap SQL-only pass run by the scheduler every tick. Never raises."""
+def tick(only: dict | None = None) -> None:
+    """Cheap SQL-only pass run by the scheduler every tick. Never raises. only (Phase 3): the per-company checks for
+    that one company and nothing else; Holdco Bench passes its company, which the scheduler's tick never sees, and
+    its thread (with the bench's mocks and settings) must not act on the owner's companies."""
     try:
-        companies = db.q("SELECT * FROM companies WHERE status='active' ORDER BY id")
+        companies = [only] if only else db.q("SELECT * FROM companies WHERE status='active' ORDER BY id")
         if not companies:
             return
         settings = db.get_settings()
@@ -470,6 +472,8 @@ def tick() -> None:
             _check_repeated_errors(c)
             _check_bouncing(c, pending_tasks)
             _check_stalled(c, settings)
+        if only:
+            return   # connectors and search are the whole portfolio's: the scheduler's own tick checks them
         by_id = {c["id"]: c for c in companies}
         _check_connectors(by_id)
         _check_search(by_id, settings)

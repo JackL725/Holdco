@@ -121,6 +121,7 @@ class Scheduler(threading.Thread):
         # Not '_stop': Thread has an internal _stop() method on Python 3.12 and older.
         self._stop_event = threading.Event()
         self._last_inbox: dict[int, float] = {}
+        self._inbox_polls: dict[int, threading.Thread] = {}   # the poll running for each company
         self._last_routines: dict[int, float] = {}
         self._model_waiting = False    # the outage notice was posted; the "back" notice is still owed
 
@@ -150,11 +151,11 @@ class Scheduler(threading.Thread):
             return   # the kill switch stops every dispatch until the owner turns it off
         if self._model_server_down():
             return   # a run would only end in a connection error; housekeeping keeps the watchdog and poller going
+        if bench.RUNNING:
+            return   # Phase 3: a Holdco Bench run has the GPU; founding, dispatch and cycles wait (chat still works)
         self._resume_founding()
         if not s.get("scheduler_enabled", True):
             return
-        if bench.RUNNING:
-            return   # Phase 3: a Holdco Bench run has the GPU; dispatch and cycles wait (chat still works)
         capacity = max(1, int(s.get("max_concurrent_runs", 2)))
         over: dict[int, bool] = {}   # the daily budgets (tokens, GPU hours), looked up once per company per tick
         started: set[int] = set()    # tasks handed out this tick
@@ -361,8 +362,34 @@ class Scheduler(threading.Thread):
         last = self._last_inbox.get(c["id"], 0)
         if time.time() - last < INBOX_MINUTES * 60:
             return
+        running = self._inbox_polls.get(c["id"])
+        if running is not None and running.is_alive():
+            # Phase 3: triage asks the small model about each new email, so a poll can outlast the interval; a
+            # second one would read the same last uid and save the same emails (and reply tasks) twice.
+            return
         self._last_inbox[c["id"]] = time.time()
-        threading.Thread(target=emailer.poll_inbox, args=(c,), daemon=True).start()
+        poll = threading.Thread(target=emailer.poll_inbox, args=(c,), daemon=True)
+        self._inbox_polls[c["id"]] = poll
+        poll.start()
+
+
+def clear_bench_leftovers() -> None:
+    """Phase 3: a Holdco Bench cut short by a crash or a restart left its temporary companies (with their connectors,
+    vault secrets and folders) and an unfinished bench_runs row; nothing else would ever remove them. At startup no
+    bench is running, so every one of them is a leftover."""
+    leftovers = db.q("SELECT * FROM companies WHERE status='bench'")
+    unfinished = db.q("SELECT id FROM bench_runs WHERE COALESCE(finished_at, '')=''")
+    if not leftovers and not unfinished:
+        return
+    try:
+        from .bench import runner   # imported here: the runner loads every agent module
+        for c in leftovers:
+            runner._delete_company(c)
+        runner._sweep_folders()
+    except Exception:
+        traceback.print_exc()
+    db.run("UPDATE bench_runs SET finished_at=?, notes='Interrupted: Holdco stopped before this bench finished.' "
+           "WHERE COALESCE(finished_at, '')=''", (db.now(),))
 
 
 def recover() -> None:
@@ -374,6 +401,7 @@ def recover() -> None:
     db.run("DELETE FROM leases")   # Phase 2: no run survives a restart, so neither do its file leases
     db.run("UPDATE approvals SET status='failed', result='Interrupted by a restart while running. Check whether it "
            "went through before asking the agent to retry.' WHERE status='running'")
+    clear_bench_leftovers()
     for c in db.q("SELECT * FROM companies WHERE status='founding'"):
         bus.emit(c["id"], "info", "Holdco restarted while this company was being founded. Resuming founding.")
         agents.found(c["id"])

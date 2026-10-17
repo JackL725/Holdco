@@ -10,7 +10,7 @@ import threading
 import traceback
 
 from . import (brain, bus, config, connectors, contracts, db, decisions, doctor, llm, planning, playbooks,  # noqa: F401
-               presets, rhythms, roles, tools, truth, vault, verify, watchdog, workspace)
+               presets, rhythms, roles, taint, tools, truth, vault, verify, watchdog, workspace)
 from . import context as ctxsys   # not 'context': run() and founding take a parameter of that name
 from .verify import summary_line as _gate_line   # _task_lines has a parameter named verify
 
@@ -379,7 +379,11 @@ def _summary_for(name: str, args: dict, text: str) -> str:
         if key in _summaries:
             return _summaries[key]
     line = ctxsys.trim_reference(name, args, text)
-    out = f"{line}\nWhat it said: {summarise_tool_result(name, args, text)}"
+    said = f"What it said: {summarise_tool_result(name, args, text)}"
+    sources = taint.fenced_sources(text)
+    if sources:   # a summary of outside content is still outside content: it keeps its fence
+        said = taint.fence(said, ", ".join(sources))
+    out = f"{line}\n{said}"
     with _summaries_lock:
         while len(_summaries) >= 512:
             _summaries.pop(next(iter(_summaries)))
@@ -546,6 +550,7 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
         bus.emit(company["id"], "founding", note, agent_id, {"stage": stage, "run_id": run_id})
 
     ctx = tools.Ctx(company=company, agent=agent, kind=kind, run_id=run_id, task=task, settings=settings)
+    taint.from_task(ctx)   # Phase 3: a task made from an inbound email starts with outside text
     if kind == "founding":
         tool_specs = tools.specs(roles.founding_tools(stage))
         ctx.founding_stage = stage   # write_file's charter hook keeps the critic to docs/critique.md

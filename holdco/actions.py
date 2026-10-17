@@ -162,9 +162,10 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     company = db.get_company(row["company_id"])
     p = db.loads(row["payload"], {})
     if payload:
-        # network: the run_code card's "Allow network" box (Phase 3; a request queued before it existed lacks it)
+        # network: the run_code card's "Allow network" box (Phase 3; a request queued before it existed lacks it);
+        # sandboxed: the card said "runs in a sandbox", so the run must not fall back to this PC (run_code)
         p.update({k: v for k, v in payload.items() if k in p or k in ("to", "subject", "body", "content", "code")
-                  or (k == "network" and row["action"] == "run_code")})
+                  or (k in ("network", "sandboxed") and row["action"] == "run_code")})
     ts = db.now()
     label = ACTION_LABELS.get(row["action"], row["action"])
 
@@ -362,7 +363,8 @@ def execute(company: dict, action: str, p: dict, approval_id: int | None = None)
         return _http(p)
     if action == "run_code":
         return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)),
-                        network=str(p.get("network", "")).strip().lower() in ("true", "1", "yes", "on"))
+                        network=str(p.get("network", "")).strip().lower() in ("true", "1", "yes", "on"),
+                        sandboxed=str(p.get("sandboxed", "")).strip().lower() in ("true", "1", "yes", "on"))
     if action == "spend_money":
         return "Approved. The owner will complete this purchase themselves and record it."
     raise ValueError(f"Unknown action {action}")
@@ -446,7 +448,8 @@ def _deploy_netlify(company: dict) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for f in site_dir.rglob("*"):
-            if f.is_file():
+            # Phase 3: a link (code in the sandbox can make one, pointing anywhere on this PC) is never followed
+            if f.is_file() and not f.is_symlink():
                 z.write(f, f.relative_to(site_dir).as_posix())
     auth = {"Authorization": f"Bearer {token}", "User-Agent": web.UA}
     site_id = cs.get("netlify_site_id")
@@ -473,11 +476,17 @@ def _deploy_netlify(company: dict) -> str:
     return f"Website deployed: {url}"
 
 
-def run_code(company: dict, language: str, code: str, timeout: int = 60, network: bool = False) -> str:
+def run_code(company: dict, language: str, code: str, timeout: int = 60, network: bool = False,
+             sandboxed: bool = False) -> str:
+    """sandboxed: the owner approved it as a run in the container (the Inbox card said so); it then never falls back
+    to this PC when the container runtime has gone away since."""
     from . import sandbox   # Phase 3: inside a container when Docker or Podman is available
     boxed = sandbox.run(company, language, code, timeout, network=network)
     if boxed is not None:
         return boxed
+    if sandboxed:
+        raise RuntimeError("You approved this to run in the code sandbox, but Docker or Podman is not available now, "
+                           "so nothing ran. Start it and retry this request, or ask for the run again.")
     ws = workspace.root(company)
     runs = ws / ".runs"
     runs.mkdir(parents=True, exist_ok=True)

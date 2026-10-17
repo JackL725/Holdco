@@ -19,6 +19,7 @@ audit log records a run the ladder allowed with approved_by "trust:<level>".
 from __future__ import annotations
 
 import datetime as dt
+import email.utils
 import re
 
 from . import bus, config, db
@@ -43,8 +44,9 @@ LABELS = {"send_email": "send emails", "social_post": "publish social posts", "d
           "connector_contact": "message people through connected services"}
 # Outward actions a session that read outside content may not take on its own (section 5).
 TAINTED_ACTIONS = LADDER + ("spend_money",)
-LEGAL_RE = re.compile(r"\b(contract|agreement|guarantee[ds]?|price guarantee|terms of service|warranty|indemnif\w*|"
-                      r"liabilit\w*|sign (the|this))\b", re.I)
+# The spec's pattern, with plurals: "the contracts" and "our warranties" are legal commitments as much as the singular.
+LEGAL_RE = re.compile(r"\b(contracts?|agreements?|guarantee[ds]?|price guarantees?|terms of service|warrant(?:y|ies)|"
+                      r"indemnif\w*|liabilit\w*|sign (the|this))\b", re.I)
 TAINTED = "asked because this session read outside content"
 CAP_REACHED = "daily cap reached"
 
@@ -102,9 +104,28 @@ def used_today(company_id: int, action: str) -> int:
 
 
 def _first_contact(company_id: int, to: str) -> bool:
-    """No contact with this address has a last touch: the email would be the first message to a new person."""
-    return not db.one("SELECT id FROM contacts WHERE company_id=? AND lower(email)=? AND COALESCE(last_touch, '')!='' "
-                      "LIMIT 1", (company_id, to.strip().lower()))
+    """No contact with this address has a last touch, or the company never exchanged an email with them: the email
+    would be the first message to a new person. last_touch alone is not enough, since agents write it themselves
+    (update_contact), and a rule that never lets an email go on its own must not hang on what the agent says."""
+    a = to.strip().lower()
+    known = db.one("SELECT id FROM contacts WHERE company_id=? AND lower(email)=? AND COALESCE(last_touch, '')!='' "
+                   "LIMIT 1", (company_id, a))
+    return not known or not _exchanged(company_id, a)
+
+
+def _exchanged(company_id: int, a: str) -> bool:
+    """The company emailed this address (a sent email, or a send in the audit log) or received an email from it."""
+    if db.one("SELECT id FROM emails WHERE company_id=? AND direction='out' AND lower(to_addr)=? LIMIT 1",
+              (company_id, a)):
+        return True
+    like = f"%{a}%"
+    if any(email.utils.parseaddr(r["from_addr"] or "")[1].strip().lower() == a for r in db.q(
+            "SELECT from_addr FROM emails WHERE company_id=? AND direction='in' AND lower(from_addr) LIKE ?",
+            (company_id, like))):
+        return True
+    return any(str((db.loads(r["payload"], {}) or {}).get("to") or "").strip().lower() == a for r in db.q(
+        "SELECT payload FROM audit WHERE company_id=? AND action='send_email' AND result NOT LIKE 'FAILED%' "
+        "AND lower(payload) LIKE ?", (company_id, like)))
 
 
 def never_promoted(company: dict, action: str, payload: dict) -> str:

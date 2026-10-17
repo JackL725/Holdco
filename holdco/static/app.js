@@ -825,7 +825,7 @@ function requestFields(a) {
       const net = sb.state === 'off' ? '<span class="small faint">Without a sandbox the code can also reach the internet.</span>'
         : `<label class="check small"><input type="checkbox" data-k="network"${isOn(p.network) ? ' checked' : ''}><span>Allow network <span class="faint">(the code may reach the internet; off keeps it offline)</span></span></label>`;
       return `<label class="field">${esc(p.language === 'python' ? 'Python script' : 'Shell command')} (runs in the company folder, ${esc(p.timeout || 60)}s limit)<textarea class="code" data-k="code" rows="${Math.min(16, Math.max(3, (p.code || '').split('\n').length + 1))}">${esc(p.code)}</textarea></label>
-        <div class="sandbox-row">${where}${net}</div>`;
+        <div class="sandbox-row">${where}${net}</div>${sb.state === 'on' ? '<input type="hidden" data-k="sandboxed" value="1">' : ''}`;
     }
     case 'spend_money':
       return `<div class="form-grid">${ro('Item', p.item)}${ro('Cost', `$${p.amount_usd}`)}${p.vendor ? ro('Vendor', p.vendor) : ''}</div>
