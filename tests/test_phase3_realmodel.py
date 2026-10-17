@@ -421,5 +421,24 @@ class TestFromTheFinalGateRun(Base):
         self.assertEqual(tools.execute(ctx2, "finish", {"summary": "Half done", "status": "partial"}), "Session ended.")
 
 
+    def test_a_finish_refused_at_the_last_step_keeps_its_handoff(self):
+        # The model finished, a check pushed it back, and the session had no tool calls left: the run used to end
+        # "out_of_steps" with an empty summary, losing the handoff the next attempt needs.
+        from unittest import mock
+        c = make_company("LastStepCo")
+        db.update_company_settings(c["id"], steps_per_task=2)
+        task = make_task(c, "research", "Note PawChef's price", status="todo", deliverable="research/pawchef.md")
+        replies = iter([
+            llm.Reply(tool_calls=[llm.ToolCall("finish", {"summary": "No price found: the page is a 404.",
+                                                          "status": "done", "deliverable": "research/pawchef.md"})]),
+            llm.Reply(tool_calls=[llm.ToolCall("list_files", {"path": "research"})]),
+        ])
+        with mock.patch.object(llm, "chat", side_effect=lambda *a, **k: next(replies)):
+            agents.run(agent_of(c, "research")["id"], "task", task_id=task["id"])
+        run = db.one("SELECT * FROM runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task["id"],))
+        self.assertEqual(run["status"], "partial")
+        self.assertIn("No price found: the page is a 404.", run["summary"])
+        self.assertIn("ran out of tool calls right after finish was refused", run["summary"])
+
 if __name__ == "__main__":
     unittest.main()

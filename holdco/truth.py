@@ -2056,8 +2056,10 @@ def _action_problem(ctx: Ctx, kind: str, deliverable: str) -> str | None:
                  else " A file does not count.")
     extra = ""
     if kind == "outreach" and emailer.outbound(db.get_company(ctx.company["id"]) or ctx.company) is None:
-        extra = (" Email is not connected; this task cannot run yet. Ask the owner for a mailbox once, or finish "
-                 "with status 'blocked'.")
+        # Phase 3 bench gate: this said "cannot run yet" while the facts say send_email still queues for the
+        # owner; the agent believed this one and finished blocked with the email only in a file.
+        extra = (" Email is not connected yet, but send_email still queues the email for the owner, who adds a "
+                 "mailbox before approving it.")
     return (f"this is {article} {kind} task: it is done only when the {noun} really happens, and no {noun} has been "
             f"queued in this task.{file_note} Call {_KIND_TOOL[kind]} (then finish with status 'waiting'), or finish "
             f"with status 'blocked' and say why.{extra}")

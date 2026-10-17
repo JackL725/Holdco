@@ -683,6 +683,8 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                             result = "Session stopped: repeated action."
                         else:
                             result = tools.execute(ctx, c.name, c.arguments)
+                            if c.name == "finish" and not ctx.finished:
+                                ctx.last_refused_finish = (dict(c.arguments or {}), result)
                             if c.name in _WORKSPACE_CHANGERS and not result.startswith("ERROR"):
                                 _forget_reads(seen_calls)
                             if RETRY_INVITED.search(result) and fp not in retry_ok:
@@ -730,6 +732,18 @@ def run(agent_id: int, kind: str, task_id: int | None = None, text: str = "", co
                     ctx.reply = chat_draft + "\n\n" + _records_line(company, chat_draft)
                 elif kind == "chat" and ctx.reply is None:
                     ctx.reply = "I ran out of steps before finishing. Ask me again or check the task board."
+                elif not ctx.finished and ctx.last_refused_finish and kind == "task":
+                    # Phase 3 bench gate: the model finished, a check pushed it back, and the session ran out of tool
+                    # calls before it could act. Keep its handoff (as partial, with what the check said) instead of
+                    # an empty "out of steps", so the next attempt knows what was done and what is missing.
+                    args, refusal = ctx.last_refused_finish
+                    ctx.finished, ctx.finish_status = True, "partial"
+                    parts = ["Status: partial", f"Summary: {str(args.get('summary') or '').strip()[:2000]}"]
+                    if str(args.get("deliverable") or "").strip():
+                        parts.insert(1, f"Deliverable: {str(args['deliverable']).strip()[:200]}")
+                    parts.append(f"Open issues: ran out of tool calls right after finish was refused: "
+                                 f"{refusal[:400]}")
+                    ctx.finish_summary = "\n".join(parts)
                 elif not ctx.finished:
                     status = "out_of_steps"
     except llm.LLMError as e:

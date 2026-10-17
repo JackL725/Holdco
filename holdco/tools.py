@@ -46,6 +46,9 @@ class Ctx:
     founding_stage: str = ""                     # research, charter, critic or plan in a founding run
     stage_warned: bool = False                   # finish() said once what the founding stage has not left
     refused_finish: dict | None = None           # the finish call that stage check refused (agents.run)
+    # Phase 3: the last finish call any check pushed back, and what it was told (agents.run keeps its handoff when
+    # the session then runs out of tool calls)
+    last_refused_finish: tuple | None = None
     # Phase 1: connector tools find_tool loaded into this session (specs the model sees from its next step on)
     loaded_tools: list = field(default_factory=list)
     loaded_by_name: dict = field(default_factory=dict)
