@@ -53,7 +53,9 @@ from . import actions, bus, config, db, roles, tools
 from .routing import HTTPError, route, to_int
 
 # The definition modules. A missing module, one that fails to import, or a None DEFINITION is skipped.
-MODULES = ("conn_stripe", "conn_resend", "conn_playwright", "conn_buffer", "conn_brave")
+MODULES = ("conn_stripe", "conn_resend", "conn_playwright", "conn_buffer", "conn_brave",
+           # Phase 4: domains, the Cloudflare deploy target, GitHub, analytics, forms, n8n and the later tier
+           "conn_porkbun", "conn_cloudflare", "conn_github", "conn_plausible", "conn_forms", "conn_n8n", "conn_later")
 KINDS = ("api", "mcp-stdio", "mcp-http", "builtin")
 MCP_KINDS = ("mcp-stdio", "mcp-http")
 SCOPES = ("global", "company")

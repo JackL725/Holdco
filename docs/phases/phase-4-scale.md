@@ -9,10 +9,22 @@ GitHub, Plausible and Umami, forms, and n8n; the later tier (ComfyUI, ads, accou
 "not yet available" cards. This is the implementation spec; the choices behind the connectors are in
 [connectors.md](../connectors.md) and the owner's side in [owner-experience.md](../owner-experience.md).
 
-Status: Planned. Branch `claude/phase-4-scale`, PR based on Phase 3. Depends on Phase 1 (`mcp.py`,
-`connectors.py`, `vault.py`, `oauth.py`, risk tags), Phase 2 (`brain.py`, `briefs`, decisions, `rhythms.py`) and
-Phase 3 (`trust.py`, taint, scheduler priorities). See [architecture.md](../architecture.md) for where the new
-modules sit and [testing.md](../testing.md) for the fakes.
+Status: in progress. Branch `claude/phase-4-scale`, based on Phase 3 (pull request JackL725/Holdco#6). Depends on
+Phase 1 (`mcp.py`, `connectors.py`, `vault.py`, `oauth.py`, risk tags), Phase 2 (`brain.py`, `briefs`, decisions,
+`rhythms.py`) and Phase 3 (`trust.py`, taint, scheduler priorities). See [architecture.md](../architecture.md) for
+where the new modules sit and [testing.md](../testing.md) for the fakes.
+
+Decided at the start of the build, from what Phases 1 to 3 built:
+- Connector modules register through `connectors.MODULES`; the later tier lives in `conn_later.py`. Fakes follow
+  Phase 3's rule: new fake services go in `holdco/bench/mocks.py` and `tests/fake_*.py` re-export them.
+- `deploy_site` asks `conn_cloudflare.deploy_if_selected(company)` first and falls back to Netlify.
+- The scheduler's Phase 3 class order is kept: `portfolio.order(queue)` reorders classes 3 to 6 by deficit.
+- The monthly review's decisions use Phase 2's `decisions.create` with `origin={"kind": "portfolio"}`, answered
+  through `portfolio.apply_answer`; the MCP `decide` tool goes through `actions.decide` with `decided_by="mcp"`.
+- MCP tools that read inbox rows show Phase 3's `_why_asked` and `_taint`; writes respect taint, trust and the
+  kill switch because they call the same functions as the dashboard.
+- Tests are split by area: `tests/test_phase4_mcp.py`, `test_phase4_portfolio.py`, `test_phase4_connectors.py`;
+  end-to-end tests continue from `test_38`.
 
 ## Scope
 

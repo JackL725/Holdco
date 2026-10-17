@@ -19,7 +19,7 @@ import time
 import traceback
 
 from . import (agents, backup, bench, bus, config, contracts, db, decisions, doctor, emailer, notify, planning,
-               rhythms, roles, watchdog)
+               portfolio, rhythms, roles, watchdog)
 
 TICK_SECONDS = float(os.environ.get("HOLDCO_TICK_SECONDS", 8))
 ROUTINE_CHECK_SECONDS = float(os.environ.get("HOLDCO_ROUTINE_CHECK_SECONDS", 60))
@@ -179,7 +179,7 @@ class Scheduler(threading.Thread):
         # 4) Hand out the rest by class, then priority, across all companies (the routines just created included).
         #    Low-value research waits for its company's quiet hours unless nothing else could start.
         known = {t["id"] for t in queue}
-        queue = _queue()
+        queue = portfolio.order(_queue())   # Phase 4: each company's share of the GPU by its allocation score
         new = [t for t in queue if t["id"] not in known]
         if new:   # tasks created since the first look (routines, a cycle's plan): their dependencies too
             deps.update(contracts.dependency_status(new))
@@ -239,7 +239,8 @@ class Scheduler(threading.Thread):
         from . import connectors   # Phase 1: connector health checks and metric pipes (both cheap when not due)
         for step in (watchdog.tick, doctor.refresh_if_stale, backup.maybe_run, notify.ensure_poller,
                      connectors.check_if_stale, connectors.poll_if_due,
-                     decisions.resolve_due, rhythms.portfolio_brief_in_background):   # Phase 2, 3
+                     decisions.resolve_due, rhythms.portfolio_brief_in_background,   # Phase 2, 3
+                     portfolio.monthly_review_if_due):   # Phase 4
             try:
                 step()
             except NotImplementedError:

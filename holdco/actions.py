@@ -358,7 +358,9 @@ def execute(company: dict, action: str, p: dict, approval_id: int | None = None)
     if action == "social_post":
         return _social(company, p)
     if action == "deploy_site":
-        return _deploy_netlify(company)
+        from . import conn_cloudflare   # Phase 4: Cloudflare Workers when the company's site_provider picks it
+        out = conn_cloudflare.deploy_if_selected(company)
+        return out if out is not None else _deploy_netlify(company)
     if action == "http_post":
         return _http(p)
     if action == "run_code":

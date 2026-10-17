@@ -161,6 +161,9 @@ def on_decided(row: dict, answer: str, decided_by: str) -> None:
     elif kind == "trust":   # Phase 3: a promotion on the trust ladder
         from . import trust
         trust.apply_promotion(cid, origin, answer)
+    elif kind == "portfolio":   # Phase 4: the monthly portfolio review (scale, hold or shut down)
+        from . import portfolio
+        portfolio.apply_answer(cid, origin, answer)
     elif kind == "monthly" and str(answer or "").strip().lower().startswith("kill"):
         company = db.get_company(cid)
         if company and company["status"] not in ("paused", "archived"):
