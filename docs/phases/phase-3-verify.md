@@ -8,7 +8,9 @@ approvals; a small model and an embedding model take the jobs that do not need t
 gets priorities; and Settings shows real context use. This is the implementation spec. The reasons are in
 [reliability.md](../reliability.md) and [safety.md](../safety.md).
 
-Status: in progress. Branch `claude/phase-3-verify`, based on Phase 2 (pull request JackL725/Holdco#5). Depends on
+Status: built. Branch `claude/phase-3-verify`, based on Phase 2 (pull request JackL725/Holdco#5). Gate on the owner's
+GPU: Holdco Bench runs in CI against the scripted model (33 of 33, and the lazy model fails exactly the scenarios it
+should), and gpt-oss:20b scores 22 to 29 of 33 on the final code across runs (see Real-model gate below). Depends on
 Phase 0 (watchdog, notify), Phase 1 (`connectors.py`, `browser_check`, `conn_stripe.py`, `find_tool`, the vault,
 `metrics.source`) and Phase 2 (`brain.py`, `tasks.checks`, `tasks.goal_id`, decisions). See
 [testing.md](../testing.md) for how the Bench fits the test suite and [connectors.md](../connectors.md) for the
@@ -562,12 +564,14 @@ Scores (`python -m holdco.bench --model gpt-oss:20b`, the same data folder for e
 |---|---|---|---|---|
 | First run (Phase 3 as merged) | 17 of 33 (52%) | 92% | 198 | 10.3 |
 | After the fixes, three full runs | 26, 25, 29 of 33 | 96%, 97%, 98% | 198 to 199 | 9.9 to 10.5 |
+| Merged with the review's 19 fixes | 26 of 33 (79%) | 96% | 203 | 10.5 |
+| Final code (after the last fixes below) | 22 of 33 (67%) | 96% | 203 | 10.5 |
 | Huihui-Qwen3.8-27B Q6_K_L, final code, not tuned | 24 of 33 (73%) | 100% | 48 | 7.7 |
 
 The Qwen row is one run on the same final code, for comparison only: at 48 tokens per second four scenarios hit
 their time limit (a 300 s task, a 900 s founding), which the limits allow for hung runs, not for a slower model.
 
-The final run (29 of 33) is on the final code; the two before it lacked the last fixes. What stays failing is the
+Runs on unchanged code differ by up to seven scenarios (22 to 29), so a single run is not a score to tune against. After the 22-of-33 run, four general fixes went in from its traces: typographic punctuation in the opt-out check, a partial finish naming a file that was never saved, a refused finish at the last step keeping its handoff, and one message about email without a mailbox; the scenarios they touched passed in targeted reruns, and no further full run was made. What stays failing is the
 model: it plans the order but never sets `depends_on`, finishes complete work as `partial`, researches when it
 should save, and sometimes summarises work it did not do. Scenarios that passed in the first run and failed once
 afterwards (`compliant_cold_email` at 91 words, `deliverable_pushback` re-running an audit) passed again in the
