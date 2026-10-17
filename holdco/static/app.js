@@ -214,7 +214,8 @@ function renderSide() {
     </nav>
     ${archived.length ? `<div class="side-label">Archived</div><nav class="nav">${archived.map(coLink).join('')}</nav>` : ''}
     <div class="side-foot">
-      <nav class="nav"><a href="#/settings" class="${at(p[0] === 'settings')}">Settings</a></nav>
+      <nav class="nav"><a href="#/settings" class="${at(p[0] === 'settings')}">Settings</a>
+        <a href="#/bench" class="${at(p[0] === 'bench')}" title="Holdco Bench: how well each model does the agents' work">Model scores</a></nav>
       <button class="engine ${st.scheduler_enabled && !S.offline ? 'on' : ''}" data-act="toggle-autopilot" style="border:0;text-align:left;cursor:pointer;font:inherit" title="Start or stop all agents">
         <span class="pulse"></span>
         <span>${S.offline ? 'Reconnecting to Holdco…' : st.scheduler_enabled ? `Autopilot on<br><span class="faint">${working ? plural(working, 'agent') + ' working' : 'Agents idle'}</span>` : 'Autopilot off<br><span class="faint">Agents only work when you run them</span>'}</span>
@@ -383,6 +384,7 @@ async function render() {
   else if (p[0] === 'library') view = Library();
   else if (p[0] === 'context') view = YourContext(p[1]);
   else if (p[0] === 'doctor') view = Doctor();
+  else if (p[0] === 'bench') view = Bench(p[1]);
   else if (p[0] === 'c' && p[1]) view = CompanyView(+p[1], p[2] || 'overview', p[3]);
   else { location.hash = '#/'; return; }
   S.view = view;
@@ -671,6 +673,119 @@ function showBrief(b, title) {
   modal({ title: title || BRIEF_LABEL[b.kind] || 'Brief', wide: true, body: `<p class="faint small" style="margin-top:0">Written ${when(b.created_at)}</p>${briefBody(b)}` });
 }
 
+// ---------------------------------------------------------------- phase 3: bench, trust, verification, sandbox
+// docs/phases/phase-3-verify.md. Scores are fractions (0.82); the owner reads percentages.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isNum = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
+const fmtShare = (v) => (isNum(v) ? `${Math.round(Number(v) * 100)}%` : 'n/a');
+const fmtCount = (v) => (Number(v) || 0).toLocaleString();
+
+// "Pass 27 of 33 (82%), tool calls valid 96%, 41 tokens/s, 6.2 steps per scenario"; a score the run could not
+// measure (no agent scenario among those run, no timing) is left out.
+function benchScores(r) {
+  const parts = [`Pass ${fmtCount(r.passed)} of ${fmtCount(r.scenarios)} (${fmtShare(r.pass_rate)})`];
+  if (isNum(r.tool_validity)) parts.push(`tool calls valid ${fmtShare(r.tool_validity)}`);
+  if (isNum(r.tokens_per_second)) parts.push(`${Math.round(Number(r.tokens_per_second)).toLocaleString()} tokens/s`);
+  if (isNum(r.steps_avg)) parts.push(`${Number(r.steps_avg).toFixed(1)} steps per scenario`);
+  return parts.join(', ');
+}
+// bench_runs rows start with notes "running" and no finished_at; one that never finished (Holdco stopped mid-bench)
+// keeps them, so "running" is only believed while /api/bench/status says this run is the one going.
+const benchRunning = (r, st) => !!st && !!st.running && st.run_id === r.id;
+const benchUnfinished = (r, st) => !r.finished_at && !benchRunning(r, st);
+const benchProgress = (st) => (st.scenario ? `Running scenario ${Math.min((Number(st.done) || 0) + 1, Number(st.total) || 1)} of ${fmtCount(st.total)}: ${st.scenario}`
+  : st.total && st.done >= st.total ? 'Scoring the results…' : 'Starting…');
+const benchNotes = (r) => String(r.notes || '').trim().replace(/^running$/, '');
+
+// POST /api/bench/run. Only one bench runs at a time: on a 409 the page follows the one already going.
+async function benchStart(model, only) {
+  const body = { model };
+  if (Array.isArray(only) && only.length) body.only = only;
+  try {
+    return (await api('POST', '/api/bench/run', body)).run_id;
+  } catch (e) {
+    if (e.status !== 409) throw e;
+    const st = await GET('/api/bench/status');
+    if (!st.running || !st.run_id) throw e;
+    toast(`A test of ${st.model || 'another model'} is already running; showing its progress.`);
+    return st.run_id;
+  }
+}
+// Polls /api/bench/status while run runId goes, calling onTick(status), then returns its bench_runs row; null when
+// alive() turns false (the owner left the page).
+async function benchFollow(runId, alive, onTick) {
+  for (;;) {
+    let st = null;
+    try { st = await GET('/api/bench/status'); } catch (_) { /* Holdco restarting: keep waiting */ }
+    if (!alive()) return null;
+    if (st && (!st.running || st.run_id !== runId)) {
+      const row = await GET(`/api/bench/results/${runId}`);
+      if (st.error && st.run_id === runId) row.error = st.error;
+      return row;
+    }
+    if (st) onTick(st);
+    await sleep(1500);
+  }
+}
+
+// The trust ladder (trust.py): the action a request counts toward. A connector call counts by its risk tag.
+const LEVEL_LABEL = (cap) => [[0, 'Ask me'], [1, `On its own, up to ${cap} a day`], [2, 'On its own']];
+function ladderAction(a) {
+  if (a.action !== 'connector_call') return a.action;
+  const tag = String((a.payload || {}).tag || a.tag || '');
+  return ['write', 'publish', 'contact'].includes(tag) ? `connector_${tag}` : '';
+}
+const streakText = (n) => `${plural(n, 'approval')} in a row without edits`;
+
+// Why the owner is asked (actions.gate stores it in the payload): outside content read in the session (_taint lists
+// the sources), a legal commitment, a first email to a person, or a daily cap that ran out.
+const TAINT_PREFIX = 'asked because this session read outside content';
+function whyAsked(p) {
+  const why = String(p._why_asked || '').trim();
+  const taint = Array.isArray(p._taint) ? p._taint.map((x) => String(x).trim()).filter(Boolean) : [];
+  if (!why && !taint.length) return '';
+  const tainted = taint.length && (!why || why.toLowerCase().startsWith(TAINT_PREFIX));
+  const text = tainted ? `Asked because this session read outside content: ${taint.join(', ')}.` : sentence(capFirst(why));
+  const title = tainted ? 'An agent read a web page or an email in this session, and text there could be steering it. Outward actions wait for you, whatever the trust level.' : '';
+  return `<p class="why small"${title ? ` title="${esc(title)}"` : ''}><span class="badge warn">Why you are asked</span> ${esc(text)}</p>`;
+}
+
+// Where run_code runs, from the Doctor's sandbox row ("Code sandbox: docker. ..." when one was found).
+function sandboxOf(checks) {
+  const r = (Array.isArray(checks) ? checks : []).find((c) => c && c.key === 'sandbox');
+  if (!r) return { state: 'unknown', runtime: '' };
+  if (r.status !== 'ok') return { state: 'off', runtime: '' };
+  const m = /Code sandbox:\s*([\w.-]+?)\.?(\s|$)/i.exec(String(r.detail || ''));
+  return { state: 'on', runtime: m ? capFirst(m[1]) : '' };
+}
+
+// The verification gate's results (tasks.verification: a JSON list of {kind, passed, detail, mode}).
+function gateResults(t) {
+  let v = t ? t.verification : null;
+  if (typeof v === 'string') { try { v = v.trim() ? JSON.parse(v) : []; } catch (_) { v = []; } }
+  return Array.isArray(v) ? v.filter((r) => r && typeof r === 'object') : [];
+}
+const gateKind = (k) => (/_/.test(String(k || '')) ? `<code>${esc(k)}</code>` : esc(capFirst(k || 'check')));
+function gateBadge(t) {
+  const rs = gateResults(t);
+  if (!rs.length) return '';
+  const bad = rs.find((r) => !r.passed);
+  if (!bad) return `<span class="badge good gate" title="${esc(`Verified: ${rs.map((r) => r.kind).join(', ')} passed`)}">Checks passed</span>`;
+  return `<span class="badge bad gate" title="${esc(`${capFirst(bad.kind || 'check')} failed: ${bad.detail || ''}`)}">Check failed</span>`;
+}
+function gateList(t) {
+  const rs = gateResults(t);
+  if (!rs.length) return '';
+  return `<h3 style="margin:16px 0 4px">Verification</h3><p class="small faint" style="margin:0">What Holdco checked before the task could be marked done.</p>
+    <ul class="rows gate-rows">${rs.map((r) => {
+    const unchecked = r.mode === 'not checked';
+    const badge = unchecked ? '<span class="badge">NOT CHECKED</span>' : r.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>';
+    const mode = r.mode === 'static' ? ' <span class="faint small" title="Playwright is not set up, so Holdco read the page instead of opening it in a browser">(static check)</span>'
+      : r.mode && !unchecked ? ` <span class="faint small">(${esc(r.mode)})</span>` : '';
+    return `<li>${badge}<div class="grow"><b>${gateKind(r.kind)}</b>${mode}${r.detail ? `<div class="small muted">${esc(r.detail)}</div>` : ''}</div></li>`;
+  }).join('')}</ul>`;
+}
+
 // ---------------------------------------------------------------- inbox
 const ACTION_VERB = {
   send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
@@ -701,8 +816,17 @@ function requestFields(a) {
       return `<p class="muted">Publishes everything in the company's <code>site/</code> folder to Netlify. <a href="/preview/${esc(a.company_slug || '')}/" target="_blank" rel="noopener" data-preview="${a.company_id}">Preview the site first</a>.</p>`;
     case 'http_post':
       return `${ro('Request', `${p.method || 'POST'} ${p.url}`)}<label class="field">Body<pre class="box">${esc(JSON.stringify(p.body, null, 2))}</pre></label>`;
-    case 'run_code':
-      return `<label class="field">${esc(p.language === 'python' ? 'Python script' : 'Shell command')} (runs in the company folder, ${esc(p.timeout || 60)}s limit)<textarea class="code" data-k="code" rows="${Math.min(16, Math.max(3, (p.code || '').split('\n').length + 1))}">${esc(p.code)}</textarea></label>`;
+    case 'run_code': {
+      // Phase 3: in a Docker or Podman container when the Doctor found one; "Allow network" sets payload.network.
+      const sb = S.sandbox || { state: 'unknown' };
+      const where = sb.state === 'on' ? `<span class="badge good" title="Only the company folder, no internet unless you allow it, 1 GB of memory and 1 CPU">runs in a sandbox (${esc(sb.runtime || 'a container')})</span>`
+        : sb.state === 'off' ? '<span class="badge warn" title="Install Docker Desktop or Podman to isolate agents\' code">runs unsandboxed on this PC</span> <a class="small" href="#/doctor">How to fix</a>'
+          : '<span class="badge" title="The Doctor has not checked for Docker or Podman yet">sandbox not checked yet</span> <a class="small" href="#/doctor">Open Doctor</a>';
+      const net = sb.state === 'off' ? '<span class="small faint">Without a sandbox the code can also reach the internet.</span>'
+        : `<label class="check small"><input type="checkbox" data-k="network"${isOn(p.network) ? ' checked' : ''}><span>Allow network <span class="faint">(the code may reach the internet; off keeps it offline)</span></span></label>`;
+      return `<label class="field">${esc(p.language === 'python' ? 'Python script' : 'Shell command')} (runs in the company folder, ${esc(p.timeout || 60)}s limit)<textarea class="code" data-k="code" rows="${Math.min(16, Math.max(3, (p.code || '').split('\n').length + 1))}">${esc(p.code)}</textarea></label>
+        <div class="sandbox-row">${where}${net}</div>`;
+    }
     case 'spend_money':
       return `<div class="form-grid">${ro('Item', p.item)}${ro('Cost', `$${p.amount_usd}`)}${p.vendor ? ro('Vendor', p.vendor) : ''}</div>
         ${p.url ? `<p><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.url)}</a></p>` : ''}${ro('Why', p.reason)}
@@ -740,10 +864,12 @@ function requestCard(a) {
   const q = a.action === 'question';
   const approveLabel = { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run', connector_call: 'Approve and run' }[a.action] || 'Approve';
   const verb = a.action === 'connector_call' ? `wants to use ${esc(connectorLabel((a.payload || {}).connector))}` : ACTION_VERB[a.action] || esc(a.action);
+  // Phase 3: the trust ladder's streak for this action (filled in by the Inbox from GET /trust), and why it asks.
+  const ladder = q ? '' : ladderAction(a);
   return `<article class="req" data-req="${a.id}">
     <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${verb}</span>
-      <div class="faint small req-meta"><span>Request #${esc(a.id)}</span>${tagBadge(a.tag)}<span>${when(a.created_at)}</span></div></div></div>
-    <div class="fields">${requestFields(a)}</div>
+      <div class="faint small req-meta"><span>Request #${esc(a.id)}</span>${tagBadge(a.tag)}<span>${when(a.created_at)}</span>${ladder ? `<span class="streak" data-streak="${esc(a.company_id)}:${esc(ladder)}"></span>` : ''}</div></div></div>
+    <div class="fields">${q ? '' : whyAsked(a.payload || {})}${requestFields(a)}</div>
     <div class="foot">${q ? `<button class="btn primary" data-act="decide" data-d="answer">Send answer</button>`
       : `<input type="text" data-k="feedback" placeholder="Note for the agent (optional)">
          <button class="btn" data-act="decide" data-d="reject">Reject</button>
@@ -777,7 +903,7 @@ function decisionCard(a) {
 async function decideRequest(card, decision, preset = '') {
   const id = +card.dataset.req;
   const payload = {};
-  $$('[data-k]', card).forEach((f) => { payload[f.dataset.k] = f.value; });
+  $$('[data-k]', card).forEach((f) => { payload[f.dataset.k] = f.type === 'checkbox' ? f.checked : f.value; });
   const { feedback = '', answer: typed = '' } = payload;
   delete payload.feedback; delete payload.answer;
   const answer = preset || typed;   // an option button answers with its exact text
@@ -812,10 +938,15 @@ function auditSummary(a) {
 
 function Inbox() {
   let el;
+  const trust = {};   // company id -> action -> its trust row (Phase 3), for the streak on each card
   const slugOf = (cid) => (S.st?.companies.find((c) => c.id === cid) || {}).slug || '';
   const loadAudit = async () => {
     const r = await GET('/api/audit?limit=50');
-    const who = (by) => (by === 'owner' ? 'you' : by === 'policy:auto' ? 'the auto policy' : by || '?');
+    const who = (by) => {
+      const lvl = /^trust:(\d)/.exec(by || '');
+      if (lvl) return lvl[1] === '1' ? 'the trust ladder (on its own, up to a daily cap)' : 'the trust ladder (on its own)';
+      return by === 'owner' ? 'you' : by === 'policy:auto' ? 'the auto policy' : by || '?';
+    };
     $('#audit', el).innerHTML = r.audit.length ? r.audit.map((a) => `
       <li><span class="badge ${/^FAILED/.test(a.result || '') ? 'bad' : 'good'}">${esc(ACTION_LABEL[a.action] || a.action)}</span><div class="grow">
         <div>${esc(auditSummary(a))}</div>
@@ -834,12 +965,38 @@ function Inbox() {
       list.insertAdjacentHTML('afterbegin', card(a));
     });
   };
+  // Phase 3: the streak of every card on the trust ladder ("12 approvals in a row without edits"); none at 0.
+  const loadTrust = async (requests) => {
+    const ids = [...new Set(requests.filter((a) => a.action !== 'question' && ladderAction(a)).map((a) => a.company_id))];
+    const got = await Promise.all(ids.map((cid) => GET(`/api/companies/${cid}/trust`).catch(() => null)));
+    ids.forEach((cid, i) => {
+      if (got[i] && Array.isArray(got[i].actions)) trust[cid] = { rows: Object.fromEntries(got[i].actions.map((t) => [t.action, t])), promoteAt: got[i].promote_at };
+    });
+  };
+  const paintStreaks = () => {
+    $$('[data-streak]', el).forEach((s) => {
+      const [cid, action] = s.dataset.streak.split(':');
+      const co = trust[cid];
+      const row = co ? co.rows[action] : null;
+      const n = row && row.on_ladder ? Number(row.streak) || 0 : 0;
+      s.textContent = n ? streakText(n) : '';
+      s.title = n ? `Approving without changes adds one; an edit starts again at zero.${co.promoteAt ? ` At ${co.promoteAt} Holdco asks whether agents may do this on their own.` : ''}` : '';
+    });
+  };
+  // run_code cards say whether the code runs in a sandbox (the Doctor's row; GET /api/doctor is the cached result).
+  const loadSandbox = async (requests) => {
+    if (!requests.some((a) => a.action === 'run_code')) return;
+    const d = await GET('/api/doctor').catch(() => null);
+    if (d) S.sandbox = sandboxOf(d.checks);
+  };
   const loadPending = async () => {
     const r = await GET('/api/approvals');
     const decisions = r.approvals.filter((a) => a.action === 'decision');
     const requests = r.approvals.filter((a) => a.action !== 'decision');
+    await Promise.all([loadTrust(requests), loadSandbox(requests)]);
     fill($('#dec-list', el), decisions, decisionCard);
     fill($('#req-list', el), requests, requestCard);
+    paintStreaks();
     $('#dec-panel', el).classList.toggle('hidden', !decisions.length);
     const empty = $('#req-empty', el);
     empty.classList.toggle('hidden', requests.length > 0);
@@ -870,7 +1027,10 @@ function Inbox() {
       await loadConnectors().catch(() => null);   // connector_call cards name the service and what agents can do with it
       await Promise.all([loadPending(), loadDecided(), loadAudit()]);
     },
-    live(ev) { if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); loadAudit().catch(() => {}); } },
+    live(ev) {
+      if (ev.type === 'approvals') { loadPending().catch(() => {}); loadDecided().catch(() => {}); loadAudit().catch(() => {}); }
+      if (ev.type === 'trust') loadPending().catch(() => {});   // a level or streak changed elsewhere
+    },
     reloadDecided: () => { loadDecided().catch(() => {}); loadAudit().catch(() => {}); },
     async act(name, t) {
       if (name === 'retry') {
@@ -1303,8 +1463,24 @@ function ConnectorCards(opts) {
 }
 
 // ---------------------------------------------------------------- settings
+// Phase 3, section 9: how full the model's context got over the latest finished sessions (GET /api/settings).
+function contextUseHtml(cu) {
+  if (!cu) return '';
+  if (!cu.n) return '<p class="small faint" style="margin:0">Context use: no finished session has reported its prompt size yet.</p>';
+  const ctx = Number(cu.num_ctx) || 0;
+  const share = ctx ? Math.min(100, Math.round((100 * (Number(cu.p95) || 0)) / ctx)) : 0;
+  return `<div class="meter${cu.warn ? ' over' : ''}"><div class="meter-head"><span><b>Context use:</b> p50 ${fmtCount(cu.p50)}, p95 ${fmtCount(cu.p95)} of ${fmtCount(ctx)} tokens (last ${plural(cu.n, 'run')})</span>
+      ${cu.warn ? '<span class="badge warn">warn</span>' : ''}</div>
+    <div class="bar" role="meter" aria-valuemin="0" aria-valuemax="${esc(ctx)}" aria-valuenow="${esc(cu.p95)}" aria-label="Largest prompts against the context window"><span style="width:${share}%"></span></div>
+    <p class="small ${cu.warn ? 'warn-text' : 'faint'}" style="margin:0">${cu.warn ? 'Agents are near the window; raise num_ctx (Context window above) or shorten prompts.'
+      : 'The largest prompt each session sent: half of them stayed under p50, 95 in 100 under p95.'}</p></div>`;
+}
+
 function Settings(arg) {
   let el, data;
+  const view = {};
+  // Phase 3 bench: the run this page started or found running, its latest status, and the newest finished runs.
+  let bench = { runId: 0, status: null, row: null, error: '' }, benchRuns = [];
   // A connector field kept as a global setting (Brave's key) is also in this page's form: keep that input in step.
   const conns = ConnectorCards({
     scope: 'global', focus: connectorFocus(arg), settings: () => (data ? data.settings : {}),
@@ -1339,8 +1515,10 @@ function Settings(arg) {
         <div class="form-grid" style="margin-top:14px">
           <label class="field">Agent model<span class="hint">Used by every agent unless you set one per agent.</span>${models.length ? modelSel('default_model', s.default_model, models) : `<input type="text" name="default_model" value="${esc(s.default_model)}">`}</label>
           <label class="field">CEO model<span class="hint">Optional stronger model for planning.</span>${models.length ? modelSel('ceo_model', s.ceo_model, models, 'Same as agent model') : `<input type="text" name="ceo_model" value="${esc(s.ceo_model)}">`}</label>
+          <label class="field">Small model<span class="hint">Optional; (none) uses the agent model. Sorts incoming email, shortens old tool results and spots duplicate notes.</span>${models.length ? modelSel('small_model', s.small_model, models, '(none)') : `<input type="text" name="small_model" value="${esc(s.small_model)}" placeholder="(none)" autocomplete="off">`}</label>
           <label class="field">Context window (tokens)<span class="hint">Ollama only. 32768 suits a 5090.</span><input type="number" name="num_ctx" min="4096" step="1024" value="${esc(s.num_ctx)}"></label>
         </div>
+        <div id="ctx-use" class="ctx-use"></div>
         <div class="form-grid" style="margin-top:14px">
           <label class="field">Agents working at once<span class="hint">Match OLLAMA_NUM_PARALLEL.</span><input type="number" name="max_concurrent_runs" min="1" max="8" value="${esc(s.max_concurrent_runs)}"></label>
           <label class="field">Tool calls per session<input type="number" name="max_steps_per_run" min="4" max="60" value="${esc(s.max_steps_per_run)}"></label>
@@ -1349,6 +1527,9 @@ function Settings(arg) {
           <label class="field">Tool calling${sel('tool_mode', s.tool_mode, [['auto', 'Automatic'], ['native', 'Native only'], ['json', 'Prompt-based (for models without tools)']])}</label>
         </div>
         <div class="actions" style="margin-top:14px"><button class="btn" type="button" data-act="test-llm">Test connection</button><span id="llm-result" class="small"></span></div>
+        <div class="bench-test"><div class="actions"><button class="btn" type="button" data-act="bench-run">Test this model</button>
+          <span class="small faint">Scores the agent model picked above on Holdco Bench: scripted jobs with pretend customers and services. It takes a while and changes no settings.</span></div>
+          <div id="bench-box" class="bench-box small" aria-live="polite"></div></div>
       </div>
       <div class="section"><h2>Autopilot</h2>
         <label class="check"><input type="checkbox" name="scheduler_enabled" ${s.scheduler_enabled ? 'checked' : ''}><span>Keep agents working around the clock<br><span class="faint small">When off, agents only work when you press Run or chat with them.</span></span></label>
@@ -1399,13 +1580,66 @@ function Settings(arg) {
       </div>
       <div class="section actions" style="justify-content:space-between"><span class="faint small">Data folder: <code>${esc(data.data_dir)}</code></span><button class="btn primary" type="submit">Save settings</button></div>
     </form>`;
+    paintContext();
+    paintBench();
   };
-  return {
+  const paintContext = () => { const box = el && $('#ctx-use', el); if (box) box.innerHTML = contextUseHtml(data.context_use); };
+  // The agent model as picked in the form (saved or not): what "Test this model" scores.
+  const pickedModel = () => {
+    const f = el && $('form[data-form="settings"]', el);
+    return String((f && f.default_model && f.default_model.value) || (data && data.settings.default_model) || '').trim();
+  };
+  // Running: the scenario now. Finished: the four scores. Otherwise the last finished test of the picked model.
+  const paintBench = () => {
+    const box = el && $('#bench-box', el);
+    const btn = el && $('[data-act="bench-run"]', el);
+    if (!box) return;
+    const st = bench.status;
+    if (btn) btn.disabled = !!(st && st.running);
+    if (st && st.running) {
+      box.innerHTML = `<span class="spinner"></span> ${esc(benchProgress(st))} <span class="faint">(testing ${esc(st.model || 'the model')})</span> <a href="#/bench">Watch on Model scores</a>`;
+      return;
+    }
+    if (bench.error) { box.innerHTML = `<span class="badge bad">Not finished</span> ${esc(bench.error)}`; return; }
+    if (bench.row) {
+      const r = bench.row;
+      box.innerHTML = r.finished_at
+        ? `<span class="badge accent">${esc(r.model)}</span> ${esc(benchScores(r))}. <a href="#/bench/${esc(r.id)}">See every scenario</a>${r.error ? ` <div class="warn-text">${esc(r.error)}</div>` : ''}`
+        : `<span class="badge warn">Did not finish</span> The test of ${esc(r.model)} stopped early. <a href="#/bench/${esc(r.id)}">Details</a>`;
+      return;
+    }
+    const model = pickedModel();
+    const last = benchRuns.find((r) => r.model === model && r.finished_at);
+    box.innerHTML = last ? `<span class="faint">Last test of ${esc(model)}, ${esc(shortDate(last.started_at))}:</span> ${esc(benchScores(last))}. <a href="#/bench/${esc(last.id)}">Details</a> · <a href="#/bench">All model scores</a>`
+      : `<span class="faint">${model ? `${esc(model)} has not been tested yet.` : 'Pick a model to test.'}</span> <a href="#/bench">All model scores</a>`;
+  };
+  const follow = async (runId) => {
+    bench = { runId, status: { running: true, scenario: '', done: 0, total: 0, model: pickedModel() }, row: null, error: '' };
+    paintBench();
+    try {
+      const row = await benchFollow(runId, () => S.view === view, (st) => { bench.status = st; paintBench(); });
+      if (!row) return;
+      bench = { runId, status: null, row, error: '' };
+      benchRuns = [row, ...benchRuns.filter((r) => r.id !== row.id)];
+      toast(row.finished_at ? `Test of ${row.model} finished: ${benchScores(row)}.` : `The test of ${row.model} stopped early.`, !row.finished_at);
+    } catch (e) { bench = { runId, status: null, row: null, error: e.message }; }
+    paintBench();
+  };
+  Object.assign(view, {
     async mount(holder) {
       el = holder;
       el.innerHTML = '<div id="set-main"></div><div id="set-conns" class="conn-holder"></div>';
-      data = await GET('/api/settings');
+      const [d, st, runs] = await Promise.all([GET('/api/settings'), GET('/api/bench/status').catch(() => null), GET('/api/bench/results?limit=50').catch(() => null)]);
+      data = d;
+      benchRuns = (runs && runs.runs) || [];
       draw(await loadModels(true));
+      // A model picked in the select shows its own last score (unless a test is running).
+      el.addEventListener('change', (e) => {
+        if (e.target.name !== 'default_model' || !e.target.closest('form[data-form="settings"]') || (bench.status && bench.status.running)) return;
+        bench = { runId: 0, status: null, row: null, error: '' };
+        paintBench();
+      });
+      if (st && st.running && st.run_id) follow(st.run_id);
       await conns.mount($('#set-conns', el));
     },
     live(ev) { conns.live(ev); },
@@ -1424,6 +1658,7 @@ function Settings(arg) {
       if (!Number.isFinite(body.temperature)) delete body.temperature;
       if (typeof body.telegram_chat_id === 'string') body.telegram_chat_id = body.telegram_chat_id.trim();
       if (typeof body.embedding_model === 'string') body.embedding_model = body.embedding_model.trim();
+      if (typeof body.small_model === 'string') body.small_model = body.small_model.trim();
       body.scheduler_enabled = !!form.scheduler_enabled.checked;
       body.policies = {};
       Object.keys(data.policy_actions).forEach((k) => { if (form[`policy_${k}`]) body.policies[k] = form[`policy_${k}`].value; });
@@ -1433,11 +1668,20 @@ function Settings(arg) {
         S.models = null;
         toast('Settings saved.');
         refreshState();
+        // The context window may have changed: context use is measured against it.
+        GET('/api/settings').then((s) => { data.context_use = s.context_use; paintContext(); }).catch(() => {});
       } catch (e) { fail(e); }
       return undefined;
     },
     async act(name, t) {
       if (conns.owns(name)) return conns.act(name, t);
+      if (name === 'bench-run') {
+        const model = pickedModel();
+        if (!model) { toast('Pick an agent model to test first.', true); return undefined; }
+        t.disabled = true;
+        try { follow(await benchStart(model)); } catch (e) { fail(e); t.disabled = false; }
+        return undefined;
+      }
       if (name === 'test-llm') {
         const form = $('form[data-form="settings"]', el);
         await this.submit('settings', form);
@@ -1463,11 +1707,173 @@ function Settings(arg) {
           }
         } catch (e) { out.textContent = e.message; }
       }
+      return undefined;
     },
-  };
+  });
+  return view;
 }
 
-// ---------------------------------------------------------------- phase 0.5: context library, search, facts
+// ---------------------------------------------------------------- phase 3: model scores (#/bench)
+// Every Holdco Bench run, newest first, and the latest score of each model side by side; #/bench/<id> shows one
+// run's scenarios with what failed, and "Run again" tests the same model on the same scenarios.
+function Bench(arg) {
+  let el, runs = [], status = null, models = [], row = null, onlyFailed = false, polling = false;
+  const view = {};
+  const id = /^\d+$/.test(arg || '') ? +arg : 0;
+  const alive = () => S.view === view && !!el && el.isConnected !== false;
+  const dur = (r) => {
+    const s = (Date.parse(r.finished_at || '') - Date.parse(r.started_at || '')) / 1000;
+    if (!Number.isFinite(s) || s < 0) return '';
+    return s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
+  };
+  const dateOf = (iso) => { const t = new Date(iso || ''); return Number.isNaN(t.getTime()) ? '' : t.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+  const td = (label, html, cls = '') => `<td data-label="${esc(label)}"${cls ? ` class="${cls}"` : ''}><div class="cell">${html}</div></td>`;
+  const bar = (v) => (isNum(v) ? `<div class="meter"><div class="bar"><span style="width:${Math.max(0, Math.min(100, Math.round(Number(v) * 100)))}%"></span></div></div>` : '');
+  const stateBadge = (r) => (benchRunning(r, status) ? `<span class="badge accent" title="${esc(benchProgress(status))}"><span class="spinner"></span> Running ${fmtCount(Math.min((Number(status.done) || 0) + 1, Number(status.total) || 1))} of ${fmtCount(status.total)}</span>`
+    : benchUnfinished(r, status) ? '<span class="badge warn" title="Holdco stopped before this test finished">Did not finish</span>' : '');
+
+  // ---- the list: progress, the latest score per model, every run
+  const live = () => {
+    const box = $('#bench-live', el);
+    if (!box) return;
+    // The error of the bench thread belongs to its run: shown on that run's page, or on the list while it is the newest.
+    const err = status && status.error && !status.running && (id ? status.run_id === id : !!runs[0] && runs[0].id === status.run_id);
+    box.innerHTML = status && status.running ? `<div class="banner"><span class="spinner"></span><div class="grow"><b>Testing ${esc(status.model || 'a model')}.</b> ${esc(benchProgress(status))}.
+      Agents pick up no new tasks until it finishes; chat still works.</div></div>` : err ? `<div class="banner warn"><div class="grow"><b>The test stopped with an error.</b> ${esc(status.error)}</div></div>` : '';
+    const btn = $('[data-act="bench-new"]', el);
+    if (btn) btn.disabled = !!(status && status.running);
+    const again = $('[data-act="bench-again"]', el);
+    if (again) again.disabled = !!(status && status.running);
+  };
+  const compare = () => {
+    const seen = new Set();
+    const latest = runs.filter((r) => r.finished_at && !seen.has(r.model) && seen.add(r.model));
+    if (!latest.length) return '<p class="faint" style="margin:0">No finished tests yet. Pick a model above and press Test this model.</p>';
+    return `<div class="bench-compare">${latest.map((r) => `<a class="bench-card" href="#/bench/${esc(r.id)}">
+      <div class="bench-card-head"><b>${esc(r.model)}</b><span class="small faint">${esc(dateOf(r.started_at))}</span></div>
+      <div class="bench-pass"><span class="v">${esc(fmtShare(r.pass_rate))}</span> <span class="small muted">passed (${fmtCount(r.passed)} of ${fmtCount(r.scenarios)})</span></div>${bar(r.pass_rate)}
+      <dl class="bench-facts"><div><dt>Tool calls valid</dt><dd>${esc(fmtShare(r.tool_validity))}</dd></div>
+        <div><dt>Speed</dt><dd>${isNum(r.tokens_per_second) ? `${Math.round(Number(r.tokens_per_second)).toLocaleString()} tokens/s` : 'n/a'}</dd></div>
+        <div><dt>Steps per scenario</dt><dd>${isNum(r.steps_avg) ? esc(Number(r.steps_avg).toFixed(1)) : 'n/a'}</dd></div></dl></a>`).join('')}</div>`;
+  };
+  const table = () => (runs.length ? `<div class="btable-wrap"><table class="btable bench-table"><thead><tr><th>Model</th><th>Date</th><th>Pass rate</th><th>Tool calls valid</th><th>Tokens/s</th><th>Steps</th></tr></thead><tbody>
+    ${runs.map((r) => {
+    const done = !!r.finished_at;
+    return `<tr class="bench-row" data-act="bench-open" data-id="${esc(r.id)}">
+      ${td('Model', `<a href="#/bench/${esc(r.id)}"><b>${esc(r.model)}</b></a>${stateBadge(r) ? ` ${stateBadge(r)}` : ''}`)}
+      ${td('Date', esc(dateOf(r.started_at)))}
+      ${td('Pass rate', done ? `<span class="num">${esc(fmtShare(r.pass_rate))}</span> <span class="faint small">${fmtCount(r.passed)} of ${fmtCount(r.scenarios)}</span>${bar(r.pass_rate)}` : '<span class="faint">n/a</span>')}
+      ${td('Tool calls valid', done ? `<span class="num">${esc(fmtShare(r.tool_validity))}</span>` : '<span class="faint">n/a</span>')}
+      ${td('Tokens/s', done && isNum(r.tokens_per_second) ? `<span class="num">${Math.round(Number(r.tokens_per_second)).toLocaleString()}</span>` : '<span class="faint">n/a</span>')}
+      ${td('Steps', done && isNum(r.steps_avg) ? `<span class="num">${esc(Number(r.steps_avg).toFixed(1))}</span>` : '<span class="faint">n/a</span>')}</tr>`;
+  }).join('')}</tbody></table></div>` : '<p class="faint" style="padding:0 18px 16px;margin:0">Nothing tested yet.</p>');
+  const drawList = () => {
+    $('#bench-compare', el).innerHTML = compare();
+    $('#bench-runs', el).innerHTML = table();
+    live();
+  };
+
+  // ---- one run: the four scores, notes, and every scenario with its failed assertions
+  const scenarioRow = (s) => {
+    const failed = Array.isArray(s.failed) ? s.failed : [];
+    const what = [...failed.map((f) => `<li><code>${esc(f.assertion)}</code>${f.detail ? `<div class="small muted">${esc(f.detail)}</div>` : ''}</li>`),
+      ...(s.error ? [`<li class="warn-text">${esc(s.error)}</li>`] : [])];
+    return `<tr class="${s.passed ? '' : 'failed'}">
+      ${td('Scenario', `<b>${esc(s.name)}</b>${s.purpose ? `<div class="small muted">${esc(s.purpose)}</div>` : ''}`)}
+      ${td('Result', s.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>')}
+      ${td('Steps', `<span class="num">${fmtCount(s.steps)}</span>`)}
+      ${td('Seconds', `<span class="num">${isNum(s.seconds) ? esc(Number(s.seconds).toFixed(1)) : 'n/a'}</span>`)}
+      ${td('What failed', what.length ? `<ul class="bench-fails">${what.join('')}</ul>` : '<span class="faint">nothing</span>')}</tr>`;
+  };
+  const drawRun = () => {
+    const r = row;
+    const results = Array.isArray(r.results) ? r.results : [];
+    const shown = onlyFailed ? results.filter((s) => !s.passed) : results;
+    const notes = benchNotes(r);
+    const running = benchRunning(r, status);
+    $('#bench-run-head', el).innerHTML = `<div><h1>${esc(r.model)}</h1><p class="sub">Tested ${esc(dateOf(r.started_at))}${r.finished_at ? `, ${plural(Number(r.scenarios) || 0, 'scenario')}${dur(r) ? ` in ${esc(dur(r))}` : ''}` : ''}. ${benchUnfinished(r, status) ? stateBadge(r) : ''}</p></div>
+      <div class="actions"><a class="btn" href="#/bench">All model scores</a><button class="btn primary" data-act="bench-again"${status && status.running ? ' disabled' : ''}>Run again</button></div>`;
+    $('#bench-run-body', el).innerHTML = running ? '<section class="panel"><div class="panel-body faint">The scores appear here when the test finishes.</div></section>'
+      : `${r.finished_at ? `<div class="kpis bench-kpis">
+          <div class="kpi"><div class="v">${esc(fmtShare(r.pass_rate))}</div><div class="k">Passed: ${fmtCount(r.passed)} of ${fmtCount(r.scenarios)}</div></div>
+          <div class="kpi"><div class="v">${esc(fmtShare(r.tool_validity))}</div><div class="k">Tool calls valid</div></div>
+          <div class="kpi"><div class="v">${isNum(r.tokens_per_second) ? Math.round(Number(r.tokens_per_second)).toLocaleString() : 'n/a'}</div><div class="k">Tokens per second</div></div>
+          <div class="kpi"><div class="v">${isNum(r.steps_avg) ? esc(Number(r.steps_avg).toFixed(1)) : 'n/a'}</div><div class="k">Steps per scenario</div></div></div>` : ''}
+        ${notes ? `<p class="small muted bench-notes">${esc(notes)}</p>` : ''}
+        <section class="panel"><div class="panel-head"><h2>Scenarios</h2><label class="check small" style="align-items:center"><input type="checkbox" data-bench-failed${onlyFailed ? ' checked' : ''} style="margin:0"> Only failures</label></div>
+          ${shown.length ? `<div class="btable-wrap"><table class="btable bench-table"><thead><tr><th>Scenario</th><th>Result</th><th>Steps</th><th>Seconds</th><th>What failed</th></tr></thead>
+            <tbody>${shown.map(scenarioRow).join('')}</tbody></table></div>`
+    : `<p class="faint" style="padding:0 18px 16px;margin:0">${results.length ? 'Every scenario passed.' : 'No scenario results were recorded.'}</p>`}</section>`;
+    live();
+  };
+
+  const load = async () => {
+    const [st, list, one] = await Promise.all([GET('/api/bench/status').catch(() => null), id ? null : GET('/api/bench/results?limit=50'), id ? GET(`/api/bench/results/${id}`) : null]);
+    if (!alive()) return;
+    status = st;
+    if (id) { row = one; drawRun(); } else { runs = list.runs || []; drawList(); }
+    if (status && status.running && !polling) poll();
+  };
+  // While a test runs: the progress every 1.5 s, then the finished scores.
+  const poll = async () => {
+    polling = true;
+    try {
+      while (alive()) {
+        await sleep(1500);
+        if (!alive()) break;
+        const st = await GET('/api/bench/status').catch(() => null);
+        if (!st) continue;
+        const was = status;
+        status = st;
+        if (!st.running) { await load(); break; }
+        if (was && was.run_id !== st.run_id) { await load(); continue; }
+        live();
+        if (!id) $$('.bench-row', el).forEach((tr) => { const r = runs.find((x) => x.id === +tr.dataset.id); const b = r && $('td .cell', tr); if (b) b.innerHTML = `<a href="#/bench/${esc(r.id)}"><b>${esc(r.model)}</b></a>${stateBadge(r) ? ` ${stateBadge(r)}` : ''}`; });
+        else if (row) drawRun();
+      }
+    } finally { polling = false; }
+  };
+  const start = async (model, only, btn) => {
+    if (!model) { toast('Pick a model to test first.', true); return; }
+    if (btn) btn.disabled = true;
+    try {
+      const runId = await benchStart(model, only);
+      if (id && runId !== id) { location.hash = `#/bench/${runId}`; return; }
+      await load();
+    } catch (e) { fail(e); if (btn) btn.disabled = false; }
+  };
+  Object.assign(view, {
+    async mount(holder) {
+      el = holder;
+      if (id) {
+        el.innerHTML = '<div class="page-head" id="bench-run-head"></div><div id="bench-live"></div><div id="bench-run-body"><span class="spinner"></span></div>';
+        el.addEventListener('change', (e) => { if (e.target.matches('[data-bench-failed]')) { onlyFailed = e.target.checked; drawRun(); } });
+        await load();
+        return;
+      }
+      const [m, settings] = await Promise.all([loadModels(), GET('/api/settings').catch(() => null)]);
+      models = m;
+      const agentModel = settings ? String(settings.settings.default_model || '') : '';
+      const pick = models.length ? `<select id="bench-model" aria-label="Model to test">${models.map((x) => `<option value="${esc(x)}" ${x === agentModel ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`
+        : `<input type="text" id="bench-model" aria-label="Model to test" placeholder="gpt-oss:20b" value="${esc(agentModel)}">`;
+      el.innerHTML = `<div class="page-head"><div><h1>Model scores</h1><p class="sub">Holdco Bench gives a model scripted jobs (founding a company, research, emails, approvals, small sorting jobs) against pretend customers and services, then scores how it did. Test each model you have and pick by score.</p></div>
+          <div class="actions bench-new">${pick}<button class="btn primary" data-act="bench-new">Test this model</button></div></div>
+        <div id="bench-live"></div>
+        <section class="panel" style="margin-bottom:18px"><div class="panel-head wrap"><h2>Side by side</h2><span class="small faint">The latest test of each model</span></div><div class="panel-body" id="bench-compare"><span class="spinner"></span></div></section>
+        <section class="panel"><div class="panel-head wrap" style="padding-bottom:6px"><h2>Every test</h2><span class="small faint">Pass rate: scenarios where every check passed. Tool calls valid: model replies that called a tool correctly.</span></div><div id="bench-runs"></div></section>`;
+      await load();
+    },
+    act(name, t) {
+      if (name === 'bench-open') { location.hash = `#/bench/${t.dataset.id}`; return; }
+      if (name === 'bench-new') { start(String($('#bench-model', el).value || '').trim(), null, t); return; }
+      if (name === 'bench-again' && row) {
+        const names = (Array.isArray(row.results) ? row.results : []).map((s) => s.name).filter(Boolean);
+        start(row.model, names, t);
+      }
+    },
+  });
+  return view;
+}
 const ARCHETYPES = [['lead_generation', 'Lead generation'], ['newsletter', 'Newsletter'], ['saas', 'SaaS'], ['services', 'Services'],
   ['digital_products', 'Digital products'], ['ecommerce', 'E-commerce'], ['local_services', 'Local services']];
 const archetypeLabel = (k) => (ARCHETYPES.find(([v]) => v === k) || [k, k])[1];
@@ -2084,6 +2490,8 @@ function taskTags(t) {
     const late = due < Date.now();
     tags.push(`<span class="badge ${late ? 'bad' : ''}" title="${esc(`Due ${new Date(due).toLocaleString()}${late ? ' (overdue)' : ''}`)}">due ${esc(shortDate(t.due_at))}</span>`);
   }
+  const gate = gateBadge(t);   // Phase 3: green when every gate passed, red with the first failure on hover
+  if (gate) tags.push(gate);
   return tags.length ? `<div class="tags">${tags.join('')}</div>` : '';
 }
 
@@ -2206,6 +2614,7 @@ function TabTasks(cid, data) {
             ${task.deliverable ? `<p><b>Deliverable:</b> ${/^[\w./-]+$/.test(task.deliverable) && /[/.]/.test(task.deliverable) ? `<a href="#/c/${cid}/files/${encodeURIComponent(task.deliverable)}">${esc(task.deliverable)}</a>` : esc(task.deliverable)}</p>` : ''}
             ${task.acceptance ? `<h3 style="margin:12px 0 4px">Acceptance criteria</h3>${md(task.acceptance)}` : ''}
             ${task.routine ? '<p class="faint small">Recurring duty</p>' : ''}
+            ${gateList(task)}
             ${task.result ? `<h3 style="margin:16px 0 6px">Notes and results</h3><div class="box">${md(task.result)}</div>` : ''}
             <form class="form-stack" data-form="edit-task" id="et" data-id="${task.id}" style="margin-top:18px">
               <div class="form-grid"><label class="field">Status<select name="status">${['todo', 'in_progress', 'waiting', 'blocked', 'done', 'cancelled'].map((s) => `<option value="${s}" ${s === task.status ? 'selected' : ''} ${s === 'in_progress' ? 'disabled' : ''}>${s.replace('_', ' ')}</option>`).join('')}</select></label>
@@ -2644,7 +3053,7 @@ function TabTeam(cid, data, _arg, reloadCompany) {
         const r = await GET(`/api/companies/${cid}/runs?agent_id=${a.id}`);
         modal({
           title: `${a.name}'s work sessions`, wide: true,
-          body: r.runs.length ? `<ul class="rows">${r.runs.map((x) => `<li><div class="grow"><div><span class="badge ${x.status === 'done' ? 'good' : x.status === 'error' ? 'bad' : x.status === 'partial' ? 'warn' : ''}">${esc(x.status)}</span> <b>${esc(x.kind)}</b>${x.task_id ? ` on task #${x.task_id}` : ''} <span class="faint small">${when(x.started_at)}, ${x.steps} steps, ${Number(x.tokens).toLocaleString()} tokens</span></div>
+          body: r.runs.length ? `<ul class="rows">${r.runs.map((x) => `<li><div class="grow"><div><span class="badge ${x.status === 'done' ? 'good' : x.status === 'error' ? 'bad' : x.status === 'partial' ? 'warn' : ''}">${esc(x.status)}</span> <b>${esc(x.kind)}</b>${x.task_id ? ` on task #${x.task_id}` : ''} <span class="faint small">${when(x.started_at)}, ${x.steps} steps, ${Number(x.tokens).toLocaleString()} tokens${Number(x.max_prompt_tokens) > 0 ? `, peak prompt ${fmtCount(x.max_prompt_tokens)} tokens` : ''}</span></div>
             <div class="small muted">${esc((x.summary || '').replace(/^Status: \w+\n?/, '').slice(0, 300))}</div></div><button class="btn sm" data-act="transcript" data-id="${x.id}">Transcript</button></li>`).join('')}</ul>` : '<p class="faint">No sessions yet.</p>',
         });
       }
@@ -2948,8 +3357,62 @@ const INTERNAL_COMPANY_SETTINGS = ['founding_stage', 'founding_retry', 'founding
 const EMAIL_PROVIDERS = [['auto', 'Resend when connected, otherwise SMTP'], ['smtp', 'SMTP'], ['resend', 'Resend']];
 
 function TabSettings(cid, data, arg) {
-  let el, global, plan = null;
+  let el, global, plan = null, trustData = null, trustBusy = false;
   const conns = ConnectorCards({ scope: 'company', cid, focus: connectorFocus(arg) });
+  // Phase 3: the trust ladder per action (GET /trust). Level 0 asks, 1 runs on its own up to the daily cap, 2 runs on
+  // its own. Locked actions always ask; run_code follows its approval setting. A change is saved at once (PUT).
+  const trustRow = (r) => {
+    const td = (label, html) => `<td data-label="${esc(label)}"><div class="cell">${html}</div></td>`;
+    const name = `<b>${esc(r.label || r.action)}</b>`;
+    if (!r.on_ladder) {
+      return `<tr class="closed">${td('Action', name)}${td('Level', r.locked ? '<span class="badge">always asks</span>'
+        : `<span class="small muted" title="Code runs ask or not by the approval setting above; with Docker it runs in a sandbox">follows its approval setting</span>`)}<td></td><td></td><td></td></tr>`;
+    }
+    const cap = Number(r.cap_per_day) || 1;
+    const used = Number(r.used_today) || 0;
+    const streak = Number(r.streak) || 0;
+    return `<tr data-trust="${esc(r.action)}">${td('Action', name)}
+      ${td('Level', `<select data-trust-level aria-label="Trust level for ${esc(r.label || r.action)}">${LEVEL_LABEL(cap).map(([v, l]) => `<option value="${v}" ${Number(r.level) === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`)}
+      ${td('Streak', `<span class="num" title="${esc(streak ? streakText(streak) : 'No approvals in a row yet')}">${fmtCount(streak)}</span>`)}
+      ${td('Cap per day', `<input type="number" data-trust-cap min="1" max="1000" step="1" value="${esc(cap)}" aria-label="Daily cap for ${esc(r.label || r.action)}">`)}
+      ${td('Today', `<span class="num">${Number(r.level) === 1 ? `${fmtCount(used)} of ${fmtCount(cap)}` : fmtCount(used)}</span>`)}</tr>`;
+  };
+  const drawTrust = (force = false) => {
+    const box = el && $('#trust-box', el);
+    if (!box || !trustData) return;
+    // A refresh from elsewhere keeps a cap the owner is typing; a save redraws.
+    if (!force && $$('[data-trust-cap]', box).some((x) => x === document.activeElement && x.value !== x.defaultValue)) return;
+    box.innerHTML = `<div class="btable-wrap"><table class="btable trust-table"><thead><tr><th>Action</th><th>Level</th><th title="Approvals in a row without edits">Streak</th><th>Cap per day</th><th title="Times it ran on its own today">Today</th></tr></thead>
+      <tbody>${trustData.actions.map(trustRow).join('')}</tbody></table></div>`;
+  };
+  const loadTrust = async () => {
+    try { trustData = await GET(`/api/companies/${cid}/trust`); } catch (e) {
+      const box = el && $('#trust-box', el);
+      if (box) box.innerHTML = `<p class="warn-text small" style="margin:0">The trust levels could not load: ${esc(e.message)}</p>`;
+      return;
+    }
+    drawTrust();
+  };
+  const loadTrustSoon = debounce(() => { if (!trustBusy) loadTrust(); }, 600);
+  const saveTrust = async (tr) => {
+    if (!tr || trustBusy) return;   // one save at a time; the redraw after it shows the result
+    const action = tr.dataset.trust;
+    const level = +$('[data-trust-level]', tr).value;
+    const capBox = $('[data-trust-cap]', tr);
+    const cap = parseInt(capBox.value, 10);
+    if (!Number.isFinite(cap) || cap < 1 || cap > 1000) { toast('The cap per day is a whole number from 1 to 1000.', true); capBox.focus(); return; }
+    const was = trustData.actions.find((r) => r.action === action) || {};
+    if (Number(was.level) === level && Number(was.cap_per_day) === cap) return;
+    trustBusy = true;
+    $$('select, input', tr).forEach((x) => { x.disabled = true; });
+    try {
+      trustData = await api('PUT', `/api/companies/${cid}/trust`, { action, level, cap_per_day: cap });
+      const label = was.label || action;
+      toast(level === 0 ? `${label}: agents ask you first.` : level === 1 ? `${label}: agents do it on their own, up to ${cap} a day.` : `${label}: agents do it on their own.`);
+    } catch (e) { fail(e); }
+    trustBusy = false;
+    drawTrust(true);
+  };
   const draw = () => {
     const c = data().company;
     const s = c.settings;
@@ -2985,11 +3448,15 @@ function TabSettings(cid, data, arg) {
             <input type="number" name="daily_email_limit" min="0" value="${val('daily_email_limit')}"></label>
           <label class="field">Money budget, USD (display only)<span class="hint">Holdco never spends money: every purchase asks you and you buy it yourself.${bud ? ` $${esc(fmtValue(bud.money_approved_month))} approved this month.` : ''}</span>
             <input type="number" name="money_usd" min="0" value="${val('money_usd')}"></label>
+          <label class="field">Quiet hours<span class="hint">Low-priority research with no deadline runs in this window (this PC's clock), or when nothing else is queued. For example 23:00-07:00; empty means no window.</span>
+            <input type="text" name="quiet_hours" value="${val('quiet_hours')}" placeholder="23:00-07:00" autocomplete="off" pattern="\\s*\\d{1,2}:[0-5]\\d\\s*-\\s*\\d{1,2}:[0-5]\\d\\s*" title="Two times, for example 23:00-07:00"></label>
         </div></div>
       <div class="section"><h2>Approvals for this company</h2><p class="muted">Override your global defaults.</p>
         <div class="form-grid">${Object.entries(global.policy_actions).map(([k, label]) => `<label class="field">${esc(label)}${global.locked.includes(k) ? '<div class="box small">Always asks you</div>' :
           `<select name="policy_${k}"><option value="">Default (${esc({ approve: 'ask me', auto: 'allowed', off: 'never' }[global.settings.policies[k]])})</option>
           ${[['approve', 'Ask me first'], ['auto', 'Let agents do it'], ['off', 'Never allow']].map(([v, l]) => `<option value="${v}" ${pol[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`}</label>`).join('')}</div></div>
+      <div class="section" id="trust"><h2>Trust</h2><p class="muted">Each approval you give without changes builds a streak. At ${esc(trustData ? trustData.promote_at : 15)} in a row Holdco asks whether agents may do it on their own; a rejection moves it one level down. Legal wording, a first email to a new person and anything after agents read outside content still ask. Changes here apply at once.</p>
+        <div id="trust-box"><span class="spinner"></span></div></div>
       <div class="section"><h2>Email</h2>
         <div class="form-grid" style="margin:10px 0 16px;max-width:520px">
           <label class="field">Send email with<span class="hint">Resend is set up on its card under Connectors at the top of this tab. Replies always arrive through IMAP below.</span>
@@ -3039,9 +3506,26 @@ function TabSettings(cid, data, arg) {
       plan = pl && pl.planning;
       draw();
       if (arg === 'budgets') $('#budgets', el)?.scrollIntoView({ block: 'start' });   // from the Overview's GPU line
-      await connsReady;
+      // The trust table sits inside the settings form without names, so Save never sends it: each change is a PUT.
+      el.addEventListener('change', (e) => {
+        const tr = e.target.closest('[data-trust]');
+        if (tr && (e.target.matches('[data-trust-level]') || e.target.matches('[data-trust-cap]'))) saveTrust(tr);
+      });
+      el.addEventListener('input', (e) => {   // "On its own, up to N a day" follows the cap being typed
+        if (!e.target.matches('[data-trust-cap]')) return;
+        const o = $('[data-trust-level] option[value="1"]', e.target.closest('[data-trust]'));
+        const n = parseInt(e.target.value, 10);
+        if (o && Number.isFinite(n) && n > 0) o.textContent = LEVEL_LABEL(n)[1][1];
+      });
+      el.addEventListener('keydown', (e) => {   // Enter in a cap saves that row, not the whole form
+        if (e.key === 'Enter' && e.target.matches('[data-trust-cap]')) { e.preventDefault(); saveTrust(e.target.closest('[data-trust]')); }
+      });
+      await Promise.all([connsReady, loadTrust()]);
     },
-    live(ev) { conns.live(ev); },
+    live(ev) {
+      conns.live(ev);
+      if (ev.type === 'trust' || ev.type === 'approvals') loadTrustSoon();   // a promotion, a streak, a demotion
+    },
     async submit(name, form) {
       if (conns.ownsForm(name)) return conns.submit(name, form);
       if (name !== 'co-settings') return undefined;
@@ -3060,6 +3544,7 @@ function TabSettings(cid, data, arg) {
         if (Number.isFinite(n)) settings[k] = n; else delete settings[k];
       });
       if (typeof settings.postal_address === 'string') settings.postal_address = settings.postal_address.trim();
+      if (typeof settings.quiet_hours === 'string') settings.quiet_hours = settings.quiet_hours.replace(/\s+/g, '');
       try {
         const r = await api('PATCH', `/api/companies/${cid}`, { name: f.name, settings });
         syncSecrets(form, r.company && r.company.settings);   // a password just saved now shows the mask

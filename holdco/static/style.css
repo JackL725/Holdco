@@ -643,3 +643,51 @@ input[type=date] {
   .brain .rows li { flex-wrap: wrap; }
   .brain .rows .row-acts { width: 100%; justify-content: flex-start; }
 }
+
+/* ---------- phase 3: model scores, trust, verification, sandbox, context use ---------- */
+.bench-test { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); display: flex; flex-direction: column; gap: 8px; }
+.bench-test .actions .faint { flex: 1; min-width: 200px; }
+.bench-box { color: var(--ink-2); overflow-wrap: anywhere; min-height: 1.5em; }
+.bench-box .badge { vertical-align: 1px; }
+.ctx-use { margin-top: 14px; max-width: 720px; }
+.ctx-use .meter-head .badge { flex: none; }
+.ctx-use .bar { margin: 6px 0; }
+.bench-new select, .bench-new input { width: auto; max-width: 260px; }
+.bench-compare { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.bench-card { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; background: var(--panel-2); color: var(--ink); min-width: 0; }
+.bench-card:hover { border-color: var(--ink-3); text-decoration: none; }
+.bench-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.bench-card-head b { overflow-wrap: anywhere; }
+.bench-pass .v { font: 650 26px var(--font-display); font-variant-numeric: tabular-nums; }
+.bench-card .meter .bar { margin: 0; background: var(--panel); }
+.bench-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 4px 0 0; font-size: 12.5px; }
+.bench-facts dt { color: var(--ink-3); font-size: 11.5px; }
+.bench-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.bench-table .meter .bar { margin: 4px 0 0; height: 6px; max-width: 120px; }
+.bench-row { cursor: pointer; }
+.bench-row:hover td { background: var(--panel-2); }
+.bench-table tr.failed td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+.bench-fails { margin: 0; padding-left: 16px; }
+.bench-fails li { margin: 0 0 4px; overflow-wrap: anywhere; }
+.bench-fails code { overflow-wrap: anywhere; }
+.bench-kpis { padding: 0; margin-bottom: 14px; }
+.bench-notes { margin: 0 0 14px; overflow-wrap: anywhere; }
+.trust-table select { min-width: 190px; }
+.trust-table input[type=number] { width: 90px; padding: 4px 6px; font-size: 13px; }
+.req .why { margin: 0; padding: 8px 10px; border-radius: var(--r-sm); background: var(--warn-soft); color: var(--ink); overflow-wrap: anywhere; }
+.req .why .badge { margin-right: 4px; background: var(--panel); }
+.req-meta .streak:not(:empty) { color: var(--good); font-weight: 600; }
+.sandbox-row { display: flex; gap: 8px 14px; align-items: center; flex-wrap: wrap; }
+.sandbox-row .check { font-weight: 400; color: var(--ink-2); }
+.sandbox-row .check input { margin-top: 2px; }
+.gate-rows li { padding-left: 0; padding-right: 0; align-items: flex-start; }
+.gate-rows .badge { min-width: 96px; justify-content: center; flex: none; }
+.panel-head.wrap { flex-wrap: wrap; }
+.panel-head.wrap h2 { flex: none; }
+.card .tags .badge.gate { cursor: help; }
+@media (max-width: 760px) {
+  .bench-new { width: 100%; }
+  .bench-new select, .bench-new input { flex: 1; max-width: none; min-width: 0; }
+  .trust-table select { min-width: 0; width: 100%; }
+  .bench-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
