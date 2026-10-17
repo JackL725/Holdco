@@ -348,7 +348,6 @@ class TestDoctorRules(DoctorBase):
             r = doctor._check_index()
         self.assertEqual((r["key"], r["label"], r["status"], r["fix"]), ("search_index", "Search index", "ok", None))
         self.assertIn("Full-text index:", r["detail"])
-        self.assertIn("last indexed", r["detail"])
         base = {"fts": True, "rows": 12, "global_files": 2, "global_last_indexed": None, "embedding_model": "",
                 "vectors": 0, "companies": [{"id": c["id"], "name": "IndexRowCo", "files_indexed": 0, "rows": 0,
                                              "last_indexed": None, "last_checked": None}]}
@@ -367,6 +366,7 @@ class TestDoctorRules(DoctorBase):
         with patch.object(context, "index_status", return_value=model):
             r = doctor._check_index()
         self.assertEqual(r["status"], "ok")
+        self.assertIn("last indexed", r["detail"])
         self.assertIn("Meaning search with nomic-embed-text: 40 vectors.", r["detail"])
 
     def test_token_budget_row(self):
