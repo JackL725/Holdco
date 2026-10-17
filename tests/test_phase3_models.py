@@ -591,13 +591,17 @@ class TestScheduler(Base):
         def search(query, n, settings=None, **kw):
             # The first run's tool is running: a second session starts and must reach the model now.
             agents.start(echo["id"], "task", task_id=second["id"])
-            seen["second_called"] = wait_until(lambda: any(c["model"] == "gpt-oss:20b-second" for c in self.chats()),
-                                               10)
-            seen["running"] = agents.running_count()
+
+            def second_called():   # sampled while waiting: on a fast machine the second session may already be done
+                seen["running"] = max(seen.get("running", 0), agents.running_count())
+                return any(c["model"] == "gpt-oss:20b-second" for c in self.chats())
+            seen["second_called"] = wait_until(second_called, 10)
             return []
 
         # Scout cites the page it fetches from the fake server (the research gate checks that), so that server counts
         # as public here, as HOLDCO_ALLOW_LOCAL makes it for the end-to-end app.
+        self.server.delay, delay = 0.2, self.server.delay   # each model call takes a moment, as a real one does
+        self.addCleanup(setattr, self.server, "delay", delay)
         with mock.patch.object(web, "search", search), \
                 mock.patch.object(web, "ALLOW_LOCAL", [f"127.0.0.1:{self.server.port}"]):
             agents.run(scout["id"], "task", task_id=first["id"])

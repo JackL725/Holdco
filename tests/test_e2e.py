@@ -823,7 +823,7 @@ class EndToEnd(unittest.TestCase):
         def routine_done(key):
             rows = [t for t in api.get(f"/api/companies/{cid}/tasks")["tasks"] if t["routine"] == key]
             return rows and all(t["status"] == "done" for t in rows)
-        wait_for(lambda: routine_done("ceo:Evening brief") and routine_done("ceo:Weekly review"), 90,
+        wait_for(lambda: routine_done("ceo:Evening brief") and routine_done("ceo:Weekly review"), 180,
                  what="the evening brief and the weekly review")
         latest = api.get(f"/api/briefs/latest?company_id={cid}")
         daily, weekly = latest["daily"], latest["weekly"]

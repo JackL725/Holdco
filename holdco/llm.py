@@ -567,7 +567,7 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     # Phase 3: a prompt-based call is held to its JSON shape by the server, unless this server rejected that once.
     shaped = json_mode and bool(tools) and not json_output and _server(s) not in _no_schema_servers
     thinking = ""
-    started = time.monotonic()
+    started = time.perf_counter()   # Windows' monotonic clock ticks in ~16 ms steps
 
     if s["llm_backend"] == "ollama":
         body = {"model": model, "stream": False, "keep_alive": s.get("keep_alive", "30m"),
@@ -630,7 +630,7 @@ def _call(s: dict, model: str, messages: list[dict], tools: list[dict], names: s
     calls = calls if tools else []
     return Reply(content=content, tool_calls=calls, tokens=tokens, mode="json" if json_mode else "native",
                  thinking=thinking[:8000], prompt_tokens=prompt_tokens, eval_count=eval_count,
-                 eval_seconds=round(eval_seconds, 3), wall_seconds=round(time.monotonic() - started, 3))
+                 eval_seconds=round(eval_seconds, 3), wall_seconds=round(time.perf_counter() - started, 3))
 
 
 def _count(v) -> int:
