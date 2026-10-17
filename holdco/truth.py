@@ -2133,10 +2133,16 @@ def _own_words(body: str) -> str:
 
 
 def suppressed(address: str) -> bool:
-    """True when this address asked any company to stop (inbound email saying stop, unsubscribe or remove me)."""
+    """True when this address asked any company to stop (inbound email saying stop, unsubscribe or remove me), or
+    is on Phase 3's global do-not-email list (the suppression table: stop replies, the owner's Suppress button).
+    A row a contact's unsubscribe added ("unsubscribed (contact #N)", brain.update_contact) is left to the checks that
+    name the contact: outreach_guard's own contact check below, and verify.outreach_check for other companies."""
     a = _addr(address)
     if not a:
         return False
+    row = db.one("SELECT reason FROM suppression WHERE email=?", (a,))
+    if row and not str(row["reason"] or "").startswith("unsubscribed (contact #"):
+        return True
     for e in db.q("SELECT from_addr, subject, body FROM emails WHERE direction='in' AND lower(from_addr) LIKE ?",
                   (f"%{a}%",)):
         if _addr(e["from_addr"]) == a and (STOP_WORDS.search(e["subject"] or "")

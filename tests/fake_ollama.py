@@ -16,7 +16,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SITE = """<!doctype html><html><head><meta charset="utf-8"><title>PawPlan</title></head>
+SITE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>PawPlan</title></head>
 <body><h1>Meal plans your dog will actually eat</h1><p>Tell us about your dog.</p>
 <form><input placeholder="you@email.com"><button>Join the waitlist</button></form></body></html>"""
 

@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import backup, config, db, emailer, llm, notify, web
+from . import backup, config, db, emailer, llm, notify, sandbox, web
 from .routing import route
 
 LAST: list[dict] = []          # most recent rows, newest run
@@ -370,6 +370,21 @@ def _disk_free_bytes() -> tuple[int, int]:
     return u.free, u.total
 
 
+SANDBOX_DOCS = "https://docs.docker.com/get-started/get-docker/"
+
+
+def _check_sandbox() -> dict:
+    """Phase 3: run_code runs in a Docker or Podman container when one is available; without one it runs on this
+    PC, which the owner should know and can fix."""
+    key, label = "sandbox", "Code sandbox"
+    runtime = sandbox.available()
+    if runtime:
+        return _row(key, label, "ok", f"Code sandbox: {runtime}. Agents' code runs in a container with only the "
+                                      f"company folder, no network unless approved, 1 GB of memory and 1 CPU.")
+    return _row(key, label, "warn", "Code sandbox: not available. Install Docker Desktop or Podman to isolate "
+                                    "agents' code.", _link("Get Docker Desktop", SANDBOX_DOCS))
+
+
 def _check_disk() -> dict:
     free, total = _disk_free_bytes()
     free_gb = free / 1024 ** 3
@@ -480,6 +495,7 @@ def run(deep: bool = False, force: bool = False) -> list[dict]:
             _Job([("search", "Web search", _link("Search settings", "#/settings"))],
                  lambda: _check_search(s, deep), long),
             *_connector_jobs(s, deep or force),
+            _Job([("sandbox", "Code sandbox", _link("Get Docker Desktop", SANDBOX_DOCS))], _check_sandbox),
             _Job([("disk", "Disk space", None)], _check_disk),
             _Job([("backup", "Last backup", _action("Back up now", "backup"))], _check_backup),
             _Job([("errors_24h", "Errors in the last 24 h", None)], _check_errors),

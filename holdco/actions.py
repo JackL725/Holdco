@@ -359,7 +359,8 @@ def execute(company: dict, action: str, p: dict, approval_id: int | None = None)
     if action == "http_post":
         return _http(p)
     if action == "run_code":
-        return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)))
+        return run_code(company, p.get("language", "python"), p.get("code", ""), int(p.get("timeout", 60)),
+                        network=str(p.get("network", "")).strip().lower() in ("true", "1", "yes", "on"))
     if action == "spend_money":
         return "Approved. The owner will complete this purchase themselves and record it."
     raise ValueError(f"Unknown action {action}")
@@ -493,12 +494,12 @@ def run_code(company: dict, language: str, code: str, timeout: int = 60, network
         proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, timeout=timeout, env=env,
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s."
+        return f"{sandbox.NONE}\nTimed out after {timeout}s."
     except FileNotFoundError as e:
-        return f"Couldn't start the interpreter: {e}"
+        return f"{sandbox.NONE}\nCouldn't start the interpreter: {e}"
     out = proc.stdout.decode("utf-8", "replace")
     err = proc.stderr.decode("utf-8", "replace")
-    res = f"Exit code {proc.returncode}\n"
+    res = f"{sandbox.NONE}\nExit code {proc.returncode}\n"   # no container: the result says where it ran
     if out:
         res += f"--- stdout ---\n{out[-6000:]}\n"
     if err:
