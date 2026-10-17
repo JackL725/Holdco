@@ -321,6 +321,26 @@ def _find_link_by_url(inst: dict, url: str) -> dict | None:
     return next((x for x in links if str(x.get("url") or "").rstrip("/") == want), None)
 
 
+def find_payment_link(inst: dict, ref: str) -> dict | None:
+    """Phase 3: a payment link retrieved from the Stripe API by id (plink_...) or by its URL (looked up to its id
+    first), or None when this account has no such link. The verification gate (verify.py) uses it to see that a
+    link someone handed off exists and is active. Other API errors raise StripeError."""
+    ref = (ref or "").strip()
+    if ref.lower().startswith(("http://", "https://")):
+        found = _find_link_by_url(inst, ref)
+        if not found:
+            return None
+        ref = str(found.get("id") or "")
+    if not ref:
+        return None
+    try:
+        return _request(inst, "GET", f"/v1/payment_links/{urllib.parse.quote(ref, safe='')}")
+    except StripeError as e:
+        if e.status == 404:
+            return None
+        raise
+
+
 def get_payment_link(inst: dict, company: dict, id: str) -> str:
     ref = (id or "").strip()
     if not ref:

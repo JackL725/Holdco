@@ -919,6 +919,9 @@ def update_contact(ctx: Ctx, contact_id: int, stage: str = "", last_touch: str =
                     "the owner can change it.")
         if unsubscribed:
             fields["unsubscribed"] = 1
+            if (row.get("email") or "").strip():
+                from . import verify   # Phase 3: an unsubscribe stops every company, not only this one
+                verify.suppress(row["email"], f"unsubscribed (contact #{contact_id})", cid)
     if notes.strip():
         fields["notes"] = ((row.get("notes") or "") + f"\n[{_today().isoformat()}] {notes.strip()}").strip()[-2000:]
     if not fields:
