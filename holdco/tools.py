@@ -648,6 +648,9 @@ def remember(ctx: Ctx, content: str, kind: str = "note", pin: bool = False) -> s
     # twice (the nearest note above 0.92 similarity, confirmed by the small model).
     same = embeddings.duplicate_memory(ctx.company, content, kind)
     if same:
+        if pin:   # the agent wants every agent to see it: the note that is already there gets the pin
+            db.run("UPDATE memory SET pinned=1 WHERE id=? AND company_id=?", (same, ctx.company["id"]))
+            return f"Already in memory (#{same}); pinned it, so every agent sees it."
         return f"Already in memory (#{same})."
     mid = db.run("INSERT INTO memory(company_id, agent_id, kind, content, pinned, created_at) VALUES(?,?,?,?,?,?)",
                  (ctx.company["id"], ctx.agent["id"], (kind or "note")[:20], content[:2000], int(bool(pin)), db.now()))
@@ -807,7 +810,9 @@ def run_code(ctx: Ctx, code: str, language: str = "python", timeout: int = 60) -
     # Phase 3: the sandbox runs without a network unless the task says network=true (the owner can also tick
     # "Allow network" on the approval card).
     task = ctx.task or {}
-    network = bool(NETWORK_RE.search(f"{task.get('title') or ''}\n{task.get('description') or ''}"))
+    # A task the inbox made quotes the sender's subject, so an outside sender could write network=true there.
+    network = task.get("created_by") != "inbox" and \
+        bool(NETWORK_RE.search(f"{task.get('title') or ''}\n{task.get('description') or ''}"))
     return actions.gate(ctx.company, ctx.agent, _task_id(ctx), "run_code",
                         {"language": lang, "code": code, "timeout": int(timeout or 60), "network": network})
 

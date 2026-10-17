@@ -1104,6 +1104,7 @@ class Mocks:
         self.deadline = deadline               # time.monotonic() after which the run is stopped (timeout_s)
         self.kill_after: int | None = None     # the kill switch comes on once this many tool calls ran
         self.kind = ""                         # the kind of run going on: founding, cycle, task, chat or job
+        self.agent_replies = 0                 # replies to an agent's session (with tools); a tool call's step
         self.replies: list[dict] = []
         self.calls: list[dict] = []
         self.phone: list[dict] = []
@@ -1251,6 +1252,18 @@ def _patch_web(m: Mocks) -> None:
                     "detail": "every provider failed: " + BLOCKED_REASONS}
         return {"key": "search", "label": "Web search", "status": "ok", "detail": "scripted results (Holdco Bench)"}
 
+    from .. import actions
+    orig_http = actions._http
+
+    def http(p):
+        # The mocked check_public_url above lets every address through (no DNS in a bench), so the real request
+        # could reach this PC or the home network: an http_post an auto policy lets run is answered here instead.
+        if not m.mine():
+            return orig_http(p)
+        check_public_url((p or {}).get("url"))
+        return f"HTTP 200\n(Holdco Bench: nothing was sent to {str((p or {}).get('url'))[:200]})"
+
+    m.patch(actions, "_http", http)
     m.patch(web, "search", search)
     m.patch(web, "http_get", http_get)
     m.patch(web, "check_public_url", check_public_url)
@@ -1461,7 +1474,13 @@ def _record(m: Mocks) -> None:
             m._depth.n = depth
         # llm.Reply carries what the server measured: eval_count tokens generated in eval_seconds (Ollama). The OpenAI
         # API reports no generation time (eval_seconds 0), so the runner falls back to tokens over this wall time.
-        m.replies.append({"kind": m.kind, "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
+        # A call without tools is a small-model job inside the session (a summary of an old result, the memory
+        # duplicate check): not an agent reply, so it neither counts for tool-call validity nor moves the steps.
+        agent = bool(tools)
+        if agent:
+            m.agent_replies += 1
+        m.replies.append({"kind": m.kind if agent else "job", "step": m.agent_replies if agent else 0,
+                          "seconds": time.monotonic() - t0, "tokens": int(reply.tokens or 0),
                           "eval_count": int(reply.eval_count or 0), "eval_seconds": float(reply.eval_seconds or 0.0),
                           "calls": len(reply.tool_calls or []), "mode": reply.mode})
         return reply
@@ -1475,7 +1494,7 @@ def _record(m: Mocks) -> None:
             rname, rargs = tool_mod.resolve(ctx, name, args)
         out = orig_execute(ctx, name, args)
         m.calls.append({"name": rname, "asked": name, "args": rargs, "result": str(out)[:6000],
-                        "step": len(m.replies), "run_id": getattr(ctx, "run_id", 0), "kind": m.kind})
+                        "step": m.agent_replies, "run_id": getattr(ctx, "run_id", 0), "kind": m.kind})
         return out
 
     m.patch(llm, "chat", chat)

@@ -159,6 +159,10 @@ def run(company: dict, language: str, code: str, timeout: int = 60, network: boo
     lang = "python" if (language or "python").lower().startswith("py") else "shell"
     ws = workspace.root(company)
     runs = ws / ".runs"
+    if runs.is_symlink():
+        # Code in an earlier container can turn .runs into a link to any folder of this PC (the mount shows the host
+        # path); Holdco writes the next script here on the host, so the link is removed, never followed.
+        runs.unlink()
     runs.mkdir(parents=True, exist_ok=True)
     head = f"Sandbox: {runtime}" + (" (network allowed)" if network else "")
     ready, note = _ensure_image(runtime)
@@ -167,7 +171,13 @@ def run(company: dict, language: str, code: str, timeout: int = 60, network: boo
                 f"then run it again.")
     ms = int(time.time() * 1000)
     if lang == "python":
-        (runs / f"run_{ms}.py").write_text(code, encoding="utf-8", newline="\n")
+        while True:
+            try:   # "x": a name that already exists (a link planted from inside a container) is never written through
+                with open(runs / f"run_{ms}.py", "x", encoding="utf-8", newline="\n") as f:
+                    f.write(code)
+                break
+            except FileExistsError:
+                ms += 1
     cmd = command(runtime, company["id"], os.path.abspath(str(ws)), ms, lang, code, network)
     name = f"holdco-{company['id']}-{ms}"
     prefix = head + (f"\n{note}" if note else "")

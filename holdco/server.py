@@ -895,7 +895,10 @@ class Handler(BaseHTTPRequestHandler):
         except workspace.PathError:
             raise HTTPError(400, "Bad path")
         if p.is_dir():
-            p = p / "index.html"
+            try:   # checked like the path itself: an index.html that is a link out of the folder is not served
+                p = workspace.safe_path(c, sub.rstrip("/") + "/index.html")
+            except workspace.PathError:
+                raise HTTPError(400, "Bad path")
         if not p.is_file():
             raise HTTPError(404, "Not found")
         # Agent-written pages are sandboxed so they can't call the dashboard API.
