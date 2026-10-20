@@ -17,7 +17,8 @@ the phase specs in `docs/phases/` are the binding record of what each phase had 
 | Touch Holdco Bench, its scenarios or the fakes | [components/bench-context.md](components/bench-context.md) |
 | Understand the whole system at once | [architecture/system-design.md](architecture/system-design.md) |
 | Know why something is the way it is (and not re-debate it) | [architecture/decisions/](architecture/decisions/) |
-| Run, test, debug, ship a change | [workflows/development.md](workflows/development.md) |
+| Run, test, ship a change | [workflows/development.md](workflows/development.md) |
+| Find out why a company is stuck or misbehaving | [workflows/debugging.md](workflows/debugging.md) |
 | Continue this documentation work | [context-engineering-progress.md](context-engineering-progress.md) |
 
 ## Project essentials

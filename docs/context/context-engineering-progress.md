@@ -27,6 +27,7 @@ context engineering: read `docs/context/context-engineering-progress.md`, then h
 | 2 Core documents | done 2026-10-20 | `project-overview.md`, `architecture/system-design.md`, 6 ADRs, 7 component files, `workflows/development.md` |
 | 3 Integration | done 2026-10-20 | `CLAUDE.md` at the repo root points Claude Code here; `docs/README.md` links this folder; the development workflow says when to update these files |
 | Maintenance | 2026-10-20 | Phase 4 merged: current state updated, docs re-checked against `main` |
+| Addition | 2026-10-20 | `workflows/debugging.md`: why a company is stuck (held on purpose, watchdog patterns, Doctor rows), where to look, SQL, how to reproduce |
 
 ## Files
 ```
@@ -40,6 +41,7 @@ docs/context/
   components/                               agent-runtime, ground-truth-and-context, organization,
                                             safety-and-approvals, integrations, operations-and-dashboard, bench
   workflows/development.md                  run, test (Windows rules), real-model checks, change, ship
+  workflows/debugging.md                    why a company is stuck, where to look, SQL, reproduce and fix
 ```
 
 ## Keeping it current
@@ -50,4 +52,3 @@ docs/context/
 ## Next steps (only if wanted)
 - ADRs for smaller settled choices if they get re-debated (for example: the CEO belt of 24 tools, owner-only budgets,
   the stdio proxy instead of a second database writer).
-- A short "how to debug a stuck company" page in `workflows/` built from the watchdog patterns and Doctor rows.
