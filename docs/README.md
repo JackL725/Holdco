@@ -1,5 +1,8 @@
 # Holdco design documentation
 
+Working on the code with an AI assistant? Start with [context/project-overview.md](context/project-overview.md),
+the map of the code as built, with one context file per subsystem and the decision records.
+
 Start with [plan.md](plan.md), the improvement plan everything else expands. Then:
 
 | Document | What it covers |
@@ -11,6 +14,7 @@ Start with [plan.md](plan.md), the improvement plan everything else expands. The
 | [safety.md](safety.md) | Trust ladder, taint tracking, code sandbox, secrets, test modes, outreach compliance, kill switch, audit, backups |
 | [owner-experience.md](owner-experience.md) | Daily brief, decisions vs approvals, Doctor page, phone notifications, portfolio, connector setup |
 | [testing.md](testing.md) | Test strategy, the fake services, phase gates as tests, the Bench |
+| [context/](context/project-overview.md) | The code as built, for AI collaborators: overview, system design, decision records, components, development workflow |
 | [phases/](phases/) | One implementation spec per phase: [0 Stabilize](phases/phase-0-stabilize.md), [0.5 Ground truth and context](phases/phase-0.5-ground-truth-and-context.md), [1 Connect](phases/phase-1-connect.md), [2 Organize](phases/phase-2-organize.md), [3 Verify](phases/phase-3-verify.md), [4 Scale](phases/phase-4-scale.md) |
 
 Each phase ships as its own pull request. A phase document's **Status** line says whether it is planned, in
