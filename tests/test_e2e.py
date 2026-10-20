@@ -835,8 +835,15 @@ class EndToEnd(unittest.TestCase):
         def routine_done(key):
             rows = [t for t in api.get(f"/api/companies/{cid}/tasks")["tasks"] if t["routine"] == key]
             return rows and all(t["status"] == "done" for t in rows)
-        wait_for(lambda: routine_done("ceo:Evening brief") and routine_done("ceo:Weekly review"), 180,
-                 what="the evening brief and the weekly review")
+        try:
+            wait_for(lambda: routine_done("ceo:Evening brief") and routine_done("ceo:Weekly review"), 180,
+                     what="the evening brief and the weekly review")
+        except AssertionError as e:
+            # Intermittent on Windows runners only: say what the evening app was doing, so the cause can be found.
+            doctor = api.get("/api/doctor")
+            tasks = [(t["id"], t["title"], t["status"], t["routine"]) for t in api.get(f"/api/companies/{cid}/tasks")["tasks"]]
+            raise AssertionError(f"{e}\ntasks: {tasks}\ndoctor: {json.dumps(doctor)[:1500]}\n"
+                                 f"log tail:\n{app.log()[-4000:]}") from None
         latest = api.get(f"/api/briefs/latest?company_id={cid}")
         daily, weekly = latest["daily"], latest["weekly"]
         self.assertTrue(daily and weekly, latest)
