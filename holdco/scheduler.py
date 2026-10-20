@@ -8,6 +8,9 @@ companies: 1 follow-ups (the owner's answer reopened them within the hour), 2 du
 4 normal, 5 routines, 6 low-value research (research or discovery, priority 3, no deadline), which runs only inside
 the company's quiet_hours window (local time) unless nothing in classes 1 to 5 could start. Classes 1 and 2 go out
 before the CEO cycles; the rest after them, as before.
+
+Phase 4 (docs/phases/phase-4-scale.md section 2): inside classes 3 to 6 portfolio.order puts the company furthest
+below its share of the GPU first, and a company with work and no run within its cycle_minutes before that.
 """
 from __future__ import annotations
 
@@ -179,7 +182,9 @@ class Scheduler(threading.Thread):
         # 4) Hand out the rest by class, then priority, across all companies (the routines just created included).
         #    Low-value research waits for its company's quiet hours unless nothing else could start.
         known = {t["id"] for t in queue}
-        queue = portfolio.order(_queue())   # Phase 4: each company's share of the GPU by its allocation score
+        # Phase 4: inside classes 3 to 6, each company's share of the GPU by its allocation score (one query; the
+        # settings say whether allocation_mode is weighted or equal, which keeps this Phase 3 order).
+        queue = portfolio.order(_queue(), s)
         new = [t for t in queue if t["id"] not in known]
         if new:   # tasks created since the first look (routines, a cycle's plan): their dependencies too
             deps.update(contracts.dependency_status(new))
