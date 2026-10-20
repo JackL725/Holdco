@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The form posts to Netlify: the verification gate (Phase 3) fails a page whose form sends its entries nowhere. The
@@ -1096,6 +1097,7 @@ class FakeModelServer:
         self.prompt_tokens = 900          # what each chat reply reports as prompt_eval_count (context use)
         self.schema_misses: list[str] = []   # scripted tools a JSON-schema request did not allow (should stay empty)
         self.cycle_prompts: list[str] = []   # Phase 3: the planning-cycle prompts received (the newest 20)
+        self.searches: list[str] = []        # queries GET /search answered (the apps' SearXNG stand-in)
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -1127,6 +1129,16 @@ class FakeModelServer:
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                     return
+                if self.path.startswith("/search?"):
+                    # A SearXNG-shaped search (format=json): the end-to-end apps search here, so the suite never
+                    # reaches the public internet (a DuckDuckGo timeout once held a test for 40 s or more).
+                    q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("q", [""])[0]
+                    outer.searches.append(q)
+                    return self._json(200, {"query": q, "results": [
+                        {"title": "Dog meal plan prices", "url": f"{outer.pages}/pricing",
+                         "content": "PawChef's Weekly plan costs $49 per month."},
+                        {"title": "Home-cooked dog food: what vets say", "url": f"{outer.pages}/vet-article",
+                         "content": "Follow a recipe a veterinary nutritionist balanced."}]})
                 if self.path == "/api/tags":
                     return self._json(200, {"models": [{"name": "gpt-oss:20b"}, {"name": "notools:latest"}]})
                 if self.path == "/v1/models":
@@ -1205,7 +1217,7 @@ class FakeModelServer:
     def start(self):
         global PAGES
         PAGES = self.pages   # for callers of script() that pass no server (the newest server started)
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
 
     def stop(self):

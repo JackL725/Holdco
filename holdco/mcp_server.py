@@ -145,9 +145,10 @@ TOOLS = [
           ("company_id",)),
     _tool("latest_brief", "Latest brief",
           "The newest brief: a company's when company_id is given, else the portfolio brief. kind is daily, "
-          "weekly or monthly (any kind when omitted).",
+          "weekly or monthly, or portfolio for the monthly portfolio review (any kind when omitted).",
           {"company_id": _int_prop("The company (optional; omitted means the portfolio brief)"),
-           "kind": _str_prop("daily, weekly or monthly (optional)", ("daily", "weekly", "monthly"))}),
+           "kind": _str_prop("daily, weekly, monthly or portfolio (optional)",
+                             ("daily", "weekly", "monthly", "portfolio"))}),
     _tool("doctor", "Health checks",
           "Holdco's health checks as on the Doctor page (model server, search, connectors, sandbox, disk, "
           "backups, errors) with the summary of the latest run.", {}),
@@ -520,8 +521,8 @@ def _latest_brief(args: dict, client: dict):
     from . import db, rhythms
     cid = _int_arg(args, "company_id", default=0)
     kind = _str_arg(args, "kind").strip().lower()
-    if kind and kind not in rhythms.BRIEF_KINDS:
-        raise ToolFailure(f"kind must be {', '.join(rhythms.BRIEF_KINDS[:-1])} or {rhythms.BRIEF_KINDS[-1]}.")
+    if kind and kind not in rhythms.READ_KINDS:
+        raise ToolFailure(f"kind must be {', '.join(rhythms.READ_KINDS[:-1])} or {rhythms.READ_KINDS[-1]}.")
     whose = _company(cid)["name"] if cid else "The portfolio"
     sql, params = ("SELECT * FROM briefs WHERE company_id=?", [cid]) if cid else \
         ("SELECT * FROM briefs WHERE company_id IS NULL", [])

@@ -16,6 +16,7 @@ from pathlib import Path
 from . import actions, agents, backup, bus, config, context, contracts, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
 from . import bench, trust  # noqa: F401  (Phase 3: their modules register the Bench and Trust routes)
 from . import mcp_server   # Phase 4: Holdco as an MCP server at /mcp
+from . import portfolio  # noqa: F401  (Phase 4: its module registers GET /api/portfolio)
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -120,7 +121,15 @@ def api_settings(h, m, body):
     raw = db.get_settings()
     s = _masked(raw, config.SECRET_SETTINGS)
     return {"settings": s, "policy_actions": config.POLICY_ACTIONS, "locked": sorted(config.LOCKED_POLICIES),
-            "data_dir": str(config.DATA_DIR), "context_use": context_use(raw)}
+            "data_dir": str(config.DATA_DIR), "context_use": context_use(raw), "mcp": mcp_info()}
+
+
+def mcp_info() -> dict:
+    """Phase 4: what the Settings page needs for the Claude Desktop and Claude Code snippets (the stdio entry point
+    and the HTTP address). Whether a password is set, never the password."""
+    return {"port": config.PORT, "password_set": bool(config.PASSWORD), "install_dir": str(config.BASE_DIR),
+            "url": f"http://127.0.0.1:{config.PORT}{mcp_server.PATH}", "command": "python",
+            "args": ["-m", "holdco.mcp_server"]}
 
 
 @route("PUT", "/api/settings")

@@ -21,7 +21,10 @@ kinds, mcp {command, args, env | url, headers, classify, allow, blocked} for MCP
 Optional extras this module also reads: health_timeout (seconds, default 15; for a stdio server also how long its
 first start may take), oauth (bool, default true for mcp-http), tag_for_call(tool, args) -> tag or None and
 refuse_call(tool, args) -> str or None (checked by call()); tag_for_call may only raise the map's tag unless
-tag_for_call_lowers is true (Stripe's allowlist of safe writes); check_result(tool, args, text) -> str or None
+tag_for_call_lowers is true (Stripe's allowlist of safe writes); prepare_call(inst, company, tool, args) -> dict of
+payload updates or None (Phase 4: actions.gate asks it before a call that is not read is queued or run, for what the
+request card must show and the executor must check, such as Porkbun's price, amount_usd, dry_run, tags and notice;
+an exception refuses the call with its text); check_result(tool, args, text) -> str or None
 (checked after every MCP result: a text replaces the result with an error, after reset_call (tool, args) has been
 sent); page_of(text) -> url or None with page_query (tool, args) (a call that is not read is tied to the page the
 browser was on when it was asked for, and refused after approval when the page changed);
@@ -464,15 +467,27 @@ def mcp_url(inst: dict) -> str:
     return str(_mcp_resolver(d, inst)("url") or "")
 
 
+def _kind(d: dict, inst: dict | None) -> str:
+    """The instance's kind. Phase 4: a definition whose instances choose their transport (GitHub: the hosted server or
+    the Docker image) gives kind_for(inst) -> "mcp-stdio" | "mcp-http"; its own kind is then the default and what the
+    setup card shows. Either way the kind stays an MCP one, so every MCP_KINDS check holds for the definition."""
+    kind = d.get("kind") or ""
+    if callable(d.get("kind_for")) and kind in MCP_KINDS:
+        try:
+            chosen = d["kind_for"](inst)
+        except Exception:
+            chosen = None
+        if chosen in MCP_KINDS:
+            return chosen
+    return kind
+
+
 def _mcp_settings(d: dict, inst: dict) -> dict:
     """Keyword arguments for mcp.Client from the definition. The mcp dict gives command, args and env (stdio) or
     url and headers (http); a definition's launch(inst) -> (command, args), mcp_url(inst) and mcp_headers(inst)
     take precedence (Playwright's command override, Stripe's Bearer key)."""
     res = _mcp_resolver(d, inst)
-    # Phase 4: a definition whose instances choose their transport (GitHub: the hosted server or the Docker image)
-    # gives kind_for(inst) -> "mcp-stdio" | "mcp-http"; its kind is then the default and what the card shows.
-    kind = d["kind_for"](inst) if callable(d.get("kind_for")) else d.get("kind")
-    if kind == "mcp-stdio":
+    if _kind(d, inst) == "mcp-stdio":
         if callable(d.get("launch")):
             command, args = d["launch"](inst)
         else:
@@ -1502,7 +1517,7 @@ def public(inst: dict, company_id: int | None = None) -> dict:
     company = db.get_company(inst["company_id"]) if inst.get("company_id") is not None else None
     oauth = bool(d.get("oauth", d.get("kind") == "mcp-http"))
     return {"id": inst["id"], "company_id": inst.get("company_id"),
-            "company_name": company["name"] if company else None, "key": inst["key"], "label": _label(d, inst["key"]), "kind": d.get("kind") or "",
+            "company_name": company["name"] if company else None, "key": inst["key"], "label": _label(d, inst["key"]), "kind": _kind(d, inst),
             "enabled": bool(inst.get("enabled")), "config": cfg, "status": inst.get("status") or "",
             "detail": inst.get("detail") or "", "last_check": inst.get("last_check"),
             "created_at": inst.get("created_at"), "mode": _mode(inst),

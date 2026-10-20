@@ -93,7 +93,10 @@ class HoldcoProcess:
                "HOLDCO_TICK_SECONDS": "1", "HOLDCO_ROUTINE_CHECK_SECONDS": "1", "PYTHONUNBUFFERED": "1",
                # Phase 2: routines with an at_hour follow a fixed local noon, so the suite gives the same result at
                # any time of day (the morning plan is due, the evening brief is not; a test can pass its own time).
-               "HOLDCO_TEST_LOCAL_NOW": "12:00", **self.env}
+               "HOLDCO_TEST_LOCAL_NOW": "12:00",
+               # Web search never leaves this PC: only SearXNG, which a test points at the fake model server's
+               # GET /search (searxng_url); unset, a search fails at once instead of waiting on DuckDuckGo.
+               "HOLDCO_SEARCH_PROVIDERS": "searxng", **self.env}
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "a", encoding="utf-8")
         self.proc = subprocess.Popen([sys.executable, str(ROOT / "run.py"), "--no-browser", "--port", str(self.port)],

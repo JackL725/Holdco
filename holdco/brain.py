@@ -33,7 +33,7 @@ OWNER_FIELDS = ("price", "offer", "positioning", "icp")   # strategy changes the
 CONTACT_STAGES = ("lead", "contacted", "replied", "customer", "lost")
 GOAL_STATUSES = ("active", "done", "dropped")
 VERDICTS = ("pending", "won", "lost", "inconclusive")
-DECIDERS = ("ceo", "owner", "telegram", "deadline")
+DECIDERS = ("ceo", "owner", "telegram", "deadline", "mcp")   # mcp (Phase 4): the owner through an MCP client
 MAX_ACTIVE_GOALS = 3
 LESSON_CAP = 300
 LOOKUP_ROWS = 20
@@ -185,7 +185,7 @@ def _ceo_name(company_id: int) -> str:
 
 def _decider(company_id: int, decided_by: str) -> str:
     return {"ceo": _ceo_name(company_id), "owner": "the owner", "telegram": "the owner (phone)",
-            "deadline": "the deadline"}.get(decided_by or "", decided_by or "someone")
+            "deadline": "the deadline", "mcp": "the owner (MCP client)"}.get(decided_by or "", decided_by or "someone")
 
 
 def _change_payload(row: dict) -> dict:

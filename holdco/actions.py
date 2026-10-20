@@ -30,6 +30,9 @@ ACTION_LABELS = {
     "connector_call": "Connected service call",
     "decision": "Decision",
 }
+# Who answered a row first, for the refusal a second answer gets (a phone button pressed after Claude Desktop decided
+# the same request through MCP, Phase 4). The dashboard ("owner") needs no words.
+DECIDED_BY_TEXT = {"telegram": " (from the phone)", "mcp": " (through an MCP client)", "deadline": " (by its deadline)"}
 
 
 def _summary(action: str, p: dict) -> str:
@@ -164,7 +167,8 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     if not row:
         raise ValueError("Request not found")
     if row["status"] != "pending":
-        raise ValueError(f"Request #{approval_id} is already {row['status']}")
+        raise ValueError(f"Request #{approval_id} is already {row['status']}"
+                         f"{DECIDED_BY_TEXT.get(row.get('decided_by') or '', '')}")
     if decision == "approve" and row["action"] not in ("question", "decision") and db.get_settings().get("kill_switch"):
         raise ValueError("The kill switch is on. Turn it off to run approvals.")
     company = db.get_company(row["company_id"])
@@ -226,8 +230,9 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
                    [*fields.values(), approval_id])
             claimed = db.scalar("SELECT changes()")
         if not claimed:
-            now = (db.one("SELECT status FROM approvals WHERE id=?", (approval_id,)) or {}).get("status", "decided")
-            raise ValueError(f"Request #{approval_id} is already {now}")
+            now = db.one("SELECT status, decided_by FROM approvals WHERE id=?", (approval_id,)) or {}
+            raise ValueError(f"Request #{approval_id} is already {now.get('status') or 'decided'}"
+                             f"{DECIDED_BY_TEXT.get(now.get('decided_by') or '', '')}")
     else:
         db.update("approvals", approval_id, **fields)
     if row["action"] == "decision":

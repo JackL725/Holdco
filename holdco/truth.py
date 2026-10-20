@@ -27,7 +27,7 @@ import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
-from . import bus, checks, db, emailer, presets, vault, workspace
+from . import bus, checks, config, db, emailer, presets, vault, workspace
 from .actions import ACTION_LABELS
 from .routing import company_or_404, route
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401  (tools register here)
@@ -147,7 +147,8 @@ def _host(url: str | None) -> str:
 
 
 def _deploy_ok(result) -> bool:
-    """Only a real Netlify upload counts. 'Approved, but no Netlify token is set' put nothing online."""
+    """Only a real upload counts: Netlify's "Website deployed: URL" or, Phase 4, "Website deployed to Cloudflare
+    Workers: URL". 'Approved, but no Netlify token is set' put nothing online."""
     return str(result or "").startswith("Website deployed")
 
 
@@ -272,7 +273,7 @@ def _state(company: dict) -> dict:
     dep_pending = [a for a in pending if a["action"] == "deploy_site"]
     dep_decided = [a for a in approvals if a["action"] == "deploy_site" and a["status"] in ("done", "failed")]
     if good:
-        line = f"Website: live at {live_url or 'its Netlify address'} (last deploy {_clock(good[0]['created_at'])})."
+        line = f"Website: live at {live_url or 'its host address'} (last deploy {_clock(good[0]['created_at'])})."
         if dep_pending:
             p = dep_pending[0]
             line += (f" Deploy request #{p['id']} for newer changes is waiting for the owner since "
@@ -519,7 +520,7 @@ def _change_items(company: dict, agent: dict, since: str, kind: str = "task") ->
                   (cid, since)):
         if (t["created_by"] or "") == my_name:
             continue
-        who = "the owner" if t["created_by"] == "owner" else (t["created_by"] or "someone")
+        who = "the owner" if t["created_by"] in config.OWNER_CREATORS else (t["created_by"] or "someone")
         items.append((t["created_at"],
                       f"Task #{t['id']} created by {who} for {t['role']}: {_one_line(t['title'], 70)}"))
     for t in db.q("SELECT * FROM tasks WHERE company_id=? AND updated_at>=? AND status IN "
