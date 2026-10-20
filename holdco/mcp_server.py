@@ -25,6 +25,7 @@ import copy
 import datetime as _dt
 import http.client
 import json
+import math
 import os
 import socket
 import sys
@@ -43,6 +44,7 @@ TOOLS_TTL_MS = 60_000          # tools/list may be cached this long ...
 CACHE_SCOPE = "client"         # ... by each client for itself
 PATH = "/mcp"
 MAX_BODY = 2_000_000           # bytes of one POST /mcp body
+MAX_BATCH = 100                # messages in one batch (each may run a tool as the owner)
 FORWARD_TIMEOUT = 300.0        # seconds the stdio proxy waits for the dashboard (approving a deploy can take a while)
 INBOX_LIMIT = 100              # pending rows list_inbox returns, like the dashboard's Inbox
 METRIC_ROWS = 500
@@ -204,6 +206,9 @@ def _handle(message, client: dict) -> dict | None:
     if "id" not in message:
         return None   # notifications (notifications/initialized among them) need no reply
     rid = message["id"]
+    if rid is not None and (isinstance(rid, bool) or not isinstance(rid, (str, int, float))
+                            or (isinstance(rid, float) and not math.isfinite(rid))):
+        return _error(None, INVALID_REQUEST, "Invalid request: the id must be a string, a number or null")
     params = message.get("params")
     params = {} if params is None else params
     if not isinstance(params, dict):
@@ -433,6 +438,8 @@ def _decide(args: dict, client: dict):
         if options and p.get("recommended"):
             hint += f" Recommended: {p['recommended']}."
         raise ToolFailure(f"#{aid} is a {row['action']}: answer it with decision 'answer' and the answer.{hint}")
+    if row["action"] == "decision":   # reject dismisses it without choosing, so it carries no answer either
+        answer = _option(aid, row, answer) if decision != "reject" else ""
     who = "mcp:" + _client_name(client)
     try:
         out = actions.decide(aid, "reject" if decision == "reject" else "approve", None, feedback, answer,
@@ -452,6 +459,26 @@ def _decide(args: dict, client: dict):
     else:
         text = f"Request #{aid} ({label}) {out.get('status')}." + (f" Outcome: {result}" if result else "")
     return text, data
+
+
+def _option(aid: int, row: dict, answer: str) -> str:
+    """A decision is answered with one of its options, as the dashboard's buttons and the phone's do: the option
+    itself, any case, or its first words when they fit exactly one option ("Scale" for "Scale (more GPU share for 30
+    days)", never "Sh" for "Shut down"). Its origin acts on the option's text (a portfolio review's Scale, a trust
+    promotion's Yes), so free text that merely starts like one must not count."""
+    from . import db
+    p = db.loads(row["payload"], {}) or {}
+    options = [str(o).strip() for o in (p.get("options") or []) if str(o).strip()] if isinstance(p, dict) else []
+    if not options:
+        return answer
+    said = " ".join(answer.split()).lower()
+    norm = {o: " ".join(o.split()).lower() for o in options}
+    exact = [o for o in options if norm[o] == said]
+    starts = [o for o in options if norm[o].startswith(said) and not norm[o][len(said):][:1].isalnum()]
+    if exact or len(starts) == 1:
+        return (exact or starts)[0]
+    raise ToolFailure(f"Decision #{aid} takes one of its options: {'; '.join(options)}. '{answer}' is not one of "
+                      "them.")
 
 
 def _assignee(company: dict, wanted: str) -> dict:
@@ -594,7 +621,7 @@ def http_reply(method: str, headers, body: bytes) -> tuple[int, object, dict]:
         return 415, _error(None, INVALID_REQUEST, "Invalid request: send the JSON-RPC message as application/json"), {}
     try:
         message = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):   # RecursionError: nested deeper than Python parses
         return 400, _error(None, PARSE_ERROR, "Parse error: the body is not JSON"), {}
     version = (headers.get("MCP-Protocol-Version") or "").strip()
     # An older-generation client names its agreed version in this header on every request after initialize.
@@ -603,6 +630,9 @@ def http_reply(method: str, headers, body: bytes) -> tuple[int, object, dict]:
     if isinstance(message, list):
         if not message:
             return 400, _error(None, INVALID_REQUEST, "Invalid request: the batch is empty"), {}
+        if len(message) > MAX_BATCH:
+            return 400, _error(None, INVALID_REQUEST, f"Invalid request: a batch holds at most {MAX_BATCH} "
+                                                      "messages"), {}
         replies = []
         for m in message:
             problem = _header_problem(m, headers)
@@ -643,7 +673,7 @@ class _Proxy:
                 continue
             try:
                 message = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 self._write(_error(None, PARSE_ERROR, "Parse error: the line is not JSON"))
                 continue
             if isinstance(message, list):
@@ -670,6 +700,9 @@ class _Proxy:
     def _batch(self, messages: list) -> None:
         if not messages:
             return self._write(_error(None, INVALID_REQUEST, "Invalid request: the batch is empty"))
+        if len(messages) > MAX_BATCH:
+            return self._write(_error(None, INVALID_REQUEST,
+                                      f"Invalid request: a batch holds at most {MAX_BATCH} messages"))
         replies = [handle(m, self.client) if self._local(m) else self._forward_safely(m) for m in messages]
         replies = [r for r in replies if r is not None]
         if replies:

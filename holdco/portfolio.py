@@ -122,10 +122,12 @@ def _goal_progress(cid: int) -> tuple[float, int]:
 
 def _dry_run(p: dict, result) -> bool:
     """Did an approved connector purchase buy nothing? The executor's own answer says so ("Dry run (nothing
-    bought): ..."), since the card's dry run may have changed between the request and the approval; the request's
-    dry_run flag decides only when there is no answer."""
-    text = str(result or "").strip()
-    return text.lower().startswith("dry run") if text else p.get("dry_run") is True
+    bought): ...", or Porkbun's sandbox: "Registered ... (1 year, sandbox mode)"), since the card may have changed
+    between the request and the approval; the request's dry_run flag and mode decide only when there is no answer."""
+    text = str(result or "").strip().lower()
+    if text:
+        return text.startswith("dry run") or "sandbox mode)" in text
+    return p.get("dry_run") is True or p.get("mode") == "sandbox"
 
 
 def _money_spent(cid: int, since: str) -> float:
@@ -148,16 +150,19 @@ def _money_spent(cid: int, since: str) -> float:
 
 def _last_results(ids: list[int]) -> dict[int, str]:
     """When each company last had a real-world result (a UTC stamp; absent when never):
-    - a connector metric whose value differs from the previous row of the same name (the first row: from 0). Stripe's
-      numbers count only as a payment: stripe.payments_30d going up (a 30-day window that drops is not a result);
+    - a connector metric whose value differs from that connector's previous row of the same name (the first row:
+      from 0; manual rows are not compared). Stripe's numbers count only as a payment: stripe.payments_30d going up
+      (a 30-day window that drops is not a result);
     - an inbound email whose In-Reply-To names a Message-ID the company sent."""
     if not ids:
         return {}
     marks = ",".join("?" * len(ids))
     out: dict[int, str] = {}
+    # The previous row is the same connector's: a number an agent typed in between (manual) neither makes nor hides
+    # a change.
     for r in db.q("SELECT company_id, MAX(created_at) AS at FROM (SELECT company_id, name, value, source, created_at, "
-                  "LAG(value) OVER (PARTITION BY company_id, name ORDER BY created_at, id) AS prev FROM metrics WHERE "
-                  f"company_id IN ({marks})) WHERE {_CONNECTOR} AND ((name NOT LIKE 'stripe.%' AND "
+                  "LAG(value) OVER (PARTITION BY company_id, name, source ORDER BY created_at, id) AS prev FROM "
+                  f"metrics WHERE company_id IN ({marks}) AND {_CONNECTOR}) WHERE ((name NOT LIKE 'stripe.%' AND "
                   "value != COALESCE(prev, 0)) OR (name='stripe.payments_30d' AND value > COALESCE(prev, 0))) "
                   "GROUP BY company_id", ids):
         if r["at"]:
@@ -264,7 +269,7 @@ def _task_key(t: dict) -> tuple:
     return (t["priority"] if t.get("priority") is not None else 2, t["id"])
 
 
-def _weighted(rest: list[dict]) -> list[dict]:
+def _weighted(rest: list[dict], deps: dict | None = None) -> list[dict]:
     """Classes 3 to 6 (in Phase 3 order) reordered: starving companies first, then inside each class the company
     with the largest deficit, then priority and id. Each place handed out counts as a run started, so the next
     place goes to whoever is furthest behind then."""
@@ -278,9 +283,15 @@ def _weighted(rest: list[dict]) -> list[dict]:
         (_iso(now - _dt.timedelta(minutes=DEFICIT_MINUTES)), _iso(now - _dt.timedelta(minutes=longest))))}
     counts = {cid: int((runs.get(cid) or {}).get("recent") or 0) for cid in companies}
     total = sum(counts.values())
+    # Each company's first task that is free to start: one that waits on another task (Phase 2's depends_on) cannot
+    # take the guard's slot, or the company's ready work would still never run. deps: the scheduler's lookup for
+    # this tick (contracts.dependency_status), else made here (no query without dependencies).
+    deps = contracts.dependency_status(rest) if deps is None else deps
     first: dict[int, dict] = {}
     for t in rest:
-        first.setdefault(t["company_id"], t)
+        if t["company_id"] not in first or (not contracts.dispatchable(first[t["company_id"]], deps)
+                                            and contracts.dispatchable(t, deps)):
+            first[t["company_id"]] = t
     out, taken = [], set()
     # The starvation guard: work waiting and no run started within the company's cycle_minutes. Each such company's
     # first task goes ahead of the deficit order; among them, Phase 3 order (first holds the heads in queue order).
@@ -311,10 +322,11 @@ def _weighted(rest: list[dict]) -> list[dict]:
     return out
 
 
-def order(queue: list[dict], settings: dict | None = None) -> list[dict]:
+def order(queue: list[dict], settings: dict | None = None, deps: dict | None = None) -> list[dict]:
     """Scheduler.tick: the dispatch queue (in Phase 3 class order) with classes 3 to 6 ordered by company deficit
     (share * runs started in the last hour - the company's own) and the starvation guard. Classes 1 and 2 keep
-    their places. allocation_mode 'equal' returns the Phase 3 order unchanged; so does any failure here."""
+    their places. allocation_mode 'equal' returns the Phase 3 order unchanged; so does any failure here. deps: the
+    tick's contracts.dependency_status for these tasks, when the caller has it."""
     s = settings if settings is not None else db.get_settings()
     if str(s.get("allocation_mode") or "weighted").strip().lower() == "equal":
         return queue
@@ -322,7 +334,7 @@ def order(queue: list[dict], settings: dict | None = None) -> list[dict]:
     if not rest:
         return queue
     try:
-        return [t for t in queue if t.get("dispatch_class") not in WEIGHTED_CLASSES] + _weighted(rest)
+        return [t for t in queue if t.get("dispatch_class") not in WEIGHTED_CLASSES] + _weighted(rest, deps)
     except Exception:   # the share is an optimisation: dispatch goes on in Phase 3 order
         traceback.print_exc()
         return queue

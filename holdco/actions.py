@@ -204,7 +204,16 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
         status, result = "answered", answer or feedback or "(no answer)"
         note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
     elif decision == "approve":
-        db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
+        # Phase 4 review: the dashboard, the phone and an MCP client can approve the same request at the same moment.
+        # Only the one that moves it from pending to running executes it (a purchase or an email runs once).
+        with db._lock:
+            db.run("UPDATE approvals SET status='running', payload=?, decided_at=?, feedback=? WHERE id=? AND "
+                   "status='pending'", (json.dumps(p), ts, feedback, approval_id))
+            claimed = db.scalar("SELECT changes()")
+        if not claimed:
+            now = db.one("SELECT status, decided_by FROM approvals WHERE id=?", (approval_id,)) or {}
+            raise ValueError(f"Request #{approval_id} is already {now.get('status') or 'decided'}"
+                             f"{DECIDED_BY_TEXT.get(now.get('decided_by') or '', '')}")
         try:
             result = execute(company, row["action"], p, approval_id=approval_id)
             status = "done"
@@ -222,9 +231,10 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     fields = {"status": status, "result": result, "payload": json.dumps(p), "decided_at": ts, "feedback": feedback,
               "decided_by": decided_by,
               "summary": _summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"]}
-    if row["action"] in ("question", "decision"):
+    if row["action"] in ("question", "decision") or status == "rejected":
         # Phase 2: the owner (dashboard or phone) and the scheduler's deadline can answer the same row at the same
-        # moment. Only the first answer counts, so the brain records it and its origin acts on it once.
+        # moment. Only the first answer counts, so the brain records it and its origin acts on it once. Phase 4
+        # review: a rejection likewise never lands on a request an approval is already running.
         with db._lock:
             db.run(f"UPDATE approvals SET {', '.join(f'{k}=?' for k in fields)} WHERE id=? AND status='pending'",
                    [*fields.values(), approval_id])

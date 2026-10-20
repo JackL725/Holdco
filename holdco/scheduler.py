@@ -184,10 +184,11 @@ class Scheduler(threading.Thread):
         known = {t["id"] for t in queue}
         # Phase 4: inside classes 3 to 6, each company's share of the GPU by its allocation score (one query; the
         # settings say whether allocation_mode is weighted or equal, which keeps this Phase 3 order).
-        queue = portfolio.order(_queue(), s)
+        queue = _queue()
         new = [t for t in queue if t["id"] not in known]
         if new:   # tasks created since the first look (routines, a cycle's plan): their dependencies too
             deps.update(contracts.dependency_status(new))
+        queue = portfolio.order(queue, s, deps)   # the guard's pick must be free to start (the same lookup)
         quiet: dict[int, bool] = {}   # company id -> inside its quiet hours now
         later = []                    # research outside the quiet window
         for t in queue:

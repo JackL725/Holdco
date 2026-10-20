@@ -448,6 +448,14 @@ def prepare_call(inst: dict, company: dict | None, tool: str, args: dict) -> dic
             "mode": m, "tags": list(TAGS), "notice": notice, "_why_asked": notice}
 
 
+def _request_card(approval_id) -> dict:
+    """The approved request's payload: prepare_call's dry_run and mode as they were when the owner was asked."""
+    from . import db   # imported here: only a purchase needs it
+    row = db.one("SELECT payload FROM approvals WHERE id=?", (int(approval_id),))
+    p = db.loads(row["payload"], {}) if row else {}
+    return p if isinstance(p, dict) else {}
+
+
 def register_domain(inst: dict, company: dict | None, domain: str, years: int = 1, price_usd=None,
                     approval_id: int | None = None) -> str:
     """Buy the domain at the price the owner approved (price_usd, set from Porkbun's quote when it was queued) or
@@ -460,8 +468,14 @@ def register_domain(inst: dict, company: dict | None, domain: str, years: int = 
     approved = _price(price_usd)
     if approved is None:
         raise RuntimeError("This request has no approved price, so nothing was bought; ask for it again.")
-    dry = dry_run(inst)
+    asked = _request_card(approval_id)   # what the request card and the phone told the owner
+    # A request queued while dry run was on said "nothing is bought": approving it stays a dry run, even when the
+    # card's Dry run was unticked in the meantime.
+    dry = dry_run(inst) or asked.get("dry_run") is True
     q = quote(inst, d, years, wait=True)
+    if not dry and asked.get("mode") == "sandbox" and mode(inst) == "live":
+        raise RuntimeError(f"{d} was requested with Porkbun's sandbox keys (no real purchase), but the keys are live "
+                           "now, so nothing was bought. Ask again to approve a real purchase.")
     span = f"{years} year{'s' if years != 1 else ''}"
     if q["available"]:
         live = q["total"]
