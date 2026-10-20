@@ -26,7 +26,7 @@ No cloud AI, no API bills, no pip installs.
   marketing drafts, lead lists, an FAQ, a ledger. Every file is a normal file you can open.
 - **Inbox (you're the layer on top).** Emails, social posts, website deploys, outside API calls, code
   execution and purchases wait for your OK. You can edit an email or post before approving it. Reject with
-  a note and the agent gets a task to revise it. Spending money always needs you; Holdco never pays for anything.
+  a note and the agent gets a task to revise it. Spending money always needs you: Holdco never pays for anything without your approval, and the only purchase it can carry out itself is a domain through Porkbun, after you approve that exact domain and price.
 - **Chat with your team.** Message the CEO or any agent; they act on it (create tasks, change plans) and reply.
 - **Live feed** of everything every agent does, plus full transcripts of every work session.
 - **Thinking tab.** Watch each agent's reasoning, the tool it picks and what the tool returns, live, per agent.
@@ -92,6 +92,13 @@ No cloud AI, no API bills, no pip installs.
   ones wait for you. What you chose goes into the brain and comes back for review two weeks later.
 - **Budgets.** GPU hours per day, tool calls per task, posts per week and emails per day, per company, in its
   Settings tab. The Overview shows how much of today's GPU budget is used.
+- **A portfolio that funds what works.** The Portfolio page scores every company on goal progress, revenue and how
+  recently it got a real-world result (a payment, a reply, a signup), and the GPU follows the score: higher-scoring
+  companies get more of the run slots, while a new company is protected for its first two weeks and nobody starves.
+  Once a month you get a portfolio review on your phone with one decision per company: scale, hold or shut down.
+- **Use Holdco from Claude.** Holdco is an MCP server: Claude Desktop, Claude Code or any MCP client can list your
+  companies, read a company's brain, metrics and briefs, see your inbox, create tasks and approve or answer requests,
+  with the same rules and audit log as the dashboard.
 - **Holdco Bench: scores for your model.** *Settings → Test this model* runs 33 scenarios of Holdco's own work
   against stand-in services (found a company, fix a page that fails QA, write a compliant cold email, resist a
   prompt injection, recover from a tool error, plan top down...) and shows the pass rate, how many tool calls were
@@ -274,6 +281,38 @@ servers that use OAuth get a *Sign in* button.
 - **Resend**: an API key and a verified sending domain. Set *Send email with* to auto or Resend in the Email section.
 - **Playwright**: needs Node.js. The first test downloads a browser, so allow a minute.
 - **Buffer**: beta; saved turned off until you switch it on.
+- **Porkbun** (domains): check names and prices, manage DNS. Start with sandbox keys and *dry run* on. Buying a domain
+  always asks you, shows the price and "This buys a domain and cannot be undone", and is never repeated by a retry.
+- **Cloudflare**: publishes the site as Workers static assets. Set *Website host* in company Settings to Cloudflare,
+  or leave it on auto (Cloudflare when connected, else Netlify). Deploys still need your approval.
+- **GitHub**: through GitHub's MCP server with a fine-grained token for chosen repositories. Every role can read;
+  engineering can file issues and open pull requests after your approval; merges always ask. Issue text counts as
+  outside content.
+- **Plausible or Umami**: visitors, visits and goal conversions arrive every hour as numbers with their source.
+- **Forms**: Netlify Forms or a small Cloudflare Worker (template in `docs/forms-worker.js`). Each signup becomes a
+  contact (with its consent, when the form asks) and the `forms.signups` number moves.
+- **n8n**: a webhook into your own workflows, for anything without a connector; each trigger asks you first until
+  the trust ladder says otherwise.
+- ComfyUI, ad platforms and accounting show as cards that explain why they are not available yet.
+
+### Using Holdco from Claude Desktop or Claude Code
+
+Holdco serves MCP at `http://127.0.0.1:8420/mcp` (both protocol generations) and through a small stdio entry point,
+`python -m holdco.mcp_server`, that forwards to the running dashboard. Claude Desktop: add this to its configuration
+file's `mcpServers` (check the file's location in Claude Desktop's own documentation):
+
+```
+{"mcpServers": {"holdco": {"command": "python", "args": ["-m", "holdco.mcp_server"],
+                            "env": {"PYTHONPATH": "C:\\path\\to\\Holdco", "HOLDCO_PORT": "8420",
+                                    "HOLDCO_PASSWORD": "your-password-if-set"}}}}
+```
+
+Claude Code: register the same command as a stdio server, or the HTTP URL above with a Basic `Authorization` header
+when `HOLDCO_PASSWORD` is set (check the flags in Claude Code's documentation). Then ask "what is waiting in my
+Holdco inbox?". The tools are `list_companies`, `get_company_brain`, `list_inbox`, `decide`, `create_task`,
+`get_metrics`, `latest_brief` and `doctor`. Decisions made this way show as made through Claude (MCP) in the audit
+log, and the kill switch, taint and trust rules apply exactly as in the dashboard. Settings shows the same snippet
+with copy buttons.
 
 The older settings still work:
 
@@ -420,10 +459,12 @@ request. Each phase document under `docs/phases/` says what was built and how to
 4. **Phase 2: Organize** (built): the company brain with measured goals, top-down planning,
    task contracts with dependencies and file leases, daily and weekly rhythms with briefs built from real numbers,
    a decisions queue with deadlines, and budgets for GPU time, steps and posts.
-5. **Phase 3: Verify** (built in this pull request): Holdco Bench to score models on Holdco's own work, the
+5. **Phase 3: Verify** (built): Holdco Bench to score models on Holdco's own work, the
    verification gate, structured tool calls with repair messages, a code sandbox, taint tracking, a trust ladder
    for approvals, a small model for routine jobs, dispatch priorities and the context-use display.
-6. **Phase 4: Scale** (planned): Holdco as an MCP server, portfolio capital allocation, the remaining connectors.
+6. **Phase 4: Scale** (built in this pull request): Holdco as an MCP server, portfolio capital allocation with a
+   monthly review, and the remaining essential connectors (Porkbun, Cloudflare, GitHub, Plausible or Umami, forms,
+   n8n).
 
 ## Project layout
 
@@ -459,7 +500,10 @@ holdco/
   vault.py          the credential vault (DPAPI, keyring, encrypted file) and redaction
   mcp.py, oauth.py  MCP client (stdio and Streamable HTTP, both protocol generations) and OAuth with PKCE
   connectors.py     connector cards, health checks, metric pipes, find_tool, risk-gated calls
-  conn_*.py         Stripe, Resend, Playwright, Buffer and Brave
+  conn_*.py         Stripe, Resend, Playwright, Buffer, Brave, Porkbun, Cloudflare, GitHub, Plausible and Umami,
+                    forms, n8n, and the later tier's cards
+  mcp_server.py     Holdco as an MCP server: /mcp and the stdio entry point
+  portfolio.py      the scorecard, each company's GPU share and the monthly portfolio review
   browser.py        browser_check
   llm.py            Ollama / OpenAI-compatible client with tool-call fallbacks
   roles.py          maps agents to presets and tool belts
