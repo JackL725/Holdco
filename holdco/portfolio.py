@@ -120,14 +120,27 @@ def _goal_progress(cid: int) -> tuple[float, int]:
     return sum(_progress(g.get("current"), g.get("target")) for g in goals) / len(goals), len(goals)
 
 
+def _dry_run(p: dict, result) -> bool:
+    """Did an approved connector purchase buy nothing? The executor's own answer says so ("Dry run (nothing
+    bought): ..."), since the card's dry run may have changed between the request and the approval; the request's
+    dry_run flag decides only when there is no answer."""
+    text = str(result or "").strip()
+    return text.lower().startswith("dry run") if text else p.get("dry_run") is True
+
+
 def _money_spent(cid: int, since: str) -> float:
-    """Dollars of the purchases the owner approved (spend_money, done) since then."""
+    """Dollars of the purchases the owner approved since then: spend_money requests (the owner buys and records it)
+    and connector calls that bought something themselves (Porkbun's register_domain carries amount_usd), unless
+    they ran as a dry run."""
     total = 0.0
-    for a in db.q("SELECT payload FROM approvals WHERE company_id=? AND action='spend_money' AND status='done' AND "
-                  "COALESCE(decided_at, created_at)>=?", (cid, since)):
+    for a in db.q("SELECT action, payload, result FROM approvals WHERE company_id=? AND status='done' AND action IN "
+                  "('spend_money', 'connector_call') AND COALESCE(decided_at, created_at)>=?", (cid, since)):
         p = db.loads(a["payload"], {})
+        p = p if isinstance(p, dict) else {}
+        if a["action"] == "connector_call" and ("amount_usd" not in p or _dry_run(p, a["result"])):
+            continue
         try:
-            total += float((p if isinstance(p, dict) else {}).get("amount_usd") or 0)
+            total += float(p.get("amount_usd") or 0)
         except (TypeError, ValueError):
             pass
     return total

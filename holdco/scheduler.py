@@ -225,7 +225,7 @@ class Scheduler(threading.Thread):
                 db.update("tasks", t["id"], agent_id=agent["id"])
             if agents.is_running(agent["id"]):
                 continue
-            if t["created_by"] != "owner":   # tasks the owner created still run over the budget
+            if t["created_by"] not in config.OWNER_CREATORS:   # the owner's tasks still run over the budget
                 if t["company_id"] not in over:
                     company = db.get_company(t["company_id"])
                     over[t["company_id"]] = bool(company and (planning.over_budget(company)

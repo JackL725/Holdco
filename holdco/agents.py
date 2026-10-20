@@ -206,7 +206,7 @@ def _goal_label(t: dict, goals: dict[int, str]) -> str:
         return "Recurring duty"
     if t.get("created_by") == "inbox":   # a reply to a customer's email: never cancelled for having no goal
         return "No goal (reply to an inbound email)"
-    return "No goal (owner's task)" if t.get("created_by") == "owner" else "No goal"
+    return "No goal (owner's task)" if t.get("created_by") in config.OWNER_CREATORS else "No goal"
 
 
 def _task_lines(company: dict, statuses: tuple, order: str, limit: int, verify: bool = False,

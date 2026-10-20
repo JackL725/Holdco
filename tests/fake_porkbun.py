@@ -196,7 +196,7 @@ class FakePorkbun:
             return [r for r in self.requests if r["path"].startswith(prefix)]
 
     def start(self):
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
 
     def stop(self):

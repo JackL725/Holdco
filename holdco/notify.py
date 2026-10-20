@@ -389,7 +389,41 @@ def _payload_lines(action: str, p: dict) -> list[str]:
         vendor = f" ({escape(g('vendor'))})" if g("vendor") else ""
         return [f"Item: {escape(g('item'))}", f"Amount: ${escape(g('amount_usd'))}{vendor}",
                 f"Reason: {escape(g('reason'))}" if g("reason") else ""]
+    if action == "connector_call":
+        return _connector_lines(p)
     return []
+
+
+def _connector_lines(p: dict) -> list[str]:
+    """A connected service's request (Phase 1), with what Phase 4's prepare_call put on it first: the notice
+    (Porkbun's register_domain: the price, "This buys a domain and cannot be undone"), the amount and whether dry run
+    is on. The phone is where the owner approves it, so nothing of this may be cut off behind the arguments."""
+    lines = []
+    if str(p.get("notice") or "").strip():
+        lines.append(f"<b>{escape(str(p['notice']).strip()[:400])}</b>")
+    key = str(p.get("connector") or "")
+    try:
+        from . import connectors   # imported here: connectors imports actions, which imports this module
+        label = connectors._label(connectors.DEFINITIONS.get(key) or {}, key)
+    except Exception:
+        label = key
+    tags = [str(t) for t in (p.get("tags") or []) if str(t).strip()] or [str(p.get("tag") or "")]
+    lines.append(f"{escape(label or 'Connected service')}: {escape(p.get('tool') or '?')} "
+                 f"[{escape(', '.join(t for t in tags if t))}]")
+    args = p.get("args") if isinstance(p.get("args"), dict) else {}
+    if args:
+        shown = "; ".join(f"{k}: {json.dumps(v, ensure_ascii=False, default=str)[:120]}" for k, v in args.items())
+        lines.append(escape(shown[:400]))
+    if p.get("amount_usd") not in (None, ""):
+        try:
+            lines.append(f"Price: ${float(p['amount_usd']):,.2f}")
+        except (TypeError, ValueError):
+            lines.append(f"Price: ${escape(p['amount_usd'])}")
+    if p.get("dry_run") is True:
+        lines.append("Dry run: on. Approving shows what would happen; nothing is bought or changed.")
+    elif p.get("dry_run") is False:
+        lines.append("<b>Dry run: off. Approving makes it real.</b>")
+    return lines
 
 
 def deadline_text(p: dict, now: float | None = None) -> str:
@@ -434,8 +468,11 @@ def build_approval(row: dict) -> tuple[str, list[list[dict]] | None, str]:
         # Phase 2: one button per option (the recommended one marked) and when it resolves on its own, if ever.
         options = [str(o).strip() for o in (p.get("options") or []) if str(o).strip()]
         rec = str(p.get("recommended") or "").strip()
-        lines = [f"<b>{aname}</b> at <b>{cname}</b> asks you to decide (decision #{aid}):",
-                 escape(p.get("question") or row.get("summary") or "")]
+        # Phase 3 and 4: a decision Holdco raised for the board itself (a trust promotion, the monthly portfolio
+        # review) has no agent behind it, so the phone does not say "An agent" asks.
+        who = (f"<b>Holdco</b> asks you to decide about <b>{cname}</b>" if not agent and p.get("origin")
+               else f"<b>{aname}</b> at <b>{cname}</b> asks you to decide")
+        lines = [f"{who} (decision #{aid}):", escape(p.get("question") or row.get("summary") or "")]
         if p.get("context"):
             lines += ["", escape(str(p["context"])[:400])]
         if rec and rec in options:

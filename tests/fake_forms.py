@@ -188,7 +188,7 @@ class FakeForms:
                 "last_7_days": sum(1 for s in rows if int(s["id"][:13]) >= week_ago), "more": len(wanted) > limit}
 
     def start(self):
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
 
     def stop(self):

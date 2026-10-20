@@ -93,6 +93,10 @@ LOCKED_POLICIES = {"spend_money", "irreversible"}  # money never moves, and noth
 # Phase 1: every tool carries one of these. read runs freely; the others map onto approval policies.
 RISK_TAGS = ("read", "write", "publish", "contact", "spend", "irreversible")
 
+# tasks.created_by of the owner's own tasks: the dashboard's form, and (Phase 4) an MCP client, which acts as the
+# owner (mcp_server.CREATED_BY). They run over the daily budgets and are never cancelled for having no goal.
+OWNER_CREATORS = ("owner", "owner (mcp)")
+
 # Phase 1: settings that are secrets live in the vault; the settings table keeps a "vault:<name>" marker.
 SECRET_SETTINGS = ("llm_api_key", "brave_api_key", "telegram_bot_token")
 SECRET_COMPANY_SETTINGS = ("smtp_password", "imap_password", "netlify_token")
