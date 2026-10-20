@@ -16,8 +16,9 @@ context engineering: read `docs/context/context-engineering-progress.md`, then h
 ## Project specifics
 - Holdco: stdlib-only Python 3.10+ app (one process: HTTP server, scheduler, Telegram poller, agent-run threads;
   SQLite; plain-JS dashboard) running AI-operated companies on a local Ollama model. Repo JackL725/Holdco.
-- Built in phases 0, 0.5, 1, 2, 3, 4 (`docs/phases/`). Written against branch `claude/phase-4-scale` (aed2a91),
-  i.e. `main` plus Phase 4 (pull request JackL725/Holdco#8).
+- Built in phases 0, 0.5, 1, 2, 3, 4 (`docs/phases/`), all in `main` since 2026-10-20 (Phase 4 merged as
+  JackL725/Holdco#8). Written against the Phase 4 code (aed2a91) and checked against `main` (9cf8431) the same day:
+  only tests differ.
 
 ## Status
 | Phase | State | Output |
@@ -25,6 +26,7 @@ context engineering: read `docs/context/context-engineering-progress.md`, then h
 | 1 Discovery and plan | done 2026-10-20 | module survey (58 modules, sizes, docstrings), docs inventory, structure below |
 | 2 Core documents | done 2026-10-20 | `project-overview.md`, `architecture/system-design.md`, 6 ADRs, 7 component files, `workflows/development.md` |
 | 3 Integration | done 2026-10-20 | `CLAUDE.md` at the repo root points Claude Code here; `docs/README.md` links this folder; the development workflow says when to update these files |
+| Maintenance | 2026-10-20 | Phase 4 merged: current state updated, docs re-checked against `main` |
 
 ## Files
 ```
@@ -44,7 +46,6 @@ docs/context/
 - When a module gains or loses a responsibility, an extension point changes, or a rule in "AI collaboration notes"
   changes, update the component file and, if needed, `project-overview.md` in the same pull request.
 - A new settled decision that people may want to re-debate gets an ADR (next number: 007).
-- After Phase 4 merges, change "Current state" in `project-overview.md` and the branch line above.
 
 ## Next steps (only if wanted)
 - ADRs for smaller settled choices if they get re-debated (for example: the CEO belt of 24 tools, owner-only budgets,

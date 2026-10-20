@@ -37,10 +37,9 @@ the phase specs in `docs/phases/` are the binding record of what each phase had 
   Feature modules register their own tools (`@tool`) and routes (`@route`) at import. See
   [system-design.md](architecture/system-design.md).
 - **Size.** About 36,000 lines of Python in `holdco/` (58 modules), 4,000 lines of `app.js`, about 920 tests.
-- **Current state (2026-10-20).** Phases 0 to 3 are in `main`. Phase 4 (MCP server, portfolio allocation, six
-  connectors) is pull request JackL725/Holdco#8. Every phase of `docs/plan.md` is built. What remains is the
-  owner's one-week gate (`docs/phases/phase-4-scale.md`) and checking vendor API details marked "verify" in the
-  Phase 4 connectors before real accounts are connected.
+- **Current state (2026-10-20).** Every phase of `docs/plan.md` (0 to 4) is built and in `main`. What remains is
+  the owner's one-week gate (`docs/phases/phase-4-scale.md`) and checking the vendor API details marked "verify" in
+  the Phase 4 connectors before real accounts are connected.
 
 ## Where things are
 
