@@ -9,10 +9,13 @@ GitHub, Plausible and Umami, forms, and n8n; the later tier (ComfyUI, ads, accou
 "not yet available" cards. This is the implementation spec; the choices behind the connectors are in
 [connectors.md](../connectors.md) and the owner's side in [owner-experience.md](../owner-experience.md).
 
-Status: in progress. Branch `claude/phase-4-scale`, based on Phase 3 (pull request JackL725/Holdco#6). Depends on
-Phase 1 (`mcp.py`, `connectors.py`, `vault.py`, `oauth.py`, risk tags), Phase 2 (`brain.py`, `briefs`, decisions,
-`rhythms.py`) and Phase 3 (`trust.py`, taint, scheduler priorities). See [architecture.md](../architecture.md) for
-where the new modules sit and [testing.md](../testing.md) for the fakes.
+Status: built. Branch `claude/phase-4-scale`, based on Phase 3 (in `main`). Checked on the owner's GPU in a sandbox
+with gpt-oss:20b and a fake Porkbun: asked in chat, the CEO found Porkbun with `find_tool`, checked a domain and
+queued its purchase with the price and dry run on the card; over MCP (both generations) `list_inbox` showed the
+request and `decide` approved it as a dry run with the audit row `mcp:<client>`. The week on the phone below is the
+owner's to run. Depends on Phase 1 (`mcp.py`, `connectors.py`, `vault.py`, `oauth.py`, risk tags), Phase 2
+(`brain.py`, `briefs`, decisions, `rhythms.py`) and Phase 3 (`trust.py`, taint, scheduler priorities). See
+[architecture.md](../architecture.md) for where the new modules sit and [testing.md](../testing.md) for the fakes.
 
 Decided at the start of the build, from what Phases 1 to 3 built:
 - Connector modules register through `connectors.MODULES`; the later tier lives in `conn_later.py`. The new fakes
