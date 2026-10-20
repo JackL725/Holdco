@@ -149,9 +149,10 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
 
 
 def decide(approval_id: int, decision: str, payload: dict | None = None, feedback: str = "",
-           answer: str = "", decided_by: str = "owner") -> dict:
+           answer: str = "", decided_by: str = "owner", approved_by: str = "owner") -> dict:
     """The owner approves or rejects a request (or answers a question or a decision). decided_by (Phase 2):
-    owner, telegram or deadline."""
+    owner, telegram, deadline or mcp (Phase 4). approved_by is who the audit row names for a request that runs:
+    "owner", or "mcp:<client name>" when an MCP client decided it (Phase 4)."""
     row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
     if not row:
         raise ValueError("Request not found")
@@ -199,7 +200,7 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
         except Exception as e:
             result, status = str(e), "failed"
         proposer = (db.get_agent(row["agent_id"]) or {}).get("name", "") if row["agent_id"] else ""
-        audit(company["id"], row["action"], proposer, "owner", p, result, approval_id)
+        audit(company["id"], row["action"], proposer, approved_by, p, result, approval_id)
         note = f"Owner APPROVED request #{approval_id} ({label}: {_summary(row['action'], p)}). Outcome: {result}"
     else:
         status, result = "rejected", ""
