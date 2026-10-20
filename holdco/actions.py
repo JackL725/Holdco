@@ -30,6 +30,9 @@ ACTION_LABELS = {
     "connector_call": "Connected service call",
     "decision": "Decision",
 }
+# Who answered a row first, for the refusal a second answer gets (a phone button pressed after Claude Desktop decided
+# the same request through MCP, Phase 4). The dashboard ("owner") needs no words.
+DECIDED_BY_TEXT = {"telegram": " (from the phone)", "mcp": " (through an MCP client)", "deadline": " (by its deadline)"}
 
 
 def _summary(action: str, p: dict) -> str:
@@ -37,7 +40,10 @@ def _summary(action: str, p: dict) -> str:
         return (p.get("question") or "")[:140]
     if action == "connector_call":
         args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
-        return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
+        line = f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
+        # Phase 4: what the owner must know first (Porkbun's register_domain: the price, and that it cannot be
+        # undone) leads, so the phone shows it even when the line is cut
+        return f"{p['notice']} ({line})" if p.get("notice") else line
     if action == "send_email":
         return f"Email to {p.get('to')}: {p.get('subject')}"
     if action == "social_post":
@@ -72,6 +78,10 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    if action == "connector_call":
+        payload, refusal = _prepared(company, payload)   # Phase 4: facts the request card needs (Porkbun's price)
+        if refusal:
+            return refusal
     approver = "policy:auto"   # who let an action run without the owner, for the audit log
     if action not in ("question", "decision"):
         # Phase 3: a session that read outside content asks, and the trust ladder sits in front of the policy.
@@ -149,14 +159,16 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
 
 
 def decide(approval_id: int, decision: str, payload: dict | None = None, feedback: str = "",
-           answer: str = "", decided_by: str = "owner") -> dict:
+           answer: str = "", decided_by: str = "owner", approved_by: str = "owner") -> dict:
     """The owner approves or rejects a request (or answers a question or a decision). decided_by (Phase 2):
-    owner, telegram or deadline."""
+    owner, telegram, deadline or mcp (Phase 4). approved_by is who the audit row names for a request that runs:
+    "owner", or "mcp:<client name>" when an MCP client decided it (Phase 4)."""
     row = db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
     if not row:
         raise ValueError("Request not found")
     if row["status"] != "pending":
-        raise ValueError(f"Request #{approval_id} is already {row['status']}")
+        raise ValueError(f"Request #{approval_id} is already {row['status']}"
+                         f"{DECIDED_BY_TEXT.get(row.get('decided_by') or '', '')}")
     if decision == "approve" and row["action"] not in ("question", "decision") and db.get_settings().get("kill_switch"):
         raise ValueError("The kill switch is on. Turn it off to run approvals.")
     company = db.get_company(row["company_id"])
@@ -192,14 +204,23 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
         status, result = "answered", answer or feedback or "(no answer)"
         note = f"Owner answered question #{approval_id} (\"{p.get('question', '')[:200]}\"): {result}"
     elif decision == "approve":
-        db.update("approvals", approval_id, status="running", payload=json.dumps(p), decided_at=ts, feedback=feedback)
+        # Phase 4 review: the dashboard, the phone and an MCP client can approve the same request at the same moment.
+        # Only the one that moves it from pending to running executes it (a purchase or an email runs once).
+        with db._lock:
+            db.run("UPDATE approvals SET status='running', payload=?, decided_at=?, feedback=? WHERE id=? AND "
+                   "status='pending'", (json.dumps(p), ts, feedback, approval_id))
+            claimed = db.scalar("SELECT changes()")
+        if not claimed:
+            now = db.one("SELECT status, decided_by FROM approvals WHERE id=?", (approval_id,)) or {}
+            raise ValueError(f"Request #{approval_id} is already {now.get('status') or 'decided'}"
+                             f"{DECIDED_BY_TEXT.get(now.get('decided_by') or '', '')}")
         try:
             result = execute(company, row["action"], p, approval_id=approval_id)
             status = "done"
         except Exception as e:
             result, status = str(e), "failed"
         proposer = (db.get_agent(row["agent_id"]) or {}).get("name", "") if row["agent_id"] else ""
-        audit(company["id"], row["action"], proposer, "owner", p, result, approval_id)
+        audit(company["id"], row["action"], proposer, approved_by, p, result, approval_id)
         note = f"Owner APPROVED request #{approval_id} ({label}: {_summary(row['action'], p)}). Outcome: {result}"
     else:
         status, result = "rejected", ""
@@ -210,16 +231,18 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     fields = {"status": status, "result": result, "payload": json.dumps(p), "decided_at": ts, "feedback": feedback,
               "decided_by": decided_by,
               "summary": _summary(row["action"], p) if row["action"] not in ("question", "decision") else row["summary"]}
-    if row["action"] in ("question", "decision"):
+    if row["action"] in ("question", "decision") or status == "rejected":
         # Phase 2: the owner (dashboard or phone) and the scheduler's deadline can answer the same row at the same
-        # moment. Only the first answer counts, so the brain records it and its origin acts on it once.
+        # moment. Only the first answer counts, so the brain records it and its origin acts on it once. Phase 4
+        # review: a rejection likewise never lands on a request an approval is already running.
         with db._lock:
             db.run(f"UPDATE approvals SET {', '.join(f'{k}=?' for k in fields)} WHERE id=? AND status='pending'",
                    [*fields.values(), approval_id])
             claimed = db.scalar("SELECT changes()")
         if not claimed:
-            now = (db.one("SELECT status FROM approvals WHERE id=?", (approval_id,)) or {}).get("status", "decided")
-            raise ValueError(f"Request #{approval_id} is already {now}")
+            now = db.one("SELECT status, decided_by FROM approvals WHERE id=?", (approval_id,)) or {}
+            raise ValueError(f"Request #{approval_id} is already {now.get('status') or 'decided'}"
+                             f"{DECIDED_BY_TEXT.get(now.get('decided_by') or '', '')}")
     else:
         db.update("approvals", approval_id, **fields)
     if row["action"] == "decision":
@@ -270,6 +293,27 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+def _prepared(company: dict, payload: dict) -> tuple[dict, str | None]:
+    """Phase 4: a connector call whose request card needs facts the agent cannot supply asks its definition's
+    prepare_call(inst, company, tool, args) -> dict of payload updates, or None, before it is queued or run.
+    Porkbun's register_domain gets the price Porkbun quotes now (in args, so the executor can refuse a higher one),
+    tags ["spend", "irreversible"] and a notice the card and the phone show. Anything the hook raises refuses the
+    call with its text: nothing that buys is queued without a price. Returns (payload, refusal)."""
+    from . import connectors   # imported here: connectors imports tools, which imports this module
+    d = connectors.DEFINITIONS.get(str(payload.get("connector") or "")) or {}
+    fn = d.get("prepare_call")
+    if not callable(fn):
+        return payload, None
+    inst = connectors.get(payload.get("connector_id"))
+    if not inst:
+        return payload, f"ERROR: the {payload.get('connector')} connector was removed."
+    try:
+        extra = fn(inst, company, str(payload.get("tool") or ""), dict(payload.get("args") or {}))
+    except Exception as e:   # a refusal, or a check that could not run: either way nothing is queued
+        return payload, f"ERROR: {connectors._error_text(e)}"
+    return ({**payload, **extra} if isinstance(extra, dict) and extra else payload), None
 
 
 def _without_reasons(p) -> dict:
@@ -358,7 +402,9 @@ def execute(company: dict, action: str, p: dict, approval_id: int | None = None)
     if action == "social_post":
         return _social(company, p)
     if action == "deploy_site":
-        return _deploy_netlify(company)
+        from . import conn_cloudflare   # Phase 4: Cloudflare Workers when the company's site_provider picks it
+        out = conn_cloudflare.deploy_if_selected(company)
+        return out if out is not None else _deploy_netlify(company)
     if action == "http_post":
         return _http(p)
     if action == "run_code":

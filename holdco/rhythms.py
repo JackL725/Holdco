@@ -21,7 +21,7 @@ import re
 import threading
 from collections import Counter
 
-from . import brain, bus, contracts, db, llm, notify, roles
+from . import brain, bus, config, contracts, db, llm, notify, roles
 from .routing import HTTPError, company_or_404, route, to_int
 from .tools import Ctx, ToolError, S, I, tool  # noqa: F401
 
@@ -31,6 +31,9 @@ WEEKLY_KEY = "ceo:Weekly review"
 MONTHLY_KEY = "ceo:Monthly strategy check"
 RHYTHM_KEYS: set[str] = {MORNING_KEY, *EVENING_KEYS, WEEKLY_KEY, MONTHLY_KEY}
 BRIEF_KINDS = ("daily", "weekly", "monthly")
+# What the briefs API (and the MCP latest_brief tool) can filter by: Phase 4 adds the monthly portfolio review, which
+# portfolio.monthly_review builds in code (company_id NULL); no agent writes one.
+READ_KINDS = BRIEF_KINDS + ("portfolio",)
 KIND_OF = {MORNING_KEY: "", EVENING_KEYS[0]: "daily", EVENING_KEYS[1]: "daily", WEEKLY_KEY: "weekly",
            MONTHLY_KEY: "monthly"}
 BRIEF_LABEL = {"daily": "daily brief", "weekly": "weekly memo", "monthly": "monthly memo"}
@@ -58,7 +61,9 @@ DATA_CAP = 12000              # characters of JSON in the prompt
 OPEN = ("todo", "in_progress", "blocked", "waiting")
 METRIC_NAMES = 40             # newest metric names in a data block
 CANCEL_NOTE = "[Weekly review] Cancelled: serves no goal"
-EXEMPT_CREATORS = ("owner", "routine", "inbox")   # never cancelled for having no goal (inbox: a customer email)
+# Never cancelled for having no goal: the owner's own tasks (an MCP client's included), routines, and inbox (a
+# reply to a customer's email).
+EXEMPT_CREATORS = (*config.OWNER_CREATORS, "routine", "inbox")
 PORTFOLIO_FRESH_HOURS = 20    # every active company has a daily brief this recent: the portfolio brief goes out
 PORTFOLIO_WAIT_HOURS = 2      # or this long after the first company brief of the day, whoever is missing
 
@@ -285,7 +290,8 @@ def weekly_data(company: dict) -> dict:
                 f"({','.join('?' * len(OPEN))}) AND (goal_id IS NULL OR goal_id=0)")
     goalless = db.q(open_sql + f" AND COALESCE(created_by, '') NOT IN ({','.join('?' * len(EXEMPT_CREATORS))})"
                     " AND COALESCE(routine, '')='' ORDER BY id DESC LIMIT 30", (cid, *OPEN, *EXEMPT_CREATORS))
-    owner_goalless = db.q(open_sql + " AND created_by='owner' ORDER BY id DESC LIMIT 20", (cid, *OPEN))
+    owner_goalless = db.q(open_sql + f" AND created_by IN ({','.join('?' * len(config.OWNER_CREATORS))}) "
+                          "ORDER BY id DESC LIMIT 20", (cid, *OPEN, *config.OWNER_CREATORS))
     titles = {g["id"]: g["title"] for g in goals}
     done: dict = {}
     for t in db.q("SELECT id, title, deliverable, goal_id FROM tasks WHERE company_id=? AND status='done' AND "
@@ -824,8 +830,8 @@ def api_briefs(h, m, body):
         params += [cid] if cid else []
     kind = (h.query.get("kind", [""])[0] or "").strip()
     if kind:
-        if kind not in BRIEF_KINDS:
-            raise HTTPError(400, "kind must be daily, weekly or monthly")
+        if kind not in READ_KINDS:
+            raise HTTPError(400, "kind must be daily, weekly, monthly or portfolio")
         sql += " AND kind=?"
         params.append(kind)
     limit = max(1, min(to_int(h.query.get("limit", [20])[0], 20), 100))
@@ -834,11 +840,11 @@ def api_briefs(h, m, body):
 
 @route("GET", "/api/briefs/latest")
 def api_briefs_latest(h, m, body):
-    """The newest brief of each kind for a company (company_id 0: the portfolio)."""
+    """The newest brief of each kind for a company (company_id 0: the portfolio, with its monthly review)."""
     cid = to_int(h.query.get("company_id", [0])[0])
     where = "company_id=?" if cid else "company_id IS NULL"
     out: dict = {"company_id": cid}
-    for kind in BRIEF_KINDS:
+    for kind in (BRIEF_KINDS if cid else READ_KINDS):
         out[kind] = _brief_row(db.one(f"SELECT * FROM briefs WHERE {where} AND kind=? ORDER BY id DESC LIMIT 1",
                                       (cid, kind) if cid else (kind,)))
     return out

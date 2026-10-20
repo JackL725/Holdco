@@ -21,7 +21,10 @@ kinds, mcp {command, args, env | url, headers, classify, allow, blocked} for MCP
 Optional extras this module also reads: health_timeout (seconds, default 15; for a stdio server also how long its
 first start may take), oauth (bool, default true for mcp-http), tag_for_call(tool, args) -> tag or None and
 refuse_call(tool, args) -> str or None (checked by call()); tag_for_call may only raise the map's tag unless
-tag_for_call_lowers is true (Stripe's allowlist of safe writes); check_result(tool, args, text) -> str or None
+tag_for_call_lowers is true (Stripe's allowlist of safe writes); prepare_call(inst, company, tool, args) -> dict of
+payload updates or None (Phase 4: actions.gate asks it before a call that is not read is queued or run, for what the
+request card must show and the executor must check, such as Porkbun's price, amount_usd, dry_run, tags and notice;
+an exception refuses the call with its text); check_result(tool, args, text) -> str or None
 (checked after every MCP result: a text replaces the result with an error, after reset_call (tool, args) has been
 sent); page_of(text) -> url or None with page_query (tool, args) (a call that is not read is tied to the page the
 browser was on when it was asked for, and refused after approval when the page changed);
@@ -30,8 +33,11 @@ returns outside content, such as other sites' pages or people's messages, or a l
 may carry its own "external": True; a session that read such a tool is tainted, see taint.py; the GitHub, forms and
 inbound-mail definitions of Phase 4 mark their reads), launch(inst) -> (command, args) for a
 stdio server's command line, mcp_url(inst) and mcp_headers(inst) for an HTTP server's address and headers,
+kind_for(inst) -> "mcp-stdio" | "mcp-http" for an MCP definition whose instances pick their transport (GitHub),
 active(inst) -> bool with parent and parent_field (the instance only works while its parent's card has that field
-ticked), enabled_by_default (bool, default true), beta (bool), and on fields: secret, hidden (kept off the card,
+ticked), enabled_by_default (bool, default true), beta (bool), available (Phase 4's later tier: False with a reason;
+listed by GET /api/connectors with its reason instead of a form, never saved, checked, polled or offered to agents),
+and on fields: secret, hidden (kept off the card,
 such as api_base; only accepted from the dashboard API while HOLDCO_ALLOW_LOCAL is set, the test switch), type
 "bool" (stored as true or false) and setting (see above).
 
@@ -53,7 +59,9 @@ from . import actions, bus, config, db, roles, tools
 from .routing import HTTPError, route, to_int
 
 # The definition modules. A missing module, one that fails to import, or a None DEFINITION is skipped.
-MODULES = ("conn_stripe", "conn_resend", "conn_playwright", "conn_buffer", "conn_brave")
+MODULES = ("conn_stripe", "conn_resend", "conn_playwright", "conn_buffer", "conn_brave",
+           # Phase 4: domains, the Cloudflare deploy target, GitHub, analytics, forms, n8n and the later tier
+           "conn_porkbun", "conn_cloudflare", "conn_github", "conn_plausible", "conn_forms", "conn_n8n", "conn_later")
 KINDS = ("api", "mcp-stdio", "mcp-http", "builtin")
 MCP_KINDS = ("mcp-stdio", "mcp-http")
 SCOPES = ("global", "company")
@@ -86,6 +94,12 @@ _alerted: dict[int, str] = {}       # instance id -> date (YYYY-MM-DD) of its la
 _checking = False                   # a background health-check pass is running
 _polling = False                    # a background metrics poll is running
 _last_poll: float | None = None     # monotonic time the last metrics poll started
+
+
+def unavailable(d: dict | None) -> bool:
+    """Phase 4's later tier: a definition with available: False. Its card shows the reason instead of a form; it is
+    never saved, health-checked, polled, shown on the Doctor page or offered to find_tool."""
+    return bool(d) and d.get("available", True) is False
 
 
 def policy_for(tag: str) -> str | None:
@@ -214,7 +228,8 @@ def visible(company) -> list[dict]:
     own = {r["key"] for r in rows if r["company_id"] is not None}
     out, seen = [], set()
     for r in rows:
-        if r["key"] not in DEFINITIONS or r["key"] in seen or (r["company_id"] is None and r["key"] in own):
+        if r["key"] not in DEFINITIONS or r["key"] in seen or (r["company_id"] is None and r["key"] in own) \
+                or unavailable(DEFINITIONS[r["key"]]):
             continue
         seen.add(r["key"])
         inst = _inst(r)
@@ -248,8 +263,9 @@ def _inactive_text(d: dict | None) -> str:
 def _active_rows() -> list[dict]:
     """Enabled instances, leaving out those of archived (or deleted) companies, and of Holdco Bench companies (Phase
     3: their scripted connectors are never health-checked, polled or reported to the owner)."""
-    return db.q("SELECT c.* FROM connectors c LEFT JOIN companies co ON co.id=c.company_id WHERE c.enabled=1 AND "
+    rows = db.q("SELECT c.* FROM connectors c LEFT JOIN companies co ON co.id=c.company_id WHERE c.enabled=1 AND "
                 "(c.company_id IS NULL OR co.status NOT IN ('archived', 'bench')) ORDER BY c.id")
+    return [r for r in rows if not unavailable(DEFINITIONS.get(r["key"]))]   # Phase 4: the later tier is ignored
 
 
 def _fields(d: dict | None) -> list[dict]:
@@ -451,12 +467,27 @@ def mcp_url(inst: dict) -> str:
     return str(_mcp_resolver(d, inst)("url") or "")
 
 
+def _kind(d: dict, inst: dict | None) -> str:
+    """The instance's kind. Phase 4: a definition whose instances choose their transport (GitHub: the hosted server or
+    the Docker image) gives kind_for(inst) -> "mcp-stdio" | "mcp-http"; its own kind is then the default and what the
+    setup card shows. Either way the kind stays an MCP one, so every MCP_KINDS check holds for the definition."""
+    kind = d.get("kind") or ""
+    if callable(d.get("kind_for")) and kind in MCP_KINDS:
+        try:
+            chosen = d["kind_for"](inst)
+        except Exception:
+            chosen = None
+        if chosen in MCP_KINDS:
+            return chosen
+    return kind
+
+
 def _mcp_settings(d: dict, inst: dict) -> dict:
     """Keyword arguments for mcp.Client from the definition. The mcp dict gives command, args and env (stdio) or
     url and headers (http); a definition's launch(inst) -> (command, args), mcp_url(inst) and mcp_headers(inst)
     take precedence (Playwright's command override, Stripe's Bearer key)."""
     res = _mcp_resolver(d, inst)
-    if d.get("kind") == "mcp-stdio":
+    if _kind(d, inst) == "mcp-stdio":
         if callable(d.get("launch")):
             command, args = d["launch"](inst)
         else:
@@ -757,7 +788,7 @@ def call(ctx, name: str, args: dict) -> str:
     """A loaded connector tool was called: read runs now, anything else goes through actions.gate."""
     key, sep, tool = name.partition("__")
     d = DEFINITIONS.get(key)
-    if not sep or not tool or not d:
+    if not sep or not tool or not d or unavailable(d):
         return f"ERROR: there's no connected tool called '{name}'. Use find_tool to load one."
     if tool in _blocked(d):
         return f"ERROR: {tool} is not available through Holdco"
@@ -907,6 +938,8 @@ def execute(payload: dict, company: dict | None = None, approval_id: int | None 
     if not d:
         raise RuntimeError(GONE_TEXT)
     label = _label(d, inst["key"])
+    if unavailable(d):
+        raise RuntimeError(f"{label} is not available yet.")
     if not inst["enabled"]:
         raise RuntimeError(f"{label} is turned off.")
     if not _is_active(d, inst):
@@ -1021,6 +1054,8 @@ def check(inst: dict, alert: bool = False, even_off: bool = False) -> tuple[str,
     d = DEFINITIONS.get(inst["key"])
     if not d:
         status, detail = "bad", GONE_TEXT
+    elif unavailable(d):   # Phase 4's later tier: nothing to check yet
+        status, detail = "warn", _clean(f"Not yet available. {d.get('reason') or ''}")
     elif not inst.get("enabled") and not even_off:
         status, detail = "warn", OFF_TEXT
     elif not _is_active(d, inst):
@@ -1122,8 +1157,8 @@ def doctor_rows() -> list[dict]:
         if cid is not None and (cid not in companies or companies[cid]["status"] in ("archived", "bench")):
             continue
         d = DEFINITIONS.get(r["key"])
-        if d and not _is_active(d, _inst(r)):
-            continue   # switched off on its parent's card, like a turned-off instance: nothing to watch
+        if d and (unavailable(d) or not _is_active(d, _inst(r))):
+            continue   # switched off on its parent's card, or not available yet: nothing to watch
         where = companies[cid]["name"] if cid is not None else "global"
         if not d:
             status, detail = "warn", GONE_TEXT
@@ -1273,6 +1308,8 @@ def save(b: dict) -> tuple[dict, tuple[str, str]]:
     if not d:
         raise HTTPError(400, f"Unknown connector '{key}'.")
     label = _label(d, key)
+    if unavailable(d):
+        raise HTTPError(400, f"{label} is not available yet. {d.get('reason') or ''}".strip())
     if existing is None:
         cid = to_int(b.get("company_id")) or None
         if d.get("scope", "company") == "company":
@@ -1450,7 +1487,9 @@ def _card(key: str, d: dict) -> dict:
             "note": str((d.get("setup") or {}).get("note") or ""),
             "enabled_by_default": bool(d.get("enabled_by_default", True)),
             "parent": d.get("parent") or None, "parent_field": d.get("parent_field") or None,
-            "hidden_fields": [f["key"] for f in shown if f["hidden"]]}
+            "hidden_fields": [f["key"] for f in shown if f["hidden"]],
+            # Phase 4's later tier: the card shows the reason instead of a form
+            "available": not unavailable(d), "reason": str(d.get("reason") or "") if unavailable(d) else ""}
 
 
 def _latest_metrics(inst: dict, company_id: int | None = None) -> list[dict]:
@@ -1478,7 +1517,7 @@ def public(inst: dict, company_id: int | None = None) -> dict:
     company = db.get_company(inst["company_id"]) if inst.get("company_id") is not None else None
     oauth = bool(d.get("oauth", d.get("kind") == "mcp-http"))
     return {"id": inst["id"], "company_id": inst.get("company_id"),
-            "company_name": company["name"] if company else None, "key": inst["key"], "label": _label(d, inst["key"]), "kind": d.get("kind") or "",
+            "company_name": company["name"] if company else None, "key": inst["key"], "label": _label(d, inst["key"]), "kind": _kind(d, inst),
             "enabled": bool(inst.get("enabled")), "config": cfg, "status": inst.get("status") or "",
             "detail": inst.get("detail") or "", "last_check": inst.get("last_check"),
             "created_at": inst.get("created_at"), "mode": _mode(inst),

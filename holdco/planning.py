@@ -64,6 +64,10 @@ def _age(created_at: str | None) -> str:
 # =============================================================== 3.1 one open question per topic
 
 MAX_PENDING_QUESTIONS = 3      # agent questions waiting per company; a fourth is refused
+# Decisions Holdco raises for the board itself, with no agent asking (Phase 3's trust promotions, Phase 4's monthly
+# portfolio review): they wait on the owner like the team's, but they neither count toward the team's cap nor take
+# in a team question as its duplicate (a promotion or a scale-or-hold answer tells an agent nothing).
+BOARD_ORIGINS = ("trust", "portfolio")
 MAX_OPTIONS = 6
 CONTEXT_CAP = 1500
 OVERLAP_THRESHOLD = 0.5        # Jaccard similarity of content words that counts as the same question
@@ -172,10 +176,17 @@ def _pending(company_id: int) -> list[dict]:
     return rows
 
 
+def board_decision(p) -> bool:
+    """Is this pending row's payload a decision Holdco raised for the board (BOARD_ORIGINS), not a team's ask?"""
+    origin = p.get("origin") if isinstance(p, dict) else None
+    return isinstance(origin, dict) and origin.get("kind") in BOARD_ORIGINS
+
+
 def pending_agent_questions(company_id: int) -> list[dict]:
-    """The team's questions and decisions (Phase 2) waiting on the owner; watchdog escalations do not count. At
-    most MAX_PENDING_QUESTIONS of them may wait at once."""
-    return [r for r in _pending(company_id) if r["action"] in ("question", "decision") and not r["p"].get("pattern")]
+    """The team's questions and decisions (Phase 2) waiting on the owner; watchdog escalations and the board's own
+    decisions (BOARD_ORIGINS) do not count. At most MAX_PENDING_QUESTIONS of them may wait at once."""
+    return [r for r in _pending(company_id) if r["action"] in ("question", "decision") and not r["p"].get("pattern")
+            and not board_decision(r["p"])]
 
 
 def cap_refusal(mine: list[dict]) -> str:
@@ -200,7 +211,7 @@ def _same_topic(shared: list[str], mine: set, their_text: str) -> bool:
 def find_duplicate(company_id: int, question: str, topics: list[str]) -> dict | None:
     """The pending question or request that already covers this question, as {"id", "reason", "label",
     "text"}, or None. Topics are checked first, then pending requests of the same kind, then word overlap."""
-    rows = _pending(company_id)
+    rows = [r for r in _pending(company_id) if not board_decision(r["p"])]   # Phase 4: never the board's own
     questions = [r for r in rows if r["action"] in ("question", "decision")]   # Phase 2: decisions too
     wanted = set(topics)
     mine = content_words(question)

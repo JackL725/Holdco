@@ -6,7 +6,9 @@ security checks and deletion; Phase 1 adds connectors and the vault, the Stripe 
 agent, opened by browser_check, a test purchase polled in as revenue), Resend and Buffer behind approvals, and an
 OAuth sign-in to an MCP server. The outside services are fakes on 127.0.0.1. Phase 2 adds founding that writes the
 company brain, the evening brief and the weekly review on connector numbers (in a second Holdco at a local 19:00),
-a decision in the inbox, and a task that waits for the one it depends on.
+a decision in the inbox, and a task that waits for the one it depends on. Phase 4 adds the Portfolio scorecard, an
+MCP client that creates a task and decides a request over /mcp, and the monthly portfolio review answered from the
+phone.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from tests.fake_resend import FakeResend  # noqa: E402
 from tests.fake_stripe import FakeStripe  # noqa: E402
 from tests.fake_telegram import FakeTelegram  # noqa: E402
 from tests.helpers import HoldcoProcess, free_port, wait_for  # noqa: E402
+from tests.mcp_client import http_client, post  # noqa: E402
 
 MASK = "\u2022" * 8
 STRIPE_KEY = "sk_test_e2e" + secrets.token_hex(10)
@@ -53,7 +56,12 @@ class EndToEnd(unittest.TestCase):
             "HOLDCO_TEST_MCP": cls.mcp.mcp_url,        # adds the test-only "fakemcp" connector (test_29)
         }).start()
         cls.api = cls.app.client
-        cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "max_concurrent_runs": 2})
+        cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "max_concurrent_runs": 2, **cls.search()})
+
+    @classmethod
+    def search(cls) -> dict:
+        """Settings that send web_search to the fake model server's SearXNG stand-in, never the public internet."""
+        return {"search_provider": "searxng", "searxng_url": cls.model.url}
 
     @classmethod
     def tearDownClass(cls):
@@ -117,6 +125,7 @@ class EndToEnd(unittest.TestCase):
         info = self.api.get(f"/api/companies/{cid}")
         self.assertEqual(info["company"]["name"], "PawPlan")
         self.assertIn("One-liner", info["company"]["charter"])
+        self.assertIn("dog meal plan subscription market", self.model.searches)   # research searched the fake
         # the scheduler hands the founding tasks to the team
         wait_for(lambda: sum(t["status"] == "done" for t in self.tasks(cid)) >= 5, 60, what="first tasks done")
         wait_for(lambda: len(self.pending(cid)) >= 5, 30, what="approval requests")
@@ -183,10 +192,13 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any("Not finished yet" in r for r in tool_results), tool_results)
 
     def test_08_recurring_duties(self):
-        db = sqlite3.connect(str(Path(self.app.data_dir) / "holdco.db"))
-        db.execute("UPDATE companies SET created_at='2020-01-01T00:00:00Z' WHERE id=?", (self.cid,))
-        db.commit()
-        db.close()
+        # Eight days old: the weekly duties are due. Not 30 (Phase 4): the monthly portfolio review would start for a
+        # company that old, and test_40 forces that review itself. Put back afterwards.
+        [before] = self.sql("SELECT created_at FROM companies WHERE id=?", (self.cid,))
+        self.addCleanup(self.sql, "UPDATE companies SET created_at=? WHERE id=?", (before["created_at"], self.cid),
+                        write=True)
+        self.sql("UPDATE companies SET created_at=? WHERE id=?",
+                 (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 86400)), self.cid), write=True)
         wait_for(lambda: {t["routine"] for t in self.tasks(self.cid) if t["routine"]} >=
                  {"ceo:Morning plan", "qa:Daily review", "qa:Weekly site audit", "research:Competitor watch"},
                  30, what="recurring duties")
@@ -783,7 +795,7 @@ class EndToEnd(unittest.TestCase):
 
     def _rhythms_and_briefs(self, app):
         api = app.client
-        api.put("/api/settings", {"llm_base_url": self.model.url, "max_concurrent_runs": 2})
+        api.put("/api/settings", {"llm_base_url": self.model.url, "max_concurrent_runs": 2, **self.search()})
         cid = api.post("/api/companies", {"idea": "Personalised weekly meal plans for dog owners",
                                           "name": "Evening Paws", "template": "minimal"})["company"]["id"]
         wait_for(lambda: api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 120, what="founding")
@@ -1060,6 +1072,150 @@ class EndToEnd(unittest.TestCase):
         unchanged = next(r for r in self.api.get(f"/api/companies/{cid}/trust")["actions"]
                          if r["action"] == "social_post")
         self.assertEqual((unchanged["level"], unchanged["cap_per_day"]), (1, 3))
+
+    # ---------------------------------------------------------------- phase 4: scale
+    SCORECARD = ("goal_progress", "revenue_30d", "mrr", "gpu_hours_week", "money_spent_30d", "days_since_result",
+                 "age_days", "score", "share")
+
+    def test_38_portfolio_api(self):
+        r = self.api.get("/api/portfolio")
+        self.assertEqual((r["allocation_mode"], r["weights"]),
+                         ("weighted", {"progress": 0.4, "traction": 0.4, "freshness": 0.2}))
+        rows = {row["id"]: row for row in r["scorecard"]}
+        row = rows[self.kid]   # the company founded in test_30 (PawPlan is paused since then)
+        for key in self.SCORECARD:
+            self.assertIn(key, row)
+        self.assertEqual((row["name"], row["status"], row["goals"]), ("Kibble Club", "active", 2))
+        self.assertGreaterEqual(row["score"], 0.5)   # younger than 14 days: the seed period's floor
+        self.assertEqual(row["share"], 1.0)          # the only active company has the whole GPU
+        self.assertEqual(row["money_spent_30d"], 0.0)   # no purchase was approved for it
+        self.assertIsInstance(row["gpu_hours_week"], float)
+        self.assertEqual((rows[self.cid]["status"], rows[self.cid]["share"]), ("paused", 0.0))
+        self.assertEqual([x["id"] for x in r["scorecard"]],
+                         [x["id"] for x in sorted(r["scorecard"], key=lambda x: (-x["score"], x["id"]))])
+        self.assertIsNone(r["latest_review"])        # no monthly review yet (test_40 forces one)
+        # The briefs API filters by the portfolio review's kind too; there is none yet.
+        self.assertEqual(self.api.get("/api/briefs?company_id=0&kind=portfolio")["briefs"], [])
+        self.assertIn("portfolio", self.api.get("/api/briefs/latest?company_id=0"))
+        # The Portfolio page's assets load.
+        status, body, _ = self.api.raw("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"/static/app.js", body)
+        status, js, _ = self.api.raw("GET", "/static/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Portfolio", js)
+        self.assertEqual(self.api.raw("GET", "/static/style.css")[0], 200)
+
+    def test_39_mcp_endpoint(self):
+        cid = self.kid
+        client = http_client(self.app.port, client_name="e2e-desktop")
+        client.connect()
+        self.addCleanup(client.close)
+        self.assertEqual(sorted(t["name"] for t in client.list_tools()),
+                         ["create_task", "decide", "doctor", "get_company_brain", "get_metrics", "latest_brief",
+                          "list_companies", "list_inbox"])
+        # GET is refused, and a browser page from another site cannot reach the endpoint
+        self.assertEqual(post(self.app.port, None, method="GET")[0], 405)
+        status, _, reply = post(self.app.port, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                                headers={"Origin": "https://evil.example"})
+        self.assertEqual((status, reply["error"]["code"]), (403, -32600))
+
+        # create_task: the scheduler hands the task to the fake model like any other
+        echo = self.agent(cid, "marketing")
+        out = client.call_tool("create_task", {"company_id": cid, "title": "Write the launch post from Claude",
+                                               "assign_to": "marketing", "priority": 1})
+        self.assertFalse(out.get("isError"), out)
+        task = out["structuredContent"]["task"]
+        self.assertEqual((task["created_by"], task["agent_id"], task["status"]), ("owner (mcp)", echo["id"], "todo"))
+        wait_for(lambda: [r for r in self.api.get(f"/api/companies/{cid}/runs")["runs"]
+                          if r["task_id"] == task["id"] and r["status"] != "running"],
+                 120, what="the scheduler to dispatch the task an MCP client created")
+        first = next(m for m in self.last_transcript(cid, echo["id"], task["id"]) if m["role"] == "user")
+        self.assertIn("Write the launch post from Claude", first["content"])
+
+        # list_inbox shows the pending requests with why the owner is asked; decide approves one as the owner
+        def social_request():
+            inbox = client.call_tool("list_inbox", {"company_id": cid})["structuredContent"]["inbox"]
+            return next((i for i in inbox if i["action"] == "social_post"), None)
+        item = wait_for(social_request, 60, what="a pending post in the MCP inbox")
+        self.assertEqual((item["kind"], item["tag"], item["company"]), ("request", "publish", "Kibble Club"))
+        self.assertIn("why_asked", item)
+        done = client.call_tool("decide", {"approval_id": item["id"], "decision": "approve"})
+        self.assertFalse(done.get("isError"), done)
+        approval = done["structuredContent"]["approval"]
+        self.assertEqual((approval["status"], approval["decided_by"]), ("done", "mcp"))
+        self.assertEqual(done["structuredContent"]["approved_by"], "mcp:e2e-desktop")
+        decided = next(a for a in self.api.get("/api/approvals?status=decided")["approvals"] if a["id"] == item["id"])
+        self.assertEqual((decided["status"], decided["decided_by"]), ("done", "mcp"))
+        [audit] = [r for r in self.api.get(f"/api/audit?company_id={cid}&limit=50")["audit"]
+                   if r["approval_id"] == item["id"]]
+        self.assertEqual((audit["action"], audit["approved_by"]), ("social_post", "mcp:e2e-desktop"))
+        # A second answer is refused, and says who answered first
+        again = client.call_tool("decide", {"approval_id": item["id"], "decision": "reject"})
+        self.assertTrue(again["isError"])
+        self.assertIn("(through an MCP client)", again["content"][0]["text"])
+
+    def test_40_monthly_review_on_phone(self):
+        cid = self.kid
+        fake = FakeTelegram().start()
+
+        def phone_off():
+            self.api.put("/api/settings", {"telegram_bot_token": "", "telegram_chat_id": "",
+                                           "telegram_api_base": "https://api.telegram.org",
+                                           "notify_level": "important"})
+            time.sleep(2)   # the poller sees the change on its next loop and exits before the fake goes away
+            fake.stop()
+        self.addCleanup(phone_off)
+        self.api.put("/api/settings", {"telegram_bot_token": fake.token, "telegram_chat_id": str(fake.chat_id),
+                                       "telegram_api_base": fake.url, "notify_level": "all"})
+        # Force the review: the only active company is 31 days old (UTC, as the database keeps it).
+        [before] = self.sql("SELECT created_at FROM companies WHERE id=?", (cid,))
+        self.addCleanup(self.sql, "UPDATE companies SET created_at=? WHERE id=?", (before["created_at"], cid),
+                        write=True)
+        self.addCleanup(self.api.patch, f"/api/companies/{cid}", {"settings": {"allocation_boost_until": ""}})
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 31 * 86400))
+        self.sql("UPDATE companies SET created_at=? WHERE id=?", (old, cid), write=True)
+
+        def decisions_sent():   # the review's decisions, with buttons (a weekly memo may name them too)
+            return [m for m in fake.sent if "scale, hold or shut down?" in m.get("text", "")
+                    and (m.get("reply_markup") or {}).get("inline_keyboard")]
+
+        def review_messages():
+            asks = decisions_sent()
+            briefs = [m for m in fake.sent if "Holdco monthly portfolio review" in m.get("text", "")]
+            return (asks, briefs) if asks and briefs else None
+        asks, briefs = wait_for(review_messages, 60, what="the monthly review on the phone")
+        time.sleep(2)   # a few more ticks: the review is made once, and nothing more arrives for it
+        asks = decisions_sent()
+        self.assertEqual(len(asks), 1, [m["text"] for m in asks])   # one per active company; paused PawPlan none
+        self.assertEqual(len([m for m in fake.sent if "Holdco monthly portfolio review" in m.get("text", "")]), 1)
+        self.assertIn("Kibble Club", briefs[0]["text"])
+        m = asks[0]
+        self.assertIn("<b>Holdco</b> asks you to decide about <b>Kibble Club</b>", m["text"])
+        self.assertIn("Kibble Club: scale, hold or shut down?", m["text"])
+        self.assertIn("Recommended: Hold", m["text"])   # no goal progress, revenue or result in 31 days
+        buttons = [b for row in m["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual([b["text"] for b in buttons],
+                         ["Scale (more GPU share for 30 days)", "✓ Hold", "Shut down (pause the company)"])
+        aid = int(buttons[0]["callback_data"].split(":")[1])
+        review = self.api.get("/api/portfolio")["latest_review"]
+        self.assertEqual([d["id"] for d in review["decisions"]], [aid])
+        self.assertEqual((review["decisions"][0]["status"], review["decisions"][0]["reversible"]), ("pending", True))
+
+        # Pressing Scale on the phone gives the company 1.5 times its GPU share for 30 days.
+        fake.push_callback(buttons[0]["callback_data"], message_id=m["message_id"])
+        wait_for(lambda: any(a["id"] == aid and a["status"] == "answered"
+                             for a in self.api.get("/api/approvals?status=decided")["approvals"]),
+                 60, what="the Scale button to answer the review's decision")
+        decided = next(a for a in self.api.get("/api/approvals?status=decided")["approvals"] if a["id"] == aid)
+        self.assertEqual((decided["result"], decided["decided_by"]), ("Scale (more GPU share for 30 days)", "telegram"))
+        until = self.api.get(f"/api/companies/{cid}")["company"]["settings"]["allocation_boost_until"]
+        days = (calendar.timegm(time.strptime(until, "%Y-%m-%dT%H:%M:%SZ")) - time.time()) / 86400
+        self.assertTrue(29.9 <= days <= 30.1, until)
+        row = next(x for x in self.api.get("/api/portfolio")["scorecard"] if x["id"] == cid)
+        self.assertEqual(row["boost_until"], until)
+        wait_for(lambda: fake.answered and any(e["method"] == "editMessageText" for e in fake.edits), 10,
+                 what="callback answered and message edited")
 
 
 if __name__ == "__main__":

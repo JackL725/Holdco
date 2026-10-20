@@ -55,6 +55,8 @@ DEFAULT_SETTINGS: dict = {
     "pinned_context": [],             # files under data/context/ included in every prompt ("always include")
     # Verify (Phase 3)
     "small_model": "",                # optional small model for triage, summaries and classification; blank = default
+    # Scale (Phase 4)
+    "allocation_mode": "weighted",    # weighted: each company's GPU share follows its score; equal: Phase 3 order
 }
 
 # What happens when an agent tries an outbound action.
@@ -91,6 +93,10 @@ LOCKED_POLICIES = {"spend_money", "irreversible"}  # money never moves, and noth
 # Phase 1: every tool carries one of these. read runs freely; the others map onto approval policies.
 RISK_TAGS = ("read", "write", "publish", "contact", "spend", "irreversible")
 
+# tasks.created_by of the owner's own tasks: the dashboard's form, and (Phase 4) an MCP client, which acts as the
+# owner (mcp_server.CREATED_BY). They run over the daily budgets and are never cancelled for having no goal.
+OWNER_CREATORS = ("owner", "owner (mcp)")
+
 # Phase 1: settings that are secrets live in the vault; the settings table keeps a "vault:<name>" marker.
 SECRET_SETTINGS = ("llm_api_key", "brave_api_key", "telegram_bot_token")
 SECRET_COMPANY_SETTINGS = ("smtp_password", "imap_password", "netlify_token")
@@ -117,6 +123,8 @@ DEFAULT_COMPANY_SETTINGS: dict = {
     "founding_stage": "",        # research | charter | critic | plan while founding (staged founding)
     # Phase 2 budgets
     "quiet_hours": "23:00-07:00",     # Phase 3: low-value research runs in this local window
+    "site_provider": "auto",          # Phase 4: auto (Cloudflare when connected, else Netlify), netlify or cloudflare
+    "allocation_boost_until": "",     # Phase 4: "Scale" in the monthly review: a bigger GPU share until this date
     "gpu_hours_per_day": 6,      # model time per day; over it the company gets no dispatch or cycles until tomorrow
     "steps_per_task": 0,         # tool calls per task attempt; 0 = the global max_steps_per_run
     "posts_per_week": 10,        # social posts approved or pending in the last 7 days
