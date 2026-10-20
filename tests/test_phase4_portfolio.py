@@ -370,6 +370,7 @@ class TestPortfolio(Base):
         self.assertEqual(self.tick(sched, 1), [starved["id"]])
         # One query per tick: nothing but the runs are read once the shares are known.
         queue, settings = scheduler._queue(), db.get_settings()
+        portfolio.order(queue, settings)   # the shares are known (cached) before the counted call, as on a real tick
         queries: list[str] = []
         real_q = db.q
         with mock.patch.object(db, "q", lambda sql, params=(): queries.append(sql) or real_q(sql, params)):
