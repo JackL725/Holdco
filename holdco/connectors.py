@@ -30,6 +30,7 @@ returns outside content, such as other sites' pages or people's messages, or a l
 may carry its own "external": True; a session that read such a tool is tainted, see taint.py; the GitHub, forms and
 inbound-mail definitions of Phase 4 mark their reads), launch(inst) -> (command, args) for a
 stdio server's command line, mcp_url(inst) and mcp_headers(inst) for an HTTP server's address and headers,
+kind_for(inst) -> "mcp-stdio" | "mcp-http" for an MCP definition whose instances pick their transport (GitHub),
 active(inst) -> bool with parent and parent_field (the instance only works while its parent's card has that field
 ticked), enabled_by_default (bool, default true), beta (bool), and on fields: secret, hidden (kept off the card,
 such as api_base; only accepted from the dashboard API while HOLDCO_ALLOW_LOCAL is set, the test switch), type
@@ -458,7 +459,10 @@ def _mcp_settings(d: dict, inst: dict) -> dict:
     url and headers (http); a definition's launch(inst) -> (command, args), mcp_url(inst) and mcp_headers(inst)
     take precedence (Playwright's command override, Stripe's Bearer key)."""
     res = _mcp_resolver(d, inst)
-    if d.get("kind") == "mcp-stdio":
+    # Phase 4: a definition whose instances choose their transport (GitHub: the hosted server or the Docker image)
+    # gives kind_for(inst) -> "mcp-stdio" | "mcp-http"; its kind is then the default and what the card shows.
+    kind = d["kind_for"](inst) if callable(d.get("kind_for")) else d.get("kind")
+    if kind == "mcp-stdio":
         if callable(d.get("launch")):
             command, args = d["launch"](inst)
         else:
