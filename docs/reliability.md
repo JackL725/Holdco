@@ -31,7 +31,7 @@ fake services the Bench runs against.
 records the run in `runs` (status, summary, transcript, tokens, steps) and updates the task.
 
 The model is `agents.model`, else `ceo_model` for the CEO, else `default_model`. Concurrency is one background
-semaphore sized by `max_concurrent_runs` (default 2) plus a separate chat semaphore of size 1, so a chat never
+semaphore sized by `max_concurrent_runs` (default 1) plus a separate chat semaphore of size 1, so a chat never
 waits behind background work inside Holdco (`llm.background_slot`, `llm.chat_slot`). The semaphore is held for
 the whole session, not per step.
 

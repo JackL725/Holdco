@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["HOLDCO_DATA"] = tempfile.mkdtemp(prefix="holdco-unit-")
 
-from holdco import actions, agents, checks, db, llm, presets, roles, tools, web, workspace  # noqa: E402
+from holdco import actions, agents, checks, config, db, llm, presets, roles, tools, web, workspace  # noqa: E402
 
 db.init()
 
@@ -133,6 +133,9 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(llm.sampling_for("qwen3:32b", "precise", s)["top_k"], 20)
         self.assertEqual(llm.sampling_for("qwen3:30b-a3b-instruct-2507", "precise", s)["temperature"], 0.7)
         self.assertEqual(llm.sampling_for("llama3.3", "precise", s), {"temperature": 0.3})
+        # the default model (the owner's Huihui Qwen3.8 27B) gets Qwen3's recommended thinking-mode sampling
+        self.assertEqual(llm.sampling_for(config.DEFAULT_SETTINGS["default_model"], "precise", {"sampling": "auto"}),
+                         {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
         self.assertEqual(llm.sampling_for("gpt-oss:20b", "creative", {**s, "sampling": "manual", "temperature": 0.2}),
                          {"temperature": 0.2})
 

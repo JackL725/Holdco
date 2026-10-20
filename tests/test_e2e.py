@@ -53,7 +53,9 @@ class EndToEnd(unittest.TestCase):
             "HOLDCO_TEST_MCP": cls.mcp.mcp_url,        # adds the test-only "fakemcp" connector (test_29)
         }).start()
         cls.api = cls.app.client
-        cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "max_concurrent_runs": 2})
+        # the fake model server answers as gpt-oss:20b; the default model is the owner's Qwen, which it does not list
+        cls.api.put("/api/settings", {"llm_base_url": cls.model.url, "default_model": "gpt-oss:20b",
+                                      "max_concurrent_runs": 2})
 
     @classmethod
     def tearDownClass(cls):
@@ -783,7 +785,8 @@ class EndToEnd(unittest.TestCase):
 
     def _rhythms_and_briefs(self, app):
         api = app.client
-        api.put("/api/settings", {"llm_base_url": self.model.url, "max_concurrent_runs": 2})
+        api.put("/api/settings", {"llm_base_url": self.model.url, "default_model": "gpt-oss:20b",
+                                  "max_concurrent_runs": 2})
         cid = api.post("/api/companies", {"idea": "Personalised weekly meal plans for dog owners",
                                           "name": "Evening Paws", "template": "minimal"})["company"]["id"]
         wait_for(lambda: api.get(f"/api/companies/{cid}")["company"]["status"] == "active", 120, what="founding")

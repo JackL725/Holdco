@@ -1874,7 +1874,7 @@ function Bench(arg) {
       models = m;
       const agentModel = settings ? String(settings.settings.default_model || '') : '';
       const pick = models.length ? `<select id="bench-model" aria-label="Model to test">${models.map((x) => `<option value="${esc(x)}" ${x === agentModel ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`
-        : `<input type="text" id="bench-model" aria-label="Model to test" placeholder="gpt-oss:20b" value="${esc(agentModel)}">`;
+        : `<input type="text" id="bench-model" aria-label="Model to test" placeholder="hf.co/bartowski/huihui-ai_Huihui-Qwen3.8-27B-abliterated-GGUF:Q6_K_L" value="${esc(agentModel)}">`;
       el.innerHTML = `<div class="page-head"><div><h1>Model scores</h1><p class="sub">Holdco Bench gives a model scripted jobs (founding a company, research, emails, approvals, small sorting jobs) against pretend customers and services, then scores how it did. Test each model you have and pick by score.</p></div>
           <div class="actions bench-new">${pick}<button class="btn primary" data-act="bench-new">Test this model</button></div></div>
         <div id="bench-live"></div>

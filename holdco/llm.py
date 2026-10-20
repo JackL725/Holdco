@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from . import db
+from . import config, db
 
 # Local model servers must never go through a system proxy.
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -147,7 +147,7 @@ def tool_ping(model: str | None = None, settings: dict | None = None) -> tuple[b
     if t.tool_calls:
         return True, f"{model} is working and can call tools ({t.mode} mode)."
     return True, (f"{model} replied, but didn't call the test tool. Agents may struggle; "
-                  "a model with stronger tool use (e.g. gpt-oss:20b) is recommended.")
+                  f"a model with stronger tool use (e.g. {config.DEFAULT_SETTINGS['default_model']}) is recommended.")
 
 
 # ---------------- format conversion ----------------

@@ -96,7 +96,7 @@ No cloud AI, no API bills, no pip installs.
   against stand-in services (found a company, fix a page that fails QA, write a compliant cold email, resist a
   prompt injection, recover from a tool error, plan top down...) and shows the pass rate, how many tool calls were
   valid, tokens per second and steps per scenario. Test two models and the *Model scores* page puts them side by
-  side, so you pick by score. Also from the command line: `python -m holdco.bench --model gpt-oss:20b`.
+  side, so you pick by score. Also from the command line: `python -m holdco.bench --model hf.co/bartowski/huihui-ai_Huihui-Qwen3.8-27B-abliterated-GGUF:Q6_K_L`.
 - **Work is checked before it counts as done.** A page must pass a browser check (or a labelled static check when
   the Playwright browser isn't connected), code must pass its tests, a payment link must exist in Stripe, research
   may cite only pages the agent actually read, and every email must pass the outreach rules. A task that fails is
@@ -127,12 +127,14 @@ No cloud AI, no API bills, no pip installs.
 ### 2. Download a model
 
 ```
-ollama pull gpt-oss:20b
+ollama pull hf.co/bartowski/huihui-ai_Huihui-Qwen3.8-27B-abliterated-GGUF:Q6_K_L
 ```
 
-`gpt-oss:20b` is the default because it produces the most reliable tool calls among open models that fit
-comfortably on a 32 GB card, and tool-call reliability matters more than raw benchmark scores in an agent
-loop. You can switch models any time in **Settings**, which lists everything you have installed. Check
+The default is the Huihui Qwen3.8 27B (Q6_K_L, about 22 GB). On Holdco Bench it scored 24 of 33 with 100% valid
+tool calls, against 22 to 29 for `gpt-oss:20b`, but it runs at about 48 tokens per second on an RTX 5090 where
+gpt-oss runs at about 200, so agents take roughly four times as long per reply. If you'd rather have speed,
+`ollama pull gpt-oss:20b` and pick it in **Settings**. This model has had its refusals removed: see
+[docs/safety.md](docs/safety.md#the-abliterated-model) for why the guardrails don't depend on it. You can switch models any time in **Settings**, which lists everything you have installed. Check
 <https://ollama.com/library> for newer tool-capable models (look for the *tools* tag).
 
 ### 3. Start Holdco
@@ -202,19 +204,20 @@ Let two agents work at the same time by telling Ollama to serve parallel request
 
 - **Windows:** *System Properties → Environment Variables*, add user variables, then quit and reopen Ollama
   from the tray:
-  - `OLLAMA_NUM_PARALLEL` = `2`
+  - `OLLAMA_NUM_PARALLEL` = `1`
   - `OLLAMA_KEEP_ALIVE` = `30m`
   - `OLLAMA_FLASH_ATTENTION` = `1` (smaller memory use for long contexts)
 - **Linux:** `sudo systemctl edit ollama` and add:
   ```
   [Service]
-  Environment="OLLAMA_NUM_PARALLEL=2" "OLLAMA_KEEP_ALIVE=30m" "OLLAMA_FLASH_ATTENTION=1"
+  Environment="OLLAMA_NUM_PARALLEL=1" "OLLAMA_KEEP_ALIVE=30m" "OLLAMA_FLASH_ATTENTION=1"
   ```
   then `sudo systemctl restart ollama`.
 
-With `gpt-oss:20b` and the default 32k context, two parallel agents fit with room to spare. If you try a
-bigger model and see slowdowns, run `ollama ps`: anything not 100% on GPU is spilling into system RAM,
-so lower *Agents working at once* or the context window.
+With the default 27B model and a 32k context, one agent at a time fits in 32 GB of VRAM; a second would push the
+model partly into system RAM. With the smaller `gpt-oss:20b`, two parallel agents fit with room to spare: set
+`OLLAMA_NUM_PARALLEL` and *Agents working at once* to 2. If you see slowdowns, run `ollama ps`: anything not
+100% on GPU is spilling into system RAM, so lower *Agents working at once* or the context window.
 
 To choose between models, press **Test this model** in Settings for each one and compare them on the *Model
 scores* page. Settings also shows *Context use*: when the 95th percentile gets near the window, raise the context

@@ -23,13 +23,16 @@ DEFAULT_SETTINGS: dict = {
     "llm_backend": "ollama",
     "llm_base_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
-    "default_model": "gpt-oss:20b",   # agent workhorse: reliable tool calls, ~14 GB
+    # Agent workhorse: the owner's Qwen 27B (24 of 33 on the Bench, 100% valid tool calls, ~22 GB, ~48 tokens/s
+    # on an RTX 5090). gpt-oss:20b is ~4x faster and scores 22 to 29; switch back in Settings if speed matters more.
+    "default_model": "hf.co/bartowski/huihui-ai_Huihui-Qwen3.8-27B-abliterated-GGUF:Q6_K_L",
     "ceo_model": "",                  # blank = use default_model
     "num_ctx": 32768,                 # context window per request (Ollama backend)
     "sampling": "auto",               # auto = each model maker's recommended settings; manual = use temperature
     "temperature": 0.4,
     "keep_alive": "30m",              # how long Ollama keeps the model loaded on the GPU
-    "max_concurrent_runs": 2,         # agents working at the same time (match OLLAMA_NUM_PARALLEL)
+    "max_concurrent_runs": 1,         # agents working at the same time (match OLLAMA_NUM_PARALLEL); a 27B model and
+                                      # two 32k contexts do not fit in 32 GB of VRAM, so the default runs one at a time
     "max_steps_per_run": 14,          # tool calls per work session
     "request_timeout": 600,           # seconds to wait for one model reply
     "tool_mode": "auto",              # auto | native | json  (json = prompt-based tool calls)

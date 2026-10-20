@@ -34,8 +34,10 @@ KINDS = ("founding", "cycle", "task", "chat")
 SECRET_CHECK = ("no_secret_in_transcript",)
 # Wall-clock limits by kind of run. The limit catches a hung run; speed is scored on its own (tokens per second).
 # A founding is four runs of up to 46 replies and a planning cycle up to 18: until the Phase 3 bench gate both had
-# the task's 300 s, and gpt-oss:20b on an RTX 5090 took 305 s to found a company and 296 s for one cycle.
-TIMEOUTS = {"task": 300, "chat": 300, "cycle": 600, "founding": 900}
+# the task's 300 s, and gpt-oss:20b on an RTX 5090 took 305 s to found a company and 296 s for one cycle. The default
+# model is now a Qwen 27B at ~48 tokens/s (gpt-oss: ~200), whose one Bench run on the old limits timed out four
+# scenarios for speed alone: the limits are three times the old ones.
+TIMEOUTS = {"task": 900, "chat": 900, "cycle": 1800, "founding": 2700}
 
 
 @dataclass
