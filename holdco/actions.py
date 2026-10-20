@@ -37,7 +37,10 @@ def _summary(action: str, p: dict) -> str:
         return (p.get("question") or "")[:140]
     if action == "connector_call":
         args = json.dumps(p.get("args") or {}, ensure_ascii=False, default=str)
-        return f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
+        line = f"{p.get('connector')} {p.get('tool')}({args[:90]}) [{p.get('tag')}]"
+        # Phase 4: what the owner must know first (Porkbun's register_domain: the price, and that it cannot be
+        # undone) leads, so the phone shows it even when the line is cut
+        return f"{p['notice']} ({line})" if p.get("notice") else line
     if action == "send_email":
         return f"Email to {p.get('to')}: {p.get('subject')}"
     if action == "social_post":
@@ -72,6 +75,10 @@ def gate(company: dict, agent: dict, task_id: int | None, action: str, payload: 
         policy = db.effective_policy(company, policy_action or action)
     if policy == "off":
         return f"Not allowed: the owner has turned off '{ACTION_LABELS.get(action, action)}' for this company."
+    if action == "connector_call":
+        payload, refusal = _prepared(company, payload)   # Phase 4: facts the request card needs (Porkbun's price)
+        if refusal:
+            return refusal
     approver = "policy:auto"   # who let an action run without the owner, for the audit log
     if action not in ("question", "decision"):
         # Phase 3: a session that read outside content asks, and the trust ladder sits in front of the policy.
@@ -270,6 +277,27 @@ def decide(approval_id: int, decision: str, payload: dict | None = None, feedbac
     bus.emit(company["id"], kind, note, row["agent_id"], {"approval_id": approval_id, "status": status})
     bus.notify("approvals")
     return db.one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+
+def _prepared(company: dict, payload: dict) -> tuple[dict, str | None]:
+    """Phase 4: a connector call whose request card needs facts the agent cannot supply asks its definition's
+    prepare_call(inst, company, tool, args) -> dict of payload updates, or None, before it is queued or run.
+    Porkbun's register_domain gets the price Porkbun quotes now (in args, so the executor can refuse a higher one),
+    tags ["spend", "irreversible"] and a notice the card and the phone show. Anything the hook raises refuses the
+    call with its text: nothing that buys is queued without a price. Returns (payload, refusal)."""
+    from . import connectors   # imported here: connectors imports tools, which imports this module
+    d = connectors.DEFINITIONS.get(str(payload.get("connector") or "")) or {}
+    fn = d.get("prepare_call")
+    if not callable(fn):
+        return payload, None
+    inst = connectors.get(payload.get("connector_id"))
+    if not inst:
+        return payload, f"ERROR: the {payload.get('connector')} connector was removed."
+    try:
+        extra = fn(inst, company, str(payload.get("tool") or ""), dict(payload.get("args") or {}))
+    except Exception as e:   # a refusal, or a check that could not run: either way nothing is queued
+        return payload, f"ERROR: {connectors._error_text(e)}"
+    return ({**payload, **extra} if isinstance(extra, dict) and extra else payload), None
 
 
 def _without_reasons(p) -> dict:
