@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import actions, agents, backup, bus, config, context, contracts, db, doctor, emailer, llm, notify, planning, playbooks, presets, roles, truth, vault, watchdog, workspace  # noqa: F401
 from . import bench, trust  # noqa: F401  (Phase 3: their modules register the Bench and Trust routes)
+from . import mcp_server   # Phase 4: Holdco as an MCP server at /mcp
 from .routing import ROUTES, HTTPError, company_or_404, route, to_int
 
 _int = to_int
@@ -806,6 +807,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/stream" and method == "GET":
                 return self._stream()
+            if path == mcp_server.PATH:   # Phase 4: before /api/, with its own Origin check instead of X-Holdco
+                return self._mcp(method)
             if path.startswith("/api/"):
                 if method != "GET" and self.headers.get("X-Holdco") != "1":
                     raise HTTPError(403, "Missing X-Holdco header")
@@ -862,6 +865,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._handle("DELETE")
+
+    # --- MCP (Phase 4)
+    def _own_origin(self, origin: str | None) -> bool:
+        """A native MCP client sends no Origin. A browser always does: only the dashboard's own origin may reach /mcp,
+        so neither another site (DNS rebinding included) nor a sandboxed preview page ("null") can."""
+        if origin is None:
+            return True
+        try:
+            o = urllib.parse.urlsplit(origin.strip())
+            port = o.port or (443 if o.scheme == "https" else 80)
+            own = (urllib.parse.urlsplit("http://" + (self.headers.get("Host") or "")).hostname or "").lower()
+        except ValueError:
+            return False
+        host = (o.hostname or "").lower()
+        if o.scheme not in ("http", "https") or not host or port != self.server.server_address[1]:
+            return False
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        if host == (config.HOST or "").lower() and config.HOST not in ("0.0.0.0", "::"):
+            return True
+        # Exposed beyond this PC (a password is then required): the address the browser used for the dashboard.
+        return bool(config.PASSWORD) and host == own
+
+    def _mcp(self, method: str):
+        """POST /mcp (mcp_server.http_reply has the protocol). The password was checked above, as for every route;
+        the X-Holdco header is not needed because the Origin check keeps browser pages out."""
+        if not self._own_origin(self.headers.get("Origin")):
+            return self._send(403, {"jsonrpc": "2.0", "id": None, "error": {
+                "code": -32600, "message": "This origin may not use Holdco's MCP endpoint"}})
+        length = _int(self.headers.get("Content-Length"), 0)
+        if length > mcp_server.MAX_BODY:
+            raise HTTPError(413, "Request too large")
+        raw = self.rfile.read(length) if length > 0 else b""
+        status, payload, extra = mcp_server.http_reply(method, self.headers, raw)
+        self._send(status, payload, extra=extra)
 
     # --- static & files
     def _file(self, p: Path, headers: dict | None = None):
