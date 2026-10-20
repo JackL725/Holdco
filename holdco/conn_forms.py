@@ -52,6 +52,9 @@ SECRET_HEADER = "X-Holdco-Secret"
 
 _TRUE = ("yes", "y", "true", "on", "1", "checked", "agree", "agreed", "accept", "accepted", "ok", "i agree")
 _FALSE = ("no", "n", "false", "off", "0", "none", "")
+# A consent answer that says no in words: "No thanks", "Not now", "I don't agree", "I do not consent", "Decline".
+_NO_RE = re.compile(r"^(?:i\s+)?(?:no|nope|not|never|don'?t|do\s+not|decline[ds]?|disagree|opt[\s-]?out|"
+                    r"unsubscribe)\b")
 NO_CONSENT_FIELD = ("Consent unknown: the form has no consent field. Ask the owner before sending this person "
                     "anything beyond a direct reply.")
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
@@ -338,7 +341,9 @@ def consent_of(data: dict, form_has_field: bool | None) -> str | None:
     if value is None:
         return "no" if form_has_field else None
     v = str(value).strip().lower()
-    return "no" if v in _FALSE else "yes" if v in _TRUE or v else "no"
+    if v in _FALSE or _NO_RE.match(v):   # a select or text box answered "No thanks", "I do not agree", ...
+        return "no"
+    return "yes" if v in _TRUE or v else "no"
 
 
 def to_contacts(company: dict, subs: list[dict], form_has_field: bool | None = None) -> dict:
