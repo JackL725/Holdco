@@ -400,8 +400,98 @@ async function render() {
 window.addEventListener('hashchange', render);
 
 // ---------------------------------------------------------------- portfolio
+// Phase 4 (docs/phases/phase-4-scale.md section 2): GET /api/portfolio gives the scorecard (highest score first), the
+// latest daily portfolio brief (pinned at the top), the latest monthly review with its decisions, and the GPU split.
 function Portfolio() {
-  let el;
+  let el, pf = null, timer = 0;
+  const view = {};
+  const td = (label, html, cls = '') => `<td data-label="${esc(label)}"${cls ? ` class="${cls}"` : ''}><div class="cell">${html}</div></td>`;
+  const bar = (v) => (isNum(v) ? `<div class="meter"><div class="bar"><span style="width:${Math.max(0, Math.min(100, Math.round(Number(v) * 100)))}%"></span></div></div>` : '');
+  const na = (title) => `<span class="faint" title="${esc(title)}">n/a</span>`;
+  const scoreRow = (r, equal) => {
+    const cid = Number(r.id) || 0;
+    const goals = Number(r.goals) || 0;
+    const days = isNum(r.days_since_result) ? Number(r.days_since_result) : null;
+    const age = Number(r.age_days) || 0;
+    const name = `<a href="#/c/${cid}"><b>${esc(r.name)}</b></a>${r.status === 'paused' ? ' <span class="badge warn">Paused</span>' : ''}`
+      + (r.boost_until ? ` <span class="badge good" title="${esc(`You chose Scale in the monthly review: 1.5 times its score until ${shortDate(r.boost_until)}`)}">scaled until ${esc(shortDate(r.boost_until))}</span>` : '');
+    const progress = goals ? `<span class="num">${esc(fmtShare(r.goal_progress))}</span> <span class="faint small">over ${plural(goals, 'goal')}</span>${bar(r.goal_progress)}`
+      : `<a class="small" href="#/c/${cid}/brain">no goals: set them in the Brain tab</a>`;
+    const result = days === null ? '<span class="faint" title="No connector number has moved, no customer replied and no payment came in yet">none yet</span>'
+      : `<span class="num">${days < 1 ? 'today' : esc(plural(Math.floor(days), 'day'))}</span>`;
+    const seed = age < 14 ? ' <span class="faint small" title="Younger than 14 days: it scores at least 0.50, so it is not starved before it can have results">new</span>' : '';
+    const share = r.status === 'paused' ? '<span class="faint" title="Paused companies get no agents">0%</span>'
+      : equal ? `<span class="faint" title="Not used: the GPU split is set to equal">${esc(fmtShare(r.share))}</span>`
+        : `<span class="num">${esc(fmtShare(r.share))}</span>${bar(r.share)}`;
+    return `<tr class="${r.status === 'paused' ? 'closed' : ''}">${td('Company', name)}${td('Goal progress', progress)}
+      ${td('Revenue 30 d', isNum(r.revenue_30d) ? `<span class="num">${esc(fmtUsd(r.revenue_30d))}</span>` : na('No Stripe numbers yet'))}
+      ${td('MRR', isNum(r.mrr) ? `<span class="num">${esc(fmtUsd(r.mrr))}</span>` : na('No Stripe numbers yet'))}
+      ${td('GPU hours this week', `<span class="num">${esc(fmtHours(r.gpu_hours_week))}</span>`)}
+      ${td('Money spent', `<span class="num">${esc(fmtUsd(r.money_spent_30d) || '$0')}</span>`)}
+      ${td('Days since result', result)}
+      ${td('Score', `<span class="num">${esc((Number(r.score) || 0).toFixed(2))}</span>${seed}`)}${td('Share', share)}</tr>`;
+  };
+  const drawScore = () => {
+    const box = el && $('#pf-score', el);
+    if (!box) return;
+    if (!pf || !Array.isArray(pf.scorecard)) { box.innerHTML = pf && pf.failed ? `<section class="panel score-panel"><div class="panel-body small warn-text">The scorecard could not load: ${esc(pf.failed)}</div></section>` : ''; return; }
+    const equal = pf.allocation_mode === 'equal';
+    const rows = [...pf.scorecard].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0) || (Number(a.id) || 0) - (Number(b.id) || 0));
+    const w = pf.weights || {};
+    const wt = (k, d) => esc(isNum(w[k]) ? String(Number(w[k])) : d);
+    const split = `<span class="small faint score-mode">GPU split: <b>${equal ? 'equal' : 'weighted by score'}</b>. <a href="#/settings/allocation">Change</a></span>`;
+    box.innerHTML = `<section class="panel score-panel"><div class="panel-head wrap"><h2>Scorecard</h2>${split}</div>
+      ${rows.length ? `<div class="btable-wrap"><table class="btable score-table"><thead><tr><th>Company</th><th>Goal progress</th><th>Revenue 30 d</th><th>MRR</th>
+        <th title="Model time its agents used in the last 7 days">GPU hours this week</th><th title="Purchases you approved in the last 30 days">Money spent</th>
+        <th title="Days since a connector number moved, a customer replied or a payment came in">Days since result</th><th>Score</th>
+        <th title="Its share of the agents working at once">Share</th></tr></thead><tbody>${rows.map((r) => scoreRow(r, equal)).join('')}</tbody></table></div>`
+    : '<p class="faint panel-body" style="margin:0">Running and paused companies are scored here. A new company joins once founding finishes.</p>'}
+      <p class="small faint score-foot">Score: ${wt('progress', '0.4')} × goal progress + ${wt('traction', '0.4')} × revenue (against your top company) + ${wt('freshness', '0.2')} × how recent the last real-world result is.
+        GPU hours and money spent are shown, not scored. ${equal ? 'With the equal split the shares are not used: no company gets priority.' : 'The share is how much of the agents working at once each company gets; every company with work still gets a turn each planning cycle.'}</p></section>`;
+  };
+  // One company of the monthly review: its recommendation by rule and the decision it filed, answered with the same
+  // buttons as in the Inbox (data-act="decide" on a [data-req] card). Shut down cannot be undone, so it waits.
+  const reviewItem = (e, d) => {
+    const rec = REC_INFO[e.recommendation] || ['', capFirst(e.recommendation || '')];
+    const cid = Number(e.company_id) || 0;
+    const head = `<div class="review-co"><a href="#/c/${cid}"><b>${esc(e.name)}</b></a> <span class="badge ${rec[0]}">Recommended: ${esc(rec[1])}</span></div>
+      ${e.why ? `<div class="small muted">${esc(sentence(capFirst(e.why)))}</div>` : ''}`;
+    if (!d) return `<article class="req review-item">${head}<p class="small faint" style="margin:6px 0 0">No decision was filed for this company.</p></article>`;
+    if (d.status === 'pending') {
+      const due = decisionDeadline(d);
+      const opts = Array.isArray(d.options) ? d.options.map((o) => String(o)).filter((o) => o.trim()) : [];
+      return `<article class="req dec review-item" data-req="${esc(d.id)}">${head}
+        <div class="review-meta small faint"><span>Decision #${esc(d.id)}</span><span class="badge ${due.cls}" title="${esc(due.title)}">${esc(due.text)}</span></div>
+        <div class="opts">${optionButtons(opts, String(d.recommended || ''))}</div></article>`;
+    }
+    const done = d.status === 'answered'
+      ? `<span class="badge good">Decided</span> ${esc(d.answer || d.result || '')}`
+      : `<span class="badge">${d.status === 'rejected' ? 'Dismissed' : esc(d.status)}</span>`;
+    return `<article class="req review-item">${head}<div class="small review-done">${done} <span class="faint">${d.decided_by ? `by ${esc(deciderText(d.decided_by))}` : ''}${d.decided_at ? ` ${when(d.decided_at)}` : ''}</span></div></article>`;
+  };
+  const drawReview = () => {
+    const box = el && $('#pf-review', el);
+    if (!box) return;
+    const rv = pf && pf.latest_review;
+    if (!rv) {
+      box.innerHTML = pf && Array.isArray(pf.scorecard) && pf.scorecard.length ? '<p class="small faint review-none">Monthly review: the first one arrives once your oldest company is 30 days old. It recommends scale, hold or shut down for each company, and each one waits here and in your Inbox.</p>' : '';
+      return;
+    }
+    const recs = Array.isArray((rv.data || {}).recommendations) ? rv.data.recommendations.filter((x) => x && typeof x === 'object') : [];
+    const byId = Object.fromEntries((Array.isArray(rv.decisions) ? rv.decisions : []).map((d) => [d.id, d]));
+    const open = recs.filter((x) => byId[x.decision_id] && byId[x.decision_id].status === 'pending').length;
+    box.innerHTML = `<section class="panel review-panel"><div class="panel-head wrap"><h2>Monthly review</h2>
+        <span class="small faint">${open ? `<span class="badge warn">${plural(open, 'decision')} waiting</span> ` : ''}${when(rv.created_at)}</span></div>
+      <div class="review-list">${recs.length ? recs.map((x) => reviewItem(x, byId[x.decision_id])).join('') : '<p class="faint" style="margin:0;padding:14px 18px 0">No running company was reviewed.</p>'}</div>
+      <div class="panel-body"><details class="fold"><summary class="small">Read the whole review</summary>${briefBody(rv)}</details></div></section>`;
+  };
+  const drawBrief = () => {
+    const box = el && $('#pf-brief', el);
+    if (!box) return;
+    const b = pf && pf.latest_brief;
+    box.innerHTML = b ? `<section class="panel brief-panel"><div class="panel-head"><h2>Portfolio brief</h2><span class="small faint">${when(b.created_at)}</span></div>
+      <div class="panel-body">${briefBody(b)}</div></section>` : '';
+  };
   const draw = () => {
     const st = S.st;
     if (!st || !el) return;
@@ -426,23 +516,27 @@ function Portfolio() {
         <div class="right">${s.approvals ? `<span class="badge warn">${plural(s.approvals, 'request')} for you</span>` : ''}<span class="faint small">${s.last_event ? 'Active ' + rel(s.last_event) : ''}</span></div></a>`;
     }).join('');
   };
-  // Phase 2: the latest portfolio brief (company_id 0), built in code once a day, pinned above the companies.
-  const loadBrief = async () => {
-    const r = await GET('/api/briefs/latest?company_id=0').catch(() => null);
-    const box = el && $('#pf-brief', el);
-    if (!box) return;
-    const b = r && r.daily;
-    box.innerHTML = b ? `<section class="panel brief-panel"><div class="panel-head"><h2>Portfolio brief</h2><span class="small faint">${when(b.created_at)}</span></div>
-      <div class="panel-body">${briefBody(b)}</div></section>` : '';
+  // The latest portfolio brief (Phase 2, built in code once a day), the scorecard and the review in one request; when
+  // it fails the brief still comes from the Phase 2 route, so the pinned brief never disappears.
+  const load = async () => {
+    let r = null, failed = '';
+    try { r = await GET('/api/portfolio'); } catch (e) { failed = e.message || String(e); }
+    if (!r) {
+      const b = await GET('/api/briefs/latest?company_id=0').catch(() => null);
+      r = { scorecard: null, latest_brief: b && b.daily, latest_review: null, failed };
+    }
+    if (!el || S.view !== view) return;
+    pf = r;
+    drawBrief(); drawScore(); drawReview();
   };
-  const loadBriefSoon = debounce(() => loadBrief().catch(() => {}), 800);
-  return {
+  const loadSoon = debounce(() => load().catch(() => {}), 1200);
+  return Object.assign(view, {
     async mount(holder) {
       el = holder;
       const hasCos = S.st && S.st.companies.some((c) => c.status !== 'archived');
       el.innerHTML = `<div class="page-head"><div><h1>Portfolio</h1><p class="sub" id="pf-sub"></p></div>
         <div class="actions"><a class="btn primary" href="#/new">Start a company</a></div></div>
-        <div id="pf-doctor"></div><div id="pf-brief"></div>
+        <div id="pf-doctor"></div><div id="pf-brief"></div><div id="pf-score"></div><div id="pf-review"></div>
         ${hasCos ? `<div class="cols"><section class="panel" id="pf-list"></section>
           <section class="panel"><div class="panel-head"><h2>Live</h2></div><div id="pf-feed"></div></section></div>`
         : `<section class="panel empty"><h2>Start your first company</h2>
@@ -452,11 +546,20 @@ function Portfolio() {
       if (hasCos) mountFeed($('#pf-feed', el), 0);
       else checkModel($('#model-check', el));
       draw();
-      if (hasCos) await loadBrief();
+      if (!hasCos) return;
+      await load();
+      // GPU hours and days since a result move with time, not only with events.
+      timer = setInterval(() => { if (S.view !== view) { clearInterval(timer); return; } load().catch(() => {}); }, 60000);
     },
     onState: draw,
-    live(ev) { if (ev.type === 'briefs' || (ev.type === 'event' && ev.kind === 'brief')) loadBriefSoon(); },
-  };
+    // A brief, a decision answered here, in the Inbox, from the phone or through MCP, a company paused, the split.
+    live(ev) {
+      if (!pf) return;
+      if (['briefs', 'approvals', 'companies', 'company', 'settings'].includes(ev.type)
+        || (ev.type === 'event' && ['brief', 'decision', 'info'].includes(ev.kind))) loadSoon();
+    },
+    reloadDecided: () => loadSoon(),
+  });
 }
 
 async function checkModel(box) {
@@ -786,6 +889,81 @@ function gateList(t) {
   }).join('')}</ul>`;
 }
 
+// ---------------------------------------------------------------- phase 4: portfolio, MCP, new connectors
+// docs/phases/phase-4-scale.md. Dollars from the scorecard and Porkbun's quote: whole amounts without cents.
+const fmtUsd = (v) => {
+  if (!isNum(v)) return '';
+  const n = Number(v);
+  return `$${n.toLocaleString(undefined, Number.isInteger(n) ? { maximumFractionDigits: 0 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+// The monthly review's recommendation by rule (portfolio.LABELS).
+const REC_INFO = { scale: ['good', 'Scale'], hold: ['', 'Hold'], shut_down: ['bad', 'Shut down'] };
+// One button per option, the recommended one primary and marked: decisions, escalations and the monthly review.
+const optionButtons = (opts, rec) => opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('');
+// Who answered (decided_by) or allowed (approved_by): the MCP server answers as the owner, "mcp" or "mcp:<client>".
+const MCP_LABEL = 'through Claude (MCP)';
+const isMcp = (by) => /^mcp(:|$)/.test(String(by || ''));
+const mcpClient = (by) => String(by || '').replace(/^mcp:?/, '').trim();
+function deciderText(by, ceo = 'the CEO') {
+  if (isMcp(by)) return `you, ${MCP_LABEL}`;
+  return { ceo, owner: 'you', telegram: 'you, from your phone', deadline: 'the deadline' }[by] || by || 'someone';
+}
+// "forms:signup" (a contact a site form brought in) reads "Site form: signup".
+const contactSource = (s) => { const t = String(s || ''); return /^forms:/.test(t) ? `Site form: ${t.slice(6) || 'unnamed'}` : t; };
+
+// Copy a snippet: the clipboard API where the page is a secure context (localhost), else (or when it is refused) a
+// hidden textarea and the older copy command.
+async function copyText(text, what = 'Copied.') {
+  const legacy = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    ta.remove();
+    return ok;
+  };
+  let ok = false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); ok = true; } catch (_) { ok = false; }
+  }
+  if (!ok) ok = legacy();
+  if (ok) toast(what);
+  else toast('The browser would not copy it. Select the text and copy it yourself.', true);
+}
+
+// Fields a connector definition does not declare as choices or per mode yet, kept in step with the hints in
+// conn_github.py and conn_forms.py. A field's own options (strings, [value, label] or {value, label, short}) and its
+// modes (the mode values it applies to) or when ({field: values}) take precedence.
+const FIELD_CHOICES = {
+  github: { mode: [['hosted', "Hosted: GitHub's own MCP server", 'Hosted'], ['docker', 'Docker on this PC (read only)', 'Docker, read only']] },
+  forms: { mode: [['netlify', 'Netlify forms', 'Netlify forms'], ['worker', 'My Cloudflare Worker', 'Worker']] },
+};
+const FIELD_MODES = { forms: { netlify_site_id: ['netlify'], endpoint_url: ['worker'], shared_secret: ['worker'] } };
+// A connector whose mode picks its transport (conn_github.kind_for): the kind badge follows the mode.
+const MODE_KIND = { github: { hosted: 'mcp-http', docker: 'mcp-stdio' } };
+function fieldChoices(d, f) {
+  const raw = Array.isArray(f.options) ? f.options : Array.isArray(f.choices) ? f.choices : ((FIELD_CHOICES[d.key] || {})[f.key] || null);
+  if (!Array.isArray(raw) || !raw.length) return null;
+  return raw.map((o) => {
+    if (Array.isArray(o)) return [String(o[0]), String(o[1] ?? o[0]), String(o[2] ?? o[1] ?? o[0])];
+    if (o && typeof o === 'object') { const v = String(o.value ?? o.key ?? ''); const l = String(o.label ?? v); return [v, l, String(o.short ?? l)]; }
+    return [String(o), capFirst(String(o)), capFirst(String(o))];
+  }).filter(([v]) => v !== '');
+}
+function fieldWhen(d, f) {
+  if (f.when && typeof f.when === 'object' && !Array.isArray(f.when)) {
+    const [k, v] = Object.entries(f.when)[0] || [];
+    if (k) return { field: k, values: (Array.isArray(v) ? v : [v]).map(String) };
+  }
+  const modes = Array.isArray(f.modes) ? f.modes : (FIELD_MODES[d.key] || {})[f.key];
+  return Array.isArray(modes) && modes.length ? { field: 'mode', values: modes.map(String) } : null;
+}
+const emptyValue = (v) => v === undefined || v === null || (typeof v === 'string' && !v.trim());
+
 // ---------------------------------------------------------------- inbox
 const ACTION_VERB = {
   send_email: 'wants to send an email', social_post: 'wants to publish a post', deploy_site: 'wants to publish the website',
@@ -813,7 +991,7 @@ function requestFields(a) {
       return `<label class="field">Post for ${esc(platformName(p.platform))}<textarea data-k="content" rows="4">${esc(p.content)}</textarea></label>
         ${p.link ? ro('Link', p.link) : ''}`;
     case 'deploy_site':
-      return `<p class="muted">Publishes everything in the company's <code>site/</code> folder to Netlify. <a href="/preview/${esc(a.company_slug || '')}/" target="_blank" rel="noopener" data-preview="${a.company_id}">Preview the site first</a>.</p>`;
+      return `<p class="muted">Publishes everything in the company's <code>site/</code> folder to ${esc(siteHost(a.company_id))}. <a href="/preview/${esc(a.company_slug || '')}/" target="_blank" rel="noopener" data-preview="${a.company_id}">Preview the site first</a>.</p>`;
     case 'http_post':
       return `${ro('Request', `${p.method || 'POST'} ${p.url}`)}<label class="field">Body<pre class="box">${esc(JSON.stringify(p.body, null, 2))}</pre></label>`;
     case 'run_code': {
@@ -838,7 +1016,7 @@ function requestFields(a) {
       return `${p.pattern ? '<div><span class="badge accent">Holdco watchdog</span></div>' : ''}
         <div class="box md">${md(p.question)}</div>
         ${p.context ? `<p class="muted small" style="margin:0;white-space:pre-wrap">${esc(p.context)}</p>` : ''}
-        ${opts.length ? `<div class="opts">${opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('')}</div>` : ''}
+        ${opts.length ? `<div class="opts">${optionButtons(opts, rec)}</div>` : ''}
         <label class="field">${opts.length ? 'Or answer in your own words' : 'Your answer'}<textarea data-k="answer" rows="3"></textarea></label>`;
     }
     case 'connector_call': {
@@ -848,7 +1026,8 @@ function requestFields(a) {
       const tool = String(p.tool || '');
       const spec = def && Array.isArray(def.tools) ? def.tools.find((x) => x.tool === tool || x.name === tool) : null;
       const can = def && def.setup && Array.isArray(def.setup.agents_can) ? def.setup.agents_can : [];
-      return `<div class="form-grid">${ro('Service', label)}
+      if (buysDomain(a)) return domainFields(p, label);
+      return `${p.notice ? `<div class="buy-warn small">${esc(sentence(p.notice))}</div>` : ''}<div class="form-grid">${ro('Service', label)}
           <label class="field">Tool<div class="box"><code>${esc(tool || '?')}</code> ${tagBadge(p.tag || a.tag)}</div></label></div>
         ${spec && spec.description ? `<p class="muted small" style="margin:0">${esc(spec.description)}</p>` : ''}
         <label class="field">Arguments<pre class="box">${esc(JSON.stringify(p.args ?? {}, null, 2))}</pre></label>
@@ -859,17 +1038,51 @@ function requestFields(a) {
   }
 }
 
+// Phase 4: where deploy_site publishes, from the company's Website host setting (site_provider). Automatic means
+// Cloudflare while the company's Cloudflare card is on and passing its check, else Netlify (conn_cloudflare).
+function siteHost(cid) {
+  const co = ((S.st && S.st.companies) || []).find((c) => c.id === cid);
+  const pick = String((co && co.settings && co.settings.site_provider) || 'auto').trim().toLowerCase();
+  if (pick === 'cloudflare') return 'Cloudflare Workers';
+  if (pick === 'netlify') return 'Netlify';
+  const cf = ((S.connectors && S.connectors.instances) || []).find((i) => i.key === 'cloudflare' && i.company_id === cid && i.enabled);
+  return cf && cf.status === 'ok' ? 'Cloudflare Workers' : 'Netlify';
+}
+
+// Phase 4: Porkbun's register_domain is the one connector call that buys something when approved. actions.gate put
+// Porkbun's price, the tags (spend, irreversible), dry_run and a notice in the payload.
+const buysDomain = (a) => a.action === 'connector_call' && String((a.payload || {}).tool || '') === 'register_domain';
+function domainFields(p, label) {
+  const args = p.args && typeof p.args === 'object' ? p.args : {};
+  const price = isNum(p.amount_usd) ? p.amount_usd : args.price_usd;
+  const tags = [...new Set(['spend', 'irreversible', ...(Array.isArray(p.tags) ? p.tags.map(String) : [])])];
+  const dry = isOn(p.dry_run);
+  const years = Number(args.years) || 1;
+  const ro = (l, v) => `<label class="field">${l}<div class="box">${v}</div></label>`;
+  return `<div class="form-grid">${ro('Service', esc(label))}${ro('Domain', `<b>${esc(args.domain || '?')}</b>`)}${ro('How long', esc(plural(years, 'year')))}
+      ${ro('Price', `<b class="num">${isNum(price) ? esc(fmtUsd(price)) : 'not known'}</b> ${tags.map(tagBadge).join(' ')}`)}</div>
+    <div class="buy-warn"><b>This buys a domain and cannot be undone.</b>${/premium name/i.test(String(p.notice || '')) ? ' <span class="badge warn">premium name</span>' : ''}
+      ${dry ? '<div class="buy-dry"><span class="badge accent">Dry run</span> Dry run: nothing will be bought. Porkbun only answers what would happen.</div>'
+    : p.mode === 'sandbox' ? '<div class="buy-dry"><span class="badge accent">Sandbox</span> Sandbox keys: Porkbun\'s sandbox never buys anything.</div>'
+      : '<div class="buy-dry">Dry run is off: approving buys it for real with your Porkbun account.</div>'}</div>`;
+}
+
 function requestCard(a) {
   const agent = S.agents[a.agent_id] || { name: a.agent_name || 'An agent', role: a.agent_role || '' };
   const q = a.action === 'question';
-  const approveLabel = { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run', connector_call: 'Approve and run' }[a.action] || 'Approve';
-  const verb = a.action === 'connector_call' ? `wants to use ${esc(connectorLabel((a.payload || {}).connector))}` : ACTION_VERB[a.action] || esc(a.action);
+  const p = a.payload || {};
+  const approveLabel = buysDomain(a) ? (isOn(p.dry_run) ? 'Approve the dry run' : 'Approve and buy')
+    : { spend_money: "Approve, I'll buy it", send_email: 'Approve and send', social_post: 'Approve and post', deploy_site: 'Approve and deploy', run_code: 'Approve and run', connector_call: 'Approve and run' }[a.action] || 'Approve';
+  const verb = a.action === 'connector_call' ? `wants to use ${esc(connectorLabel(p.connector))}` : ACTION_VERB[a.action] || esc(a.action);
   // Phase 3: the trust ladder's streak for this action (filled in by the Inbox from GET /trust), and why it asks.
   const ladder = q ? '' : ladderAction(a);
+  // A connector call's notice (Porkbun's purchase warning) doubles as why it asks: shown once, on the card.
+  const taint = Array.isArray(p._taint) && p._taint.length;
+  const why = q || (p.notice && !taint && String(p._why_asked || '').trim() === String(p.notice).trim()) ? '' : whyAsked(p);
   return `<article class="req" data-req="${a.id}">
     <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${verb}</span>
       <div class="faint small req-meta"><span>Request #${esc(a.id)}</span>${tagBadge(a.tag)}<span>${when(a.created_at)}</span>${ladder ? `<span class="streak" data-streak="${esc(a.company_id)}:${esc(ladder)}"></span>` : ''}</div></div></div>
-    <div class="fields">${q ? '' : whyAsked(a.payload || {})}${requestFields(a)}</div>
+    <div class="fields">${why}${requestFields(a)}</div>
     <div class="foot">${q ? `<button class="btn primary" data-act="decide" data-d="answer">Send answer</button>`
       : `<input type="text" data-k="feedback" placeholder="Note for the agent (optional)">
          <button class="btn" data-act="decide" data-d="reject">Reject</button>
@@ -881,19 +1094,22 @@ function requestCard(a) {
 // and when it resolves on its own. Answered through the same route as a question: the option is the answer and the
 // note goes as feedback; dismissing it (reject without an answer) records no choice.
 function decisionCard(a) {
-  const agent = S.agents[a.agent_id] || { name: a.agent_name || 'An agent', role: a.agent_role || '' };
   const p = a.payload || {};
+  // No agent: Holdco itself asks (Phase 4's monthly portfolio review, a trust promotion).
+  const holdco = !a.agent_id;
+  const agent = S.agents[a.agent_id] || { name: a.agent_name || (holdco ? 'Holdco' : 'An agent'), role: a.agent_role || '' };
+  const verb = p.origin && p.origin.kind === 'portfolio' ? `${ACTION_VERB.decision} (monthly portfolio review)` : ACTION_VERB.decision;
   const opts = Array.isArray(p.options) ? p.options.map((o) => String(o)).filter((o) => o.trim()) : [];
   const rec = String(p.recommended || '');
   const due = decisionDeadline(p);
   const after = p.reversible === false ? 'It cannot be undone, so it waits for your answer.'
     : rec && due.text.startsWith('auto') ? `If you don't answer, "${esc(rec)}" is taken ${esc(due.text.replace(/^auto /, ''))}.` : '';
   return `<article class="req dec" data-req="${a.id}">
-    <div class="req-head">${avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${ACTION_VERB.decision}</span>
+    <div class="req-head">${holdco ? avatar(null) : avatar(agent)}<div class="what"><b>${esc(agent.name)}</b> <span class="muted">at <a href="#/c/${a.company_id}">${esc(a.company_name)}</a> ${verb}</span>
       <div class="faint small req-meta"><span>Decision #${esc(a.id)}</span><span class="badge ${due.cls}" title="${esc(due.title)}">${esc(due.text)}</span><span>${when(a.created_at)}</span></div></div></div>
     <div class="fields"><div class="box md">${md(p.question)}</div>
       ${p.context ? `<details class="dec-context"><summary class="small">Context</summary><p class="small muted">${esc(p.context)}</p></details>` : ''}
-      <div class="opts">${opts.map((o) => `<button class="btn ${o === rec ? 'primary' : ''}" type="button" data-act="decide" data-d="answer" data-answer="${esc(o)}">${o === rec ? '✓ ' : ''}${esc(o)}${o === rec ? ' (recommended)' : ''}</button>`).join('')}</div>
+      <div class="opts">${optionButtons(opts, rec)}</div>
       ${after ? `<p class="small faint" style="margin:0">${after}</p>` : ''}
       <label class="field">Note for the team (optional)<textarea data-k="feedback" rows="2" placeholder="Why you chose it, or what to do next"></textarea></label></div>
     <div class="foot"><button class="btn sm ghost" data-act="decide" data-d="reject" title="Close it without choosing; the team decides within its own authority">Dismiss without choosing</button></div>
@@ -931,7 +1147,13 @@ function auditSummary(a) {
     case 'http_post': return `${p.method || 'POST'} ${p.url || ''}`;
     case 'run_code': return `Ran ${p.language || 'python'}: ${String(p.code || '').trim().split('\n')[0].slice(0, 90)}`;
     case 'spend_money': return `Buy ${p.item || '?'} for $${p.amount_usd}${p.vendor ? ` (${p.vendor})` : ''}`;
-    case 'connector_call': return `${connectorLabel(p.connector)} ${p.tool || '?'}(${JSON.stringify(p.args ?? {}).slice(0, 90)})${p.tag ? ` [${p.tag}]` : ''}`;
+    case 'connector_call':
+      if (p.tool === 'register_domain') {
+        const args = p.args || {};
+        const price = isNum(p.amount_usd) ? p.amount_usd : args.price_usd;
+        return `${connectorLabel(p.connector)}: register ${args.domain || '?'}${isNum(price) ? ` for ${fmtUsd(price)}` : ''}${isOn(p.dry_run) ? ' (dry run, nothing bought)' : ''}`;
+      }
+      return `${connectorLabel(p.connector)} ${p.tool || '?'}(${JSON.stringify(p.args ?? {}).slice(0, 90)})${p.tag ? ` [${p.tag}]` : ''}`;
     default: return a.action;
   }
 }
@@ -944,13 +1166,15 @@ function Inbox() {
     const r = await GET('/api/audit?limit=50');
     const who = (by) => {
       const lvl = /^trust:(\d)/.exec(by || '');
-      if (lvl) return lvl[1] === '1' ? 'the trust ladder (on its own, up to a daily cap)' : 'the trust ladder (on its own)';
-      return by === 'owner' ? 'you' : by === 'policy:auto' ? 'the auto policy' : by || '?';
+      if (lvl) return esc(lvl[1] === '1' ? 'the trust ladder (on its own, up to a daily cap)' : 'the trust ladder (on its own)');
+      // Phase 4: "mcp:<client>" is you, answering from an MCP client; the client's name is on hover.
+      if (isMcp(by)) return `<span title="${esc(mcpClient(by) ? `MCP client: ${mcpClient(by)}` : 'An MCP client')}">${esc(`you, ${MCP_LABEL}`)}</span>`;
+      return esc(by === 'owner' ? 'you' : by === 'policy:auto' ? 'the auto policy' : by || '?');
     };
     $('#audit', el).innerHTML = r.audit.length ? r.audit.map((a) => `
       <li><span class="badge ${/^FAILED/.test(a.result || '') ? 'bad' : 'good'}">${esc(ACTION_LABEL[a.action] || a.action)}</span><div class="grow">
         <div>${esc(auditSummary(a))}</div>
-        <div class="faint small">${esc(a.company_name || 'Holdco')}, ${when(a.created_at)}. Proposed by ${esc(a.proposed_by || 'an agent')}, allowed by ${esc(who(a.approved_by))}.</div>
+        <div class="faint small">${esc(a.company_name || 'Holdco')}, ${when(a.created_at)}. Proposed by ${esc(a.proposed_by || 'an agent')}, allowed by ${who(a.approved_by)}.</div>
         ${a.result ? `<div class="small muted" style="margin-top:4px">${esc(String(a.result).slice(0, 120))}</div>` : ''}</div></li>`).join('')
       : '<li class="faint">Nothing has run yet. Approved and automatic actions are listed here.</li>';
   };
@@ -1006,9 +1230,10 @@ function Inbox() {
   const loadDecided = async () => {
     const r = await GET('/api/approvals?status=decided');
     const badge = { done: 'good', answered: 'good', rejected: '', failed: 'bad', running: 'accent' };
-    const by = { deadline: '<span class="badge" title="Nobody answered in time, so the recommended option was taken">decided by the deadline</span> ', telegram: '<span class="badge">from your phone</span> ' };
+    const by = { deadline: '<span class="badge" title="Nobody answered in time, so the recommended option was taken">decided by the deadline</span> ', telegram: '<span class="badge">from your phone</span> ',
+      mcp: `<span class="badge accent" title="You answered it from Claude Desktop, Claude Code or another MCP client">${esc(MCP_LABEL)}</span> ` };
     $('#decided', el).innerHTML = r.approvals.length ? r.approvals.slice(0, 30).map((a) => `
-      <li>${avatar(S.agents[a.agent_id] || { name: a.agent_name || '?', role: a.agent_role })}<div class="grow">
+      <li>${a.agent_id ? avatar(S.agents[a.agent_id] || { name: a.agent_name || '?', role: a.agent_role }) : avatar(null)}<div class="grow">
         <div><span class="badge ${badge[a.status] || ''}">${esc(a.action === 'decision' && a.status === 'rejected' ? 'dismissed' : a.status)}</span> ${by[a.decided_by] || ''}${esc(a.summary)}</div>
         <div class="faint small">${esc(a.company_name)}, ${when(a.decided_at)}${a.feedback ? `. Your note: ${esc(a.feedback)}` : ''}</div>
         ${a.result ? `<div class="small muted" style="margin-top:4px">${inline(a.result.slice(0, 400))}</div>` : ''}</div>
@@ -1180,6 +1405,37 @@ function ConnectorCards(opts) {
   const defsOf = (scope) => Object.values(data.definitions).filter((d) => (d.scope || 'company') === scope);
   const flag = (d, k) => (d[k] !== undefined ? d[k] : (d.setup || {})[k]);   // beta, enabled_by_default
   const labelOf = (key) => ((data && data.definitions[key]) || {}).label || key;
+  // Phase 4's later tier (available: false): a card with its reason, never a form.
+  const later = (d) => d.available === false;
+  const shownFields = (d) => ((d.setup || {}).fields || []).filter((f) => f && f.key && !f.hidden);
+  // A field's value on the card: what is saved, else the global setting it mirrors, else the definition's default
+  // (Porkbun's dry run starts ticked). Secrets never take a default.
+  const fieldValue = (d, f, inst) => {
+    const cfg = (inst && inst.config) || {};
+    const globals = (opts.settings && opts.settings()) || {};
+    let v = cfg[f.key];
+    if (emptyValue(v) && f.setting) v = globals[f.setting];
+    if (emptyValue(v) && !f.secret && f.default !== undefined && f.default !== null) v = f.default;
+    return v;
+  };
+  // A choice field's value (the mode): blank means the definition's default or the first choice, as the server reads it.
+  const choiceValue = (d, f, inst) => {
+    const choices = fieldChoices(d, f) || [];
+    const v = fieldValue(d, f, inst);
+    return emptyValue(v) ? (choices[0] ? choices[0][0] : '') : String(v).trim().toLowerCase();
+  };
+  // The saved mode of a card with a mode choice (GitHub hosted or docker, forms netlify or worker): [value, short label].
+  const savedMode = (d, inst) => {
+    const f = inst ? shownFields(d).find((x) => x.key === 'mode' && fieldChoices(d, x)) : null;
+    if (!f) return null;
+    const v = choiceValue(d, f, inst);
+    const c = (fieldChoices(d, f) || []).find(([x]) => x === v);
+    return [v, c ? c[2] : v];
+  };
+  const kindOf = (d, inst) => {
+    const m = savedMode(d, inst);
+    return (m && (MODE_KIND[d.key] || {})[m[0]]) || d.kind || '';
+  };
 
   const healthBadge = (inst) => {
     if (!inst) return '<span class="badge">Not set up</span>';
@@ -1189,8 +1445,13 @@ function ConnectorCards(opts) {
   };
   const modeBadge = (mode) => (mode === 'live' ? '<span class="badge warn" title="Real money and real customers">Live mode</span>'
     : mode === 'test' ? '<span class="badge accent" title="Test data only">Test mode</span>' : '');
-  const stateHtml = (d, inst) => healthBadge(inst) + (inst ? modeBadge(inst.mode) : '')
-    + (d.oauth && inst && inst.signed_in ? '<span class="badge good">Signed in</span>' : '');
+  const stateHtml = (d, inst) => {
+    if (later(d)) return '<span class="badge">Not yet available</span>';
+    const m = savedMode(d, inst);
+    return healthBadge(inst) + (inst ? modeBadge(inst.mode) : '')
+      + (m ? `<span class="badge" title="The mode saved on this card">${esc(m[1])}</span>` : '')
+      + (d.oauth && inst && inst.signed_in ? '<span class="badge good">Signed in</span>' : '');
+  };
   const metricTile = (key, m) => {
     const name = String(m.name || '');
     const short = name.startsWith(`${key}.`) ? name.slice(key.length + 1) : name;
@@ -1227,21 +1488,66 @@ function ConnectorCards(opts) {
       ${s.test_mode ? `<p><b>Test mode.</b> ${esc(s.test_mode)}</p>` : ''}
       ${docs ? `<p><a href="${esc(docs)}" target="_blank" rel="noopener noreferrer">${esc(d.label || d.key)} documentation</a></p>` : ''}</div></details>`;
   };
+  // Phase 4: a field with choices is a select (a mode); a field that applies to one mode only is hidden while another
+  // is picked (data-when-*, toggled on change by showWhen). Hidden fields are still sent, so nothing saved is lost.
   const fieldsHtml = (d, inst) => {
-    const cfg = (inst && inst.config) || {};
-    const globals = (opts.settings && opts.settings()) || {};
-    const fields = ((d.setup || {}).fields || []).filter((f) => f && f.key && !f.hidden);
-    const value = (f) => {
-      const v = cfg[f.key];
-      return (v === undefined || v === null || v === '') && f.setting ? globals[f.setting] : v;
+    const fields = shownFields(d);
+    const byKey = Object.fromEntries(fields.map((f) => [f.key, f]));
+    const current = (key) => {
+      const f = byKey[key];
+      if (!f) return '';
+      return fieldChoices(d, f) ? choiceValue(d, f, inst) : String(fieldValue(d, f, inst) ?? '').trim().toLowerCase();
     };
-    const inputs = fields.filter((f) => f.type !== 'bool').map((f) => `<label class="field">${esc(f.label || f.key)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}
-      <input type="${f.secret ? 'password' : 'text'}" data-field="${esc(f.key)}" data-kind="${f.secret ? 'secret' : 'text'}" value="${esc(value(f) ?? '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="${f.secret ? 'new-password' : 'off'}" spellcheck="false"></label>`);
-    const bools = fields.filter((f) => f.type === 'bool').map((f) => `<label class="check"><input type="checkbox" data-field="${esc(f.key)}" data-kind="bool"${isOn(value(f)) ? ' checked' : ''}>
+    const when = (f) => {
+      const w = fieldWhen(d, f);
+      if (!w || !byKey[w.field]) return '';
+      const on = w.values.map((x) => x.toLowerCase()).includes(current(w.field));
+      return ` data-when-field="${esc(w.field)}" data-when-values="${esc(w.values.join(' '))}"${on ? '' : ' hidden'}`;
+    };
+    const hint = (f) => (f.hint ? `<span class="hint">${esc(f.hint)}</span>` : '');
+    const input = (f) => {
+      const choices = fieldChoices(d, f);
+      if (choices && !f.secret) {
+        const v = choiceValue(d, f, inst);
+        const list = choices.some(([x]) => x === v) || !v ? choices : [...choices, [v, `${v} (not one Holdco knows)`, v]];
+        // A hint that only spells the choices for a text box ("netlify or worker") says nothing next to a select.
+        const bare = String(f.hint || '').trim().toLowerCase() === choices.map(([x]) => x).join(' or ');
+        return `<label class="field"${when(f)}>${esc(f.label || f.key)}${bare ? '' : hint(f)}
+          <select data-field="${esc(f.key)}" data-kind="text" data-mode-field="${esc(f.key)}">${list.map(([x, l]) => `<option value="${esc(x)}"${x === v ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`;
+      }
+      const v = fieldValue(d, f, inst);
+      return `<label class="field"${when(f)}>${esc(f.label || f.key)}${hint(f)}
+        <input type="${f.secret ? 'password' : 'text'}" data-field="${esc(f.key)}" data-kind="${f.secret ? 'secret' : 'text'}" value="${esc(v ?? '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="${f.secret ? 'new-password' : 'off'}" spellcheck="false"></label>`;
+    };
+    const inputs = fields.filter((f) => f.type !== 'bool').map(input);
+    const bools = fields.filter((f) => f.type === 'bool').map((f) => `<label class="check"${when(f)}><input type="checkbox" data-field="${esc(f.key)}" data-kind="bool"${isOn(fieldValue(d, f, inst)) ? ' checked' : ''}>
       <span>${esc(f.label || f.key)}${f.hint ? `<br><span class="faint small">${esc(f.hint)}</span>` : ''}</span></label>`);
-    return (inputs.length ? `<div class="form-grid">${inputs.join('')}</div>` : '') + bools.join('');
+    // The forms Worker template ships in the repository; the dashboard does not serve docs/, so it is named, not linked.
+    const worker = d.key === 'forms' && byKey.mode
+      ? `<p class="small muted conn-tip" data-when-field="mode" data-when-values="worker"${current('mode') === 'worker' ? '' : ' hidden'}>The Worker template is <code>docs/forms-worker.js</code> in your Holdco folder. Its header says how to deploy it to Cloudflare and set its <code>SHARED_SECRET</code>; then point your form's action at the Worker.</p>`
+      : '';
+    return (inputs.length ? `<div class="form-grid">${inputs.join('')}</div>` : '') + worker + bools.join('');
+  };
+  // Show the fields of the mode now picked in this form.
+  const showWhen = (form) => {
+    $$('[data-when-field]', form).forEach((node) => {
+      const src = $(`[data-field="${CSS.escape(node.dataset.whenField || '')}"]`, form);
+      const v = String((src && (src.type === 'checkbox' ? String(src.checked) : src.value)) || '').trim().toLowerCase();
+      const on = String(node.dataset.whenValues || '').toLowerCase().split(' ').includes(v);
+      node.hidden = !on;
+    });
+  };
+  const laterCard = (d) => {
+    const will = Array.isArray((d.setup || {}).agents_will) ? d.setup.agents_will : [];
+    return `<article class="conn conn-later" id="conn-${esc(d.key)}" data-conn="${esc(d.key)}">
+      <div class="conn-head"><div class="conn-title"><h3>${esc(d.label || d.key)}</h3><span class="badge">${esc(d.category || 'Other')}</span></div>
+        <div class="conn-state" data-conn-state>${stateHtml(d, null)}</div></div>
+      <p class="small conn-note muted">${esc(sentence(d.reason || 'Not in this version of Holdco.'))}</p>
+      ${will.length ? `<div class="conn-info"><div><b class="small">What agents will do with it</b><ul>${will.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div></div>` : ''}
+    </article>`;
   };
   const card = (d) => {
+    if (later(d)) return laterCard(d);
     const inst = own(d.key);
     const s = d.setup || {};
     const beta = !!flag(d, 'beta');
@@ -1250,7 +1556,7 @@ function ConnectorCards(opts) {
     const note = d.note || s.note || '';
     return `<article class="conn" id="conn-${esc(d.key)}" data-conn="${esc(d.key)}"${inst ? ` data-inst="${esc(inst.id)}"` : ''}>
       <div class="conn-head"><div class="conn-title"><h3>${esc(d.label || d.key)}</h3><span class="badge">${esc(d.category || 'Other')}</span>
-          ${d.kind ? `<span class="badge" title="How Holdco talks to it">${esc(KIND_LABEL[d.kind] || d.kind)}</span>` : ''}${beta ? '<span class="badge warn">Beta</span>' : ''}</div>
+          ${kindOf(d, inst) ? `<span class="badge" title="How Holdco talks to it">${esc(KIND_LABEL[kindOf(d, inst)] || kindOf(d, inst))}</span>` : ''}${beta ? '<span class="badge warn">Beta</span>' : ''}</div>
         <div class="conn-state" data-conn-state>${stateHtml(d, inst)}</div></div>
       ${note ? `<p class="small conn-note ${beta ? 'warn-text' : 'muted'}">${esc(note)}</p>` : ''}
       <div class="conn-info">${can.length ? `<div><b class="small">What agents can do</b><ul>${can.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}${toolsHtml(d)}</div>
@@ -1273,24 +1579,30 @@ function ConnectorCards(opts) {
       <div class="grow"><b>${esc(i.label || labelOf(i.key))}</b>${company ? '' : ` <span class="muted">at ${esc(i.company_name || `company ${i.company_id}`)}</span>`}
         <div class="small muted">${esc(sentence(i.detail) || 'Not checked yet.')}${i.last_check ? ` <span class="faint">Checked ${when(i.last_check)}.</span>` : ''}</div></div>
       <a class="btn sm" href="${esc(href)}">Open</a></li>`;
+    const ready = (scope) => defsOf(scope).filter((d) => !later(d));   // the later tier cannot be set up anywhere yet
     if (company) {
       const shared = data.instances.filter((i) => i.company_id == null && (data.definitions[i.key] || {}).scope === 'global');
-      const names = andList(defsOf('global').map((d) => d.label || d.key));
+      const names = andList(ready('global').map((d) => d.label || d.key));
       return `<h3 class="conn-cat">Set up once for every company</h3>${shared.length
         ? `<ul class="rows conn-rows">${shared.map((i) => row(i, `#/settings/connector-${i.id}`)).join('')}</ul>`
-        : `<p class="small faint">Nothing yet.${names ? ` ${esc(names)} ${defsOf('global').length === 1 ? 'is' : 'are'} set up on the <a href="#/settings">Settings page</a> and apply to every company.` : ''}</p>`}`;
+        : `<p class="small faint">Nothing yet.${names ? ` ${esc(names)} ${ready('global').length === 1 ? 'is' : 'are'} set up on the <a href="#/settings">Settings page</a> and apply to every company.` : ''}</p>`}`;
     }
     const per = data.instances.filter((i) => i.company_id != null);
-    const names = andList(defsOf('company').map((d) => d.label || d.key));
+    const names = andList(ready('company').map((d) => d.label || d.key));
     return `<h3 class="conn-cat">Set up per company</h3>${per.length
       ? `<ul class="rows conn-rows">${per.map((i) => row(i, `#/c/${i.company_id}/settings/connector-${i.id}`)).join('')}</ul>`
       : `<p class="small faint">None yet.${names ? ` ${esc(names)} belong to one company each: set them up in that company's Settings tab.` : ''}</p>`}`;
   };
+  // Categories in definition order; the later tier (not yet available) goes last, under its own heading.
   const body = () => {
-    const list = defsOf(opts.scope);
+    const all = defsOf(opts.scope);
+    const list = all.filter((d) => !later(d));
+    const soon = all.filter(later);
     const cats = [...new Set(list.map((d) => d.category || 'Other'))];
     return (list.length ? cats.map((c) => `<div class="conn-group"><h3 class="conn-cat">${esc(c)}</h3><div class="conn-cards">${list.filter((d) => (d.category || 'Other') === c).map(card).join('')}</div></div>`).join('')
-      : '<p class="faint">No connectors of this kind in this version of Holdco.</p>') + `<div class="conn-group" id="conn-extra">${extraHtml()}</div>`;
+      : '<p class="faint">No connectors of this kind in this version of Holdco.</p>')
+      + (soon.length ? `<div class="conn-group"><h3 class="conn-cat">Not yet available</h3><div class="conn-cards">${soon.map(card).join('')}</div></div>` : '')
+      + `<div class="conn-group" id="conn-extra">${extraHtml()}</div>`;
   };
   // Cards the owner is typing in keep their fields; everything else is redrawn from the server's answer.
   const paint = () => {
@@ -1337,7 +1649,12 @@ function ConnectorCards(opts) {
     btn.innerHTML = `<span class="spinner"></span> ${esc(text)}`;
     return () => { btn.disabled = false; btn.innerHTML = was; };
   };
-  const slowText = (d, saving) => (d && d.kind === 'mcp-stdio' ? 'Starting it; the first time can take two minutes…' : saving ? 'Saving and testing…' : 'Testing…');
+  // A server started on this PC (GitHub in docker mode too) can take minutes the first time.
+  const slowText = (d, saving, form) => {
+    const picked = form && $('[data-mode-field="mode"]', form);
+    const kind = d && picked && (MODE_KIND[d.key] || {})[picked.value] ? MODE_KIND[d.key][picked.value] : d ? kindOf(d, own(d.key)) : '';
+    return kind === 'mcp-stdio' ? 'Starting it; the first time can take two minutes…' : saving ? 'Saving and testing…' : 'Testing…';
+  };
   // After an OAuth sign-in in another tab: when the owner comes back, reload; once signed in, test right away.
   const onFocus = async () => {
     window.removeEventListener('focus', onFocus);
@@ -1385,6 +1702,7 @@ function ConnectorCards(opts) {
       };
       el.addEventListener('input', touch);
       el.addEventListener('change', touch);
+      el.addEventListener('change', (e) => { const s = e.target; if (s && s.dataset && s.dataset.modeField) showWhen(s.closest('form')); });
       el.addEventListener('toggle', (e) => { const g = e.target; if (g && g.dataset && g.dataset.guide) guides.set(g.dataset.guide, g.open); }, true);
       try { await load(); } catch (e) { $('#conn-list', el).innerHTML = `<p class="warn-text" style="margin:0">Connectors could not load: ${esc(e.message)}</p>`; }
       if (opts.focus) reveal(opts.focus);
@@ -1449,7 +1767,7 @@ function ConnectorCards(opts) {
       const payload = { key, company_id: company ? opts.cid : null, enabled: !!(on && on.checked), config };
       if (inst) payload.id = inst.id;
       const btn = $('button[type=submit]', form);
-      const done = btn ? busy(btn, slowText(d, true)) : () => {};
+      const done = btn ? busy(btn, slowText(d, true, form)) : () => {};
       try {
         const r = await api('POST', '/api/connectors', payload);
         dirty.delete(key);
@@ -1535,6 +1853,12 @@ function Settings(arg) {
         <label class="check"><input type="checkbox" name="scheduler_enabled" ${s.scheduler_enabled ? 'checked' : ''}><span>Keep agents working around the clock<br><span class="faint small">When off, agents only work when you press Run or chat with them.</span></span></label>
         <div class="form-grid" style="margin-top:14px"><label class="field">What agents call you<input type="text" name="owner_name" value="${esc(s.owner_name)}"></label></div>
       </div>
+      <div class="section" id="allocation"><h2>Allocation</h2><p class="muted">How the agents working at once are shared between your companies. The scores are on the <a href="#/">Portfolio page</a>.</p>
+        <div class="form-grid" style="max-width:640px">
+          <label class="field">GPU split<span class="hint">Either way, every company with work gets a turn each planning cycle, and urgent work and your own tasks go first.</span>
+            ${sel('allocation_mode', s.allocation_mode === 'equal' ? 'equal' : 'weighted', [['weighted', "Weighted: each company's GPU share follows its score"], ['equal', 'Equal: no company gets priority']])}</label>
+        </div>
+      </div>
       <div class="section"><h2>Phone notifications</h2><p class="muted">Approve requests and answer questions from your phone. A Telegram bot gives you buttons; ntfy only notifies.</p>
         <div class="form-grid">
           <label class="field">Telegram bot token<input type="password" name="telegram_bot_token" value="${esc(s.telegram_bot_token)}" autocomplete="off" data-secret></label>
@@ -1579,9 +1903,44 @@ function Settings(arg) {
         </div>
       </div>
       <div class="section actions" style="justify-content:space-between"><span class="faint small">Data folder: <code>${esc(data.data_dir)}</code></span><button class="btn primary" type="submit">Save settings</button></div>
-    </form>`;
+    </form>
+    ${mcpPanel()}`;
     paintContext();
     paintBench();
+  };
+  // Phase 4: Holdco as an MCP server. The stdio command proxies to this dashboard's port (python -m holdco.mcp_server);
+  // the HTTP transport is /mcp on the same address. The API does not say where Holdco is installed, so the folder is
+  // read from the default data folder (<Holdco>/data) when it is one, else left for the owner to fill in.
+  const mcpPanel = () => {
+    const dir = String(data.data_dir || '');
+    const win = /^[A-Za-z]:[\\/]/.test(dir) || dir.includes('\\');
+    const m = /^(.*)[\\/]data[\\/]?$/.exec(dir);
+    const folder = m ? m[1] : '';
+    const home = folder || (win ? 'C:\\path\\to\\Holdco' : '/path/to/Holdco');
+    const port = location.port || (location.protocol === 'https:' ? '443' : '80');
+    const url = `${location.origin}/mcp`;
+    const pw = 'your-password-if-set';
+    const desktop = JSON.stringify({ mcpServers: { holdco: { command: 'python', args: ['-m', 'holdco.mcp_server'], env: { PYTHONPATH: home, HOLDCO_PORT: port, HOLDCO_PASSWORD: pw } } } }, null, 2);
+    const q = (v) => (/[\s"]/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v);
+    const code = `claude mcp add holdco -e PYTHONPATH=${q(home)} -e HOLDCO_PORT=${port} -e HOLDCO_PASSWORD=${pw} -- python -m holdco.mcp_server`;
+    const http = `claude mcp add --transport http holdco ${url}`;
+    const block = (id, text, label) => `<div class="mcp-snippet"><pre class="box mono" id="${id}">${esc(text)}</pre><button class="btn sm" type="button" data-act="copy" data-target="${id}" data-what="${esc(label)}">Copy</button></div>`;
+    return `<section class="panel mcp-panel" id="mcp"><div class="section"><h2>Connect Claude Desktop or Claude Code</h2>
+      <p class="muted">Holdco is an MCP server: Claude Desktop, Claude Code or any MCP client can read your portfolio, Inbox, brains, metrics and briefs, add tasks and answer requests. Answers follow the same rules as this dashboard (the kill switch, approvals and trust), are listed in the audit log and read "${esc(MCP_LABEL)}". Holdco must be running.</p>
+      <h3 class="mcp-h">Claude Desktop</h3>
+      <p class="small muted">Add this to Claude Desktop's configuration file (in Claude Desktop: Settings, Developer, Edit Config), save it and restart Claude Desktop. The <b>holdco</b> tools then appear in the chat.</p>
+      ${block('mcp-desktop', desktop, 'Configuration copied.')}
+      <p class="small faint">PYTHONPATH is the Holdco folder, the one with run.py${folder ? ' (read from your data folder; change it if Holdco lives somewhere else)' : ': replace the example path with yours'}. If <code>python</code> is not found, put the full path to python.exe in <code>command</code>.</p>
+      <h3 class="mcp-h">Claude Code</h3>
+      <p class="small muted">Run this in a terminal to add the same command:</p>
+      ${block('mcp-code', code, 'Command copied.')}
+      <p class="small muted">Or use the HTTP address instead of the command:</p>
+      ${block('mcp-url', url, 'Address copied.')}
+      ${block('mcp-http', http, 'Command copied.')}
+      <p class="small faint">Check <code>claude mcp add --help</code> if your version names the options differently.</p>
+      <h3 class="mcp-h">Password</h3>
+      <p class="small muted">The password only applies when Holdco was started with <code>HOLDCO_PASSWORD</code> set (needed before Holdco listens beyond this PC). Then put that password in <code>HOLDCO_PASSWORD</code> above, and give an HTTP client a Basic <code>Authorization</code> header: any user name, a colon and the password, base64-encoded. Without a password, delete the <code>HOLDCO_PASSWORD</code> line; the MCP address then answers only on this PC.</p>
+    </div></section>`;
   };
   const paintContext = () => { const box = el && $('#ctx-use', el); if (box) box.innerHTML = contextUseHtml(data.context_use); };
   // The agent model as picked in the form (saved or not): what "Test this model" scores.
@@ -1640,6 +1999,8 @@ function Settings(arg) {
         paintBench();
       });
       if (st && st.running && st.run_id) follow(st.run_id);
+      // #/settings/allocation (from the Portfolio page) and #/settings/mcp open at their section.
+      if (arg === 'allocation' || arg === 'mcp') $(`#${arg}`, el)?.scrollIntoView({ block: 'start' });
       await conns.mount($('#set-conns', el));
     },
     live(ev) { conns.live(ev); },
@@ -1675,6 +2036,11 @@ function Settings(arg) {
     },
     async act(name, t) {
       if (conns.owns(name)) return conns.act(name, t);
+      if (name === 'copy') {
+        const src = el && $(`#${t.dataset.target}`, el);
+        if (src) copyText(src.textContent, t.dataset.what || 'Copied.');
+        return undefined;
+      }
       if (name === 'bench-run') {
         const model = pickedModel();
         if (!model) { toast('Pick an agent model to test first.', true); return undefined; }
@@ -2701,7 +3067,7 @@ function TabBrain(cid, data) {
   const isEditing = (section, id) => !!editing && editing.section === section && editing.id === id;
   const roles = () => [...new Set(['ceo', ...data().agents.map((a) => a.role)])];
   const ceoName = () => (data().agents.find((a) => a.role === 'ceo') || {}).name || 'the CEO';
-  const decider = (by) => ({ ceo: ceoName(), owner: 'you', telegram: 'you, from your phone', deadline: 'the deadline' }[by] || by || 'someone');
+  const decider = (by) => deciderText(by, ceoName());
   const day = (v) => String(v || '').slice(0, 10);
   const num = (v) => (v === null || v === undefined || v === '' ? '?' : esc(fmtValue(v)));
   const opt = (v, l, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(l)}</option>`;
@@ -2773,10 +3139,12 @@ function TabBrain(cid, data) {
   // ---- contacts: a table with a stage filter; the stage changes inline.
   const contactRow = (c) => {
     if (isEditing('contacts', c.id)) return `<tr class="editing"><td colspan="6">${editForm('contacts', c)}</td></tr>`;
-    return `<tr>${td('Name', `<b>${esc(c.name || '(no name)')}</b>${c.unsubscribed ? ' <span class="badge warn">unsubscribed</span>' : ''}${c.company ? `<div class="small muted">${esc(c.company)}${c.role ? `, ${esc(c.role)}` : ''}</div>` : ''}`)}
+    // Phase 4: a lead from a site form without a consent box has empty consent; it is flagged so nobody emails it blind.
+    const unknown = /^forms:/.test(String(c.source || '')) && !String(c.consent || '').trim();
+    return `<tr>${td('Name', `<b>${esc(c.name || '(no name)')}</b>${c.unsubscribed ? ' <span class="badge warn">unsubscribed</span>' : ''}${unknown ? ' <span class="badge warn" title="The form had no consent box, so Holdco does not know whether this person agreed to be contacted. Check before anyone emails them.">consent unknown</span>' : ''}${c.company ? `<div class="small muted">${esc(c.company)}${c.role ? `, ${esc(c.role)}` : ''}</div>` : ''}`)}
       ${td('Email', c.email ? esc(c.email) : '<span class="faint">none</span>')}
       ${td('Stage', `<select data-b-stage="${c.id}" aria-label="Stage of ${esc(c.name || c.email || 'contact')}">${CONTACT_STAGES.map((s) => opt(s, capFirst(s), c.stage)).join('')}</select>`)}
-      ${td('Last touch', c.last_touch ? esc(day(c.last_touch)) : '<span class="faint">never</span>')}${td('Source', esc(c.source || ''))}
+      ${td('Last touch', c.last_touch ? esc(day(c.last_touch)) : '<span class="faint">never</span>')}${td('Source', `<span title="${esc(c.source || '')}">${esc(contactSource(c.source))}</span>`)}
       <td class="acts-cell">${acts('contacts', c.id)}</td></tr>`;
   };
   const drawContacts = () => {
@@ -3374,6 +3742,8 @@ function TabCharter(cid, data) {
 const INTERNAL_COMPANY_SETTINGS = ['founding_stage', 'founding_retry', 'founding_research_note', 'founding_context', 'last_waiting_notice',
   'budget_notice', 'truth_scan_done', 'name_locked', 'template', 'pinned_context'];
 const EMAIL_PROVIDERS = [['auto', 'Resend when connected, otherwise SMTP'], ['smtp', 'SMTP'], ['resend', 'Resend']];
+// Phase 4: the company setting site_provider (conn_cloudflare.provider).
+const SITE_PROVIDERS = [['auto', 'Automatic: Cloudflare when its card is set up and working, otherwise Netlify'], ['netlify', 'Netlify'], ['cloudflare', 'Cloudflare Workers']];
 
 function TabSettings(cid, data, arg) {
   let el, global, plan = null, trustData = null, trustBusy = false;
@@ -3441,6 +3811,7 @@ function TabSettings(cid, data, arg) {
     const bud = data().budgets || null;   // Phase 2: what each budget has used (GET /api/companies/<id>)
     const detected = !s.archetype && plan && plan.archetype ? ` (now: ${archetypeLabel(plan.archetype)})` : '';
     const provider = EMAIL_PROVIDERS.some(([k]) => k === s.email_provider) ? s.email_provider : 'auto';
+    const siteProvider = SITE_PROVIDERS.some(([k]) => k === String(s.site_provider || '').toLowerCase()) ? String(s.site_provider).toLowerCase() : 'auto';
     $('#co-set-form', el).innerHTML = `<form class="panel" data-form="co-settings">
       <div class="section"><h2>Direction</h2>
         <label class="field">Standing orders<span class="hint">Every agent reads these in every session. Brand rules, things to avoid, priorities.</span>
@@ -3500,7 +3871,11 @@ function TabSettings(cid, data, arg) {
           <label class="field">Password<input type="password" name="imap_password" value="${val('imap_password')}" autocomplete="new-password" data-secret></label>
         </div>
         <div class="actions" style="margin-top:14px"><input type="email" id="test-to" placeholder="Send a test email to…" style="max-width:280px"><button class="btn" type="button" data-act="test-email">Send test</button></div></div>
-      <div class="section"><h2>Website</h2><p class="muted">The site in <code>site/</code> always previews locally. To publish it, add a Netlify personal access token; Holdco creates the site on first deploy.</p>
+      <div class="section" id="website"><h2>Website</h2><p class="muted">The site in <code>site/</code> always previews locally. To publish it, add a Netlify personal access token below (Holdco creates the site on first deploy), or set up the Cloudflare card under Connectors at the top of this tab.</p>
+        <div class="form-grid" style="margin-bottom:14px;max-width:520px">
+          <label class="field">Website host<span class="hint">Where an approved deploy publishes the site.</span>
+            <select name="site_provider">${SITE_PROVIDERS.map(([k, l]) => `<option value="${k}" ${siteProvider === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+        </div>
         <div class="form-grid">
           <label class="field">Netlify token<input type="password" name="netlify_token" value="${val('netlify_token')}" autocomplete="off" data-secret></label>
           <label class="field">Netlify site ID<span class="hint">Leave blank to create one.</span><input type="text" name="netlify_site_id" value="${val('netlify_site_id')}"></label>

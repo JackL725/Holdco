@@ -691,3 +691,39 @@ input[type=date] {
   .trust-table select { min-width: 0; width: 100%; }
   .bench-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+
+/* ---------- phase 4: scorecard, monthly review, MCP, purchase cards, connector modes ---------- */
+.conn [hidden] { display: none !important; }   /* a field of another mode: label.field sets display, so [hidden] needs help */
+.score-panel, .review-panel { margin-bottom: 18px; }
+.score-mode b { color: var(--ink); font-weight: 600; }
+.score-table td:first-child { min-width: 170px; }
+.score-table .meter .bar { max-width: 110px; }
+.score-table td .badge { vertical-align: 1px; }
+.score-foot { margin: 0; padding: 10px 18px 14px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.review-none { margin: -6px 2px 18px; }
+.review-list .req { padding: 14px 18px; }
+.review-co { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; }
+.review-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0 8px; }
+.review-item .opts .btn { white-space: normal; text-align: left; }
+.review-done { margin-top: 6px; overflow-wrap: anywhere; }
+.review-panel > .panel-body { border-top: 1px solid var(--line); padding-top: 10px; padding-bottom: 12px; }
+.buy-warn { padding: 10px 12px; border-radius: var(--r-sm); background: var(--bad-soft); color: var(--ink); overflow-wrap: anywhere; }
+.buy-warn > b { color: var(--bad); }
+.buy-dry { margin-top: 6px; font-size: 13px; color: var(--ink-2); }
+.buy-dry .badge { margin-right: 4px; }
+.req-head .sys, .decided .sys { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none;
+  background: var(--panel-2); color: var(--ink-3); border: 1px solid var(--line); }   /* asked by Holdco itself, no agent */
+.mcp-panel { margin-top: 18px; }
+.mcp-h { margin: 16px 0 4px; font-size: 14px; }
+.mcp-snippet { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 8px; min-width: 0; }
+.mcp-snippet pre { flex: 1; min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+#allocation, #mcp, #website { scroll-margin-top: 64px; }
+.conn-tip { margin: 0; overflow-wrap: anywhere; }
+.conn-later { background: var(--panel-2); }
+.conn-later h3 { color: var(--ink-2); }
+@media (max-width: 760px) {
+  .mcp-snippet { flex-direction: column; align-items: stretch; }
+  .mcp-snippet .btn { align-self: flex-start; }
+  .score-foot { padding: 10px 16px 14px; }
+  .review-list .req { padding: 12px 16px; }
+}
